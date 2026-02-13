@@ -145,7 +145,10 @@ Ab jetzt gilt:
 
 - jedes neue Git-Tag im Format `vX.Y.Z` triggert automatisch einen Build
 - das GitHub-Action-Workflow-File liegt unter `.github/workflows/release-docker.yml`
-- bei Tag-Push wird automatisch zu `ghcr.io/<github-owner>/linkwarden-mcp` gepusht
+- bei Tag-Push wird automatisch zu
+  - `ghcr.io/<github-owner>/linkwarden-mcp`
+  - `docker.io/<dockerhub-user>/linkwarden-mcp`
+  gepusht
 
 Beispiel für neues Release:
 
