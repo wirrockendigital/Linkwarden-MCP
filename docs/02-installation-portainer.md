@@ -31,6 +31,8 @@ Konfiguration über Env:
 - `MCP_STATIC_IP=192.168.123.220`
 - `MCP_RUN_UID=1061`
 - `MCP_RUN_GID=1061`
+- `MCP_HOST_BIND_IP=127.0.0.1`
+- `MCP_HOST_PORT=39227`
 
 Der Container wird mit diesen Werten gestartet:
 
@@ -56,3 +58,15 @@ Empfohlen:
 - Intern: `http://192.168.123.220:8080`
 
 Nach dem Deploy öffnest du intern `http://192.168.123.220:8080/` für Setup/Login.
+
+## Optional: Direkter Zugriff per NAS-IP:Port
+
+Für direkten Zugriff ohne Reverse Proxy:
+
+1. In `linkwarden-mcp.env` `MCP_HOST_BIND_IP` auf deine NAS-IP setzen (oder `0.0.0.0`)
+2. `MCP_HOST_PORT` auf dem unüblichen Default `39227` lassen (oder anpassen)
+3. Stack neu deployen
+
+Danach erreichst du den Dienst direkt über:
+
+- `http://<NAS-IP>:39227`

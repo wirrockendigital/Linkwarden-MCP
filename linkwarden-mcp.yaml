@@ -29,6 +29,10 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    ports:
+      # This mapping stays local-only by default via MCP_HOST_BIND_IP=127.0.0.1.
+      # Set MCP_HOST_BIND_IP to your NAS IP (or 0.0.0.0) for direct LAN access.
+      - "${MCP_HOST_BIND_IP}:${MCP_HOST_PORT}:${MCP_PORT}"
 
 networks:
   allmydocker-net:

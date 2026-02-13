@@ -42,8 +42,10 @@ Portainer-Dateien (Projektname als Präfix):
 
 Hinweis:
 
-- Im Stack ist **kein** `ports:` Mapping enthalten (gewollt).
-- Zugriff erfolgt intern über `192.168.123.220:8080` und extern über den DSM Reverse Proxy.
+- Der Stack hat optionalen Host-Portzugriff über einen unüblichen Port `39227`.
+- Standardmäßig ist der Port nur lokal am NAS gebunden (`MCP_HOST_BIND_IP=127.0.0.1`).
+- Für direkten Zugriff im LAN setze `MCP_HOST_BIND_IP` auf deine NAS-IP oder `0.0.0.0`.
+- Zugriff intern über Container-IP bleibt `192.168.123.220:8080`; extern bevorzugt weiterhin über DSM Reverse Proxy.
 - Der Container läuft als konfigurierbarer User über `MCP_RUN_UID`/`MCP_RUN_GID`.
 
 Wichtige Env-Werte in `linkwarden-mcp.env`:
@@ -58,6 +60,13 @@ Wichtige Env-Werte in `linkwarden-mcp.env`:
 - `MCP_LOG_LEVEL=debug`
 - `MCP_SESSION_TTL_HOURS=12`
 - `MCP_COOKIE_SECURE=auto`
+- `MCP_HOST_BIND_IP=127.0.0.1`
+- `MCP_HOST_PORT=39227`
+
+Optionaler Direktzugriff per NAS-IP:
+
+- Beispiel: `MCP_HOST_BIND_IP=192.168.123.50`
+- dann ist die UI/MCP direkt über `http://192.168.123.50:39227` erreichbar
 
 Hinweis zu Logs:
 
