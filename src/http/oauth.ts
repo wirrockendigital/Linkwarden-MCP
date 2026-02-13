@@ -258,19 +258,28 @@ function isScopeSubset(requestedScope: string, grantedScope: string): boolean {
 
 // This function registers OAuth discovery, authorization, token, and dynamic registration endpoints.
 export function registerOAuthRoutes(fastify: FastifyInstance, deps: OAuthRouteDeps): void {
-  fastify.get('/.well-known/oauth-protected-resource', async (request, reply) => {
+  // Serve discovery metadata at standard and MCP-relative paths for client compatibility.
+  const sendProtectedResourceMetadata = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
     reply.header('cache-control', 'no-store');
     reply.send(buildProtectedResourceMetadata(request));
-  });
+  };
 
-  fastify.get('/.well-known/oauth-authorization-server', async (request, reply) => {
+  const sendAuthorizationServerMetadata = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
     const runtime = deps.configStore.isUnlocked() ? deps.configStore.getRuntimeConfig() : null;
     const methods: Array<'none' | 'client_secret_post'> =
       runtime?.oauthClientSecret && runtime.oauthClientSecret.trim().length > 0 ? ['client_secret_post'] : ['none'];
 
     reply.header('cache-control', 'no-store');
     reply.send(buildAuthorizationServerMetadata(request, methods));
-  });
+  };
+
+  fastify.get('/.well-known/oauth-protected-resource', sendProtectedResourceMetadata);
+  fastify.get('/.well-known/oauth-authorization-server', sendAuthorizationServerMetadata);
+  fastify.get('/.well-known/openid-configuration', sendAuthorizationServerMetadata);
+
+  fastify.get('/mcp/.well-known/oauth-protected-resource', sendProtectedResourceMetadata);
+  fastify.get('/mcp/.well-known/oauth-authorization-server', sendAuthorizationServerMetadata);
+  fastify.get('/mcp/.well-known/openid-configuration', sendAuthorizationServerMetadata);
 
   fastify.post('/register', async (request, reply) => {
     if (!deps.configStore.isInitialized()) {
