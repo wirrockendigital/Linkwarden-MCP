@@ -22,6 +22,22 @@ export interface ServerResources {
 // This symbol stores high-resolution request start time on Fastify request objects.
 const REQUEST_START_TIME = Symbol('request-start-time');
 
+// This helper builds a safe header snapshot for request diagnostics without leaking secrets.
+function buildRequestHeaderSnapshot(headers: Record<string, unknown>): Record<string, unknown> {
+  return sanitizeForLog({
+    host: headers.host ?? null,
+    'x-forwarded-host': headers['x-forwarded-host'] ?? null,
+    'x-forwarded-proto': headers['x-forwarded-proto'] ?? null,
+    'x-forwarded-for': headers['x-forwarded-for'] ?? null,
+    'x-forwarded-port': headers['x-forwarded-port'] ?? null,
+    'x-real-ip': headers['x-real-ip'] ?? null,
+    'user-agent': headers['user-agent'] ?? null,
+    accept: headers.accept ?? null,
+    'content-type': headers['content-type'] ?? null,
+    'content-length': headers['content-length'] ?? null
+  }) as Record<string, unknown>;
+}
+
 // This function builds and configures the full HTTP application.
 export function createServer(): ServerResources {
   const dataDir = process.env.DATA_DIR ?? '/data';
@@ -103,6 +119,18 @@ export function createServer(): ServerResources {
         contentLength: request.headers['content-length'] ?? null
       },
       'http_request_start'
+    );
+
+    request.log.info(
+      {
+        event: 'http_request_headers',
+        requestId: request.id,
+        method: request.method,
+        path: request.url,
+        headers: buildRequestHeaderSnapshot(request.headers as Record<string, unknown>),
+        query: sanitizeForLog(request.query ?? null)
+      },
+      'http_request_headers'
     );
   });
 
