@@ -1,0 +1,35 @@
+# This Portainer stack is fully controlled through an uploaded environment file.
+version: "3.9"
+
+services:
+  linkwarden-mcp:
+    image: ${MCP_IMAGE}
+    container_name: ${MCP_CONTAINER_NAME}
+    restart: ${MCP_RESTART_POLICY}
+    environment:
+      HOST: ${MCP_HOST}
+      PORT: ${MCP_PORT}
+      DATA_DIR: ${MCP_DATA_DIR}
+      LOG_LEVEL: ${MCP_LOG_LEVEL}
+      STATE_DB_PATH: ${MCP_STATE_DB_PATH}
+      CONFIG_ENC_PATH: ${MCP_CONFIG_ENC_PATH}
+      SESSION_TTL_HOURS: ${MCP_SESSION_TTL_HOURS}
+      COOKIE_SECURE: ${MCP_COOKIE_SECURE}
+      MCP_MASTER_PASSPHRASE_FILE: ${MCP_MASTER_PASSPHRASE_FILE}
+    volumes:
+      - ${MCP_VOLUME_HOST}:${MCP_VOLUME_CONTAINER}
+      - ${MCP_MASTER_PASSPHRASE_HOST_FILE}:${MCP_MASTER_PASSPHRASE_FILE}:ro
+    networks:
+      allmydocker-net:
+        ipv4_address: ${MCP_STATIC_IP}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${MCP_PORT}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  allmydocker-net:
+    external: true
+    name: ${MCP_DOCKER_NETWORK}

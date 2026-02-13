@@ -1,0 +1,11 @@
+# This ignore file keeps local runtime artifacts and build output out of version control.
+node_modules/
+dist/
+coverage/
+.data/
+*.log
+.DS_Store
+
+# Keep local milestone notes out of git history.
+milestone.md
+milestone.*.md
