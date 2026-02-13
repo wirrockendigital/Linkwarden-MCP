@@ -29,6 +29,12 @@ Konfiguration über Env:
 
 - `MCP_DOCKER_NETWORK=allmydocker-net`
 - `MCP_STATIC_IP=192.168.123.220`
+- `MCP_RUN_UID=1061`
+- `MCP_RUN_GID=1061`
+
+Der Container wird mit diesen Werten gestartet:
+
+- `user: "${MCP_RUN_UID}:${MCP_RUN_GID}"`
 
 ## Persistente Daten
 
@@ -50,4 +56,3 @@ Empfohlen:
 - Intern: `http://192.168.123.220:8080`
 
 Nach dem Deploy öffnest du intern `http://192.168.123.220:8080/` für Setup/Login.
-

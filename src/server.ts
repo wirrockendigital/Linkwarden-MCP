@@ -10,12 +10,16 @@ import { registerUiRoutes } from './http/ui.js';
 import { createValidatedLinkwardenClient } from './linkwarden/runtime.js';
 import { registerMcpRoutes } from './mcp/protocol.js';
 import { AppError, normalizeError } from './utils/errors.js';
+import { buildLoggerOptions, errorForLog, sanitizeForLog } from './utils/logger.js';
 
 export interface ServerResources {
   app: FastifyInstance;
   db: SqliteStore;
   configStore: ConfigStore;
 }
+
+// This symbol stores high-resolution request start time on Fastify request objects.
+const REQUEST_START_TIME = Symbol('request-start-time');
 
 // This function builds and configures the full HTTP application.
 export function createServer(): ServerResources {
@@ -29,9 +33,7 @@ export function createServer(): ServerResources {
   }
 
   const app = Fastify({
-    logger: {
-      level: process.env.LOG_LEVEL ?? 'info'
-    },
+    logger: buildLoggerOptions(),
     bodyLimit: 1024 * 1024,
     trustProxy: true
   });
@@ -51,45 +53,73 @@ export function createServer(): ServerResources {
       }
 
       configStore.unlock(passphrase);
-      app.log.info({ masterPassphraseFile }, 'auto_unlock_success');
+      app.log.info({ event: 'config_auto_unlock_success', masterPassphraseFile }, 'config_auto_unlock_success');
     } catch (error) {
       app.log.error(
         {
+          event: 'config_auto_unlock_failed',
           masterPassphraseFile,
-          message: error instanceof Error ? error.message : 'unknown'
+          error: errorForLog(error)
         },
-        'auto_unlock_failed'
+        'config_auto_unlock_failed'
       );
     }
   }
 
   // This hook enriches request logs with consistent route and request-id metadata.
   app.addHook('onRequest', async (request) => {
+    (request as any)[REQUEST_START_TIME] = process.hrtime.bigint();
+
     request.log.info(
       {
+        event: 'http_request_start',
         requestId: request.id,
         method: request.method,
-        path: request.url
+        path: request.url,
+        ip: request.ip,
+        userAgent: request.headers['user-agent'] ?? null,
+        contentLength: request.headers['content-length'] ?? null
       },
-      'request_start'
+      'http_request_start'
     );
   });
 
-  // This hook logs response completion including status for auditability.
+  // This hook logs response completion including status and duration for request tracing.
   app.addHook('onResponse', async (request, reply) => {
+    const startTime = (request as any)[REQUEST_START_TIME] as bigint | undefined;
+    const durationMs = startTime ? Number(process.hrtime.bigint() - startTime) / 1_000_000 : undefined;
+
     request.log.info(
       {
+        event: 'http_request_complete',
         requestId: request.id,
         statusCode: reply.statusCode,
         method: request.method,
+        path: request.url,
+        durationMs,
+        responseContentLength: reply.getHeader('content-length') ?? null
+      },
+      'http_request_complete'
+    );
+  });
+
+  // This hook emits explicit timeout events to simplify debugging of stalled requests.
+  app.addHook('onTimeout', async (request) => {
+    request.log.warn(
+      {
+        event: 'http_request_timeout',
+        requestId: request.id,
+        method: request.method,
         path: request.url
       },
-      'request_complete'
+      'http_request_timeout'
     );
   });
 
   // This endpoint exposes a lightweight liveness signal.
   app.get('/health', async () => {
+    app.log.debug({ event: 'health_check' }, 'health_check');
+
     return {
       ok: true,
       status: 'alive',
@@ -106,6 +136,18 @@ export function createServer(): ServerResources {
     const whitelistCount = db.listWhitelist().length;
 
     if (!initialized || !unlocked || !hasUsers || !target || whitelistCount === 0) {
+      app.log.info(
+        {
+          event: 'readiness_failed_local_state',
+          initialized,
+          unlocked,
+          hasUsers,
+          linkwardenTargetConfigured: Boolean(target),
+          whitelistConfigured: whitelistCount > 0
+        },
+        'readiness_failed_local_state'
+      );
+
       return {
         ok: false,
         initialized,
@@ -119,12 +161,31 @@ export function createServer(): ServerResources {
 
     let upstreamReachable = false;
     try {
-      const client = createValidatedLinkwardenClient(configStore, db);
+      const client = createValidatedLinkwardenClient(configStore, db, app.log);
       await client.listTags({ limit: 1, offset: 0 });
       upstreamReachable = true;
     } catch {
+      app.log.warn(
+        {
+          event: 'readiness_upstream_unreachable'
+        },
+        'readiness_upstream_unreachable'
+      );
       upstreamReachable = false;
     }
+
+    app.log.info(
+      {
+        event: 'readiness_evaluated',
+        initialized,
+        unlocked,
+        hasUsers,
+        linkwardenTargetConfigured: Boolean(target),
+        whitelistConfigured: whitelistCount > 0,
+        upstreamReachable
+      },
+      'readiness_evaluated'
+    );
 
     return {
       ok: initialized && unlocked && hasUsers && Boolean(target) && whitelistCount > 0 && upstreamReachable,
@@ -148,13 +209,13 @@ export function createServer(): ServerResources {
 
     request.log.error(
       {
+        event: 'http_request_failed',
         requestId: request.id,
         code: normalized.code,
-        details: normalized.details,
-        message: normalized.message,
-        stack: error instanceof Error ? error.stack : undefined
+        details: sanitizeForLog(normalized.details),
+        error: errorForLog(error)
       },
-      'request_failed'
+      'http_request_failed'
     );
 
     reply.status(status).send({
@@ -169,6 +230,17 @@ export function createServer(): ServerResources {
 
   app.setNotFoundHandler((request, reply) => {
     const error = new AppError(404, 'not_found', `Route not found: ${request.method} ${request.url}`);
+
+    request.log.warn(
+      {
+        event: 'http_route_not_found',
+        requestId: request.id,
+        method: request.method,
+        path: request.url
+      },
+      'http_route_not_found'
+    );
+
     reply.status(404).send({
       ok: false,
       error: {

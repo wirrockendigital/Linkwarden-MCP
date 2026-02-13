@@ -1,8 +1,10 @@
 // This module wraps Linkwarden API calls with timeout, retry, and defensive response mapping.
 
 import { setTimeout as sleep } from 'node:timers/promises';
+import type { FastifyBaseLogger } from 'fastify';
 import type { LinkCollection, LinkItem, LinkTag, PagingInput, PlanScope, RuntimeConfig } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
+import { errorForLog, sanitizeForLog } from '../utils/logger.js';
 
 interface ApiListResult<T> {
   items: T[];
@@ -28,17 +30,38 @@ interface BulkReplaceInput {
 export class LinkwardenClient {
   private readonly baseUrl: string;
   private readonly config: RuntimeConfig;
+  private readonly logger?: FastifyBaseLogger;
 
-  public constructor(baseUrl: string, config: RuntimeConfig) {
+  public constructor(baseUrl: string, config: RuntimeConfig, logger?: FastifyBaseLogger) {
     this.baseUrl = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
     this.config = config;
+    this.logger = logger?.child({
+      component: 'linkwarden_client'
+    });
   }
 
   // This helper applies exponential backoff with jitter between retries.
-  private async waitWithBackoff(attempt: number): Promise<void> {
+  private async waitWithBackoff(attempt: number): Promise<number> {
     const jitter = Math.floor(Math.random() * 100);
     const delay = this.config.retryBaseDelayMs * 2 ** attempt + jitter;
     await sleep(delay);
+    return delay;
+  }
+
+  // This helper writes one structured client event only when a logger is available.
+  private log(
+    level: 'debug' | 'info' | 'warn' | 'error',
+    event: string,
+    details?: Record<string, unknown>
+  ): void {
+    const sanitizedDetails = (sanitizeForLog(details) ?? {}) as Record<string, unknown>;
+    this.logger?.[level](
+      {
+        event,
+        ...sanitizedDetails
+      },
+      event
+    );
   }
 
   // This helper builds canonical endpoint URLs against the configured Linkwarden base URL.
@@ -66,10 +89,28 @@ export class LinkwardenClient {
     }
   ): Promise<T> {
     const maxAttempts = Math.max(1, this.config.maxRetries + 1);
+    const startedAt = Date.now();
+
+    this.log('info', 'linkwarden_request_started', {
+      method,
+      path,
+      query: options?.query,
+      hasBody: options?.body !== undefined,
+      maxAttempts
+    });
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const abortController = new AbortController();
       const timer = setTimeout(() => abortController.abort(), this.config.requestTimeoutMs);
+      const attemptStartedAt = Date.now();
+      const attemptNumber = attempt + 1;
+
+      this.log('debug', 'linkwarden_request_attempt_started', {
+        method,
+        path,
+        attempt: attemptNumber,
+        maxAttempts
+      });
 
       try {
         const response = await fetch(this.buildUrl(path, options?.query), {
@@ -82,39 +123,103 @@ export class LinkwardenClient {
           signal: abortController.signal
         });
 
+        this.log('debug', 'linkwarden_request_attempt_response', {
+          method,
+          path,
+          attempt: attemptNumber,
+          status: response.status,
+          durationMs: Date.now() - attemptStartedAt
+        });
+
         if (response.status === 429 || (response.status >= 500 && response.status <= 599)) {
           if (attempt < maxAttempts - 1) {
-            await this.waitWithBackoff(attempt);
+            const delayMs = await this.waitWithBackoff(attempt);
+            this.log('warn', 'linkwarden_request_retry_scheduled', {
+              method,
+              path,
+              attempt: attemptNumber,
+              status: response.status,
+              delayMs
+            });
             continue;
           }
         }
 
         if (!response.ok) {
           const message = await response.text();
+          this.log('error', 'linkwarden_request_http_error', {
+            method,
+            path,
+            attempt: attemptNumber,
+            status: response.status,
+            bodyPreview: message
+          });
           throw new AppError(response.status, 'linkwarden_api_error', message || 'Linkwarden API request failed.');
         }
 
         if (response.status === 204) {
+          this.log('info', 'linkwarden_request_completed', {
+            method,
+            path,
+            attemptsUsed: attemptNumber,
+            durationMs: Date.now() - startedAt,
+            status: response.status
+          });
           return {} as T;
         }
 
-        return (await response.json()) as T;
+        const payload = (await response.json()) as T;
+        this.log('info', 'linkwarden_request_completed', {
+          method,
+          path,
+          attemptsUsed: attemptNumber,
+          durationMs: Date.now() - startedAt,
+          status: response.status
+        });
+        return payload;
       } catch (error) {
         if (error instanceof AppError) {
+          this.log('error', 'linkwarden_request_failed_app_error', {
+            method,
+            path,
+            attempt: attemptNumber,
+            durationMs: Date.now() - attemptStartedAt,
+            error: errorForLog(error)
+          });
           throw error;
         }
 
         if (attempt >= maxAttempts - 1) {
           const message = error instanceof Error ? error.message : 'unknown transport error';
+          this.log('error', 'linkwarden_request_failed_transport', {
+            method,
+            path,
+            attempt: attemptNumber,
+            durationMs: Date.now() - attemptStartedAt,
+            error: errorForLog(error)
+          });
           throw new AppError(502, 'linkwarden_unreachable', `Linkwarden request failed: ${message}`);
         }
 
-        await this.waitWithBackoff(attempt);
+        const delayMs = await this.waitWithBackoff(attempt);
+        this.log('warn', 'linkwarden_request_retry_transport', {
+          method,
+          path,
+          attempt: attemptNumber,
+          delayMs,
+          error: errorForLog(error)
+        });
       } finally {
         clearTimeout(timer);
       }
     }
 
+    this.log('error', 'linkwarden_request_failed_after_retries', {
+      method,
+      path,
+      maxAttempts,
+      totalDurationMs: Date.now() - startedAt
+    });
     throw new AppError(502, 'linkwarden_unreachable', 'Linkwarden request failed after retries.');
   }
 

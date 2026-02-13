@@ -7,6 +7,7 @@ import { ConfigStore } from '../config/config-store.js';
 import { SqliteStore } from '../db/database.js';
 import type { LinkwardenWhitelistEntry, SessionPrincipal, UserRole } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
+import { sanitizeForLog } from '../utils/logger.js';
 import {
   generateApiToken,
   generateCsrfToken,
@@ -88,6 +89,48 @@ const userIdParamSchema = z.object({
 const keyIdParamSchema = z.object({
   keyId: z.string().min(3).max(128)
 });
+
+// This helper writes one structured info-level UI event with request metadata.
+function logUiInfo(request: FastifyRequest, event: string, details?: Record<string, unknown>): void {
+  const sanitizedDetails = (sanitizeForLog(details) ?? {}) as Record<string, unknown>;
+  request.log.info(
+    {
+      event,
+      requestId: request.id,
+      ip: request.ip,
+      ...sanitizedDetails
+    },
+    event
+  );
+}
+
+// This helper writes one structured warning-level UI event with sanitized details.
+function logUiWarn(request: FastifyRequest, event: string, details?: Record<string, unknown>): void {
+  const sanitizedDetails = (sanitizeForLog(details) ?? {}) as Record<string, unknown>;
+  request.log.warn(
+    {
+      event,
+      requestId: request.id,
+      ip: request.ip,
+      ...sanitizedDetails
+    },
+    event
+  );
+}
+
+// This helper writes one structured debug-level UI event with sanitized details.
+function logUiDebug(request: FastifyRequest, event: string, details?: Record<string, unknown>): void {
+  const sanitizedDetails = (sanitizeForLog(details) ?? {}) as Record<string, unknown>;
+  request.log.debug(
+    {
+      event,
+      requestId: request.id,
+      ip: request.ip,
+      ...sanitizedDetails
+    },
+    event
+  );
+}
 
 // This map tracks login failures to throttle brute-force attempts per ip+username pair.
 const loginAttempts = new Map<string, LoginAttemptState>();
@@ -329,7 +372,7 @@ const csrfToken = ${JSON.stringify(csrfToken)};
 
 function parseWhitelistInput(value) {
   return value
-    .split(/\n+/)
+    .split(/\\r?\\n+/)
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => {
@@ -550,7 +593,7 @@ const csrfToken = ${JSON.stringify(csrfToken)};
 
 function parseWhitelistInput(value) {
   return value
-    .split(/\n+/)
+    .split(/\\r?\\n+/)
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => {
@@ -750,21 +793,29 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     const { csrfToken } = ensureCsrfCookie(request, reply);
 
     if (!configStore.isInitialized()) {
+      logUiInfo(request, 'ui_render_first_run');
       reply.type('text/html').send(renderFirstRunPage(csrfToken));
       return;
     }
 
     if (!configStore.isUnlocked()) {
+      logUiInfo(request, 'ui_render_unlock');
       reply.type('text/html').send(renderUnlockPage(csrfToken));
       return;
     }
 
     const principal = authenticateSession(request, db);
     if (!principal) {
+      logUiInfo(request, 'ui_render_login');
       reply.type('text/html').send(renderLoginPage(csrfToken));
       return;
     }
 
+    logUiInfo(request, 'ui_render_dashboard', {
+      userId: principal.userId,
+      username: principal.username,
+      role: principal.role
+    });
     reply.type('text/html').send(renderDashboardPage(principal, csrfToken));
   });
 
@@ -773,7 +824,10 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
   });
 
   fastify.post('/auth/login', async (request, reply) => {
+    logUiInfo(request, 'ui_login_attempt');
+
     if (!configStore.isInitialized()) {
+      logUiWarn(request, 'ui_login_rejected_not_initialized');
       throw new AppError(503, 'not_initialized', 'Server setup has not been completed.');
     }
 
@@ -781,16 +835,26 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     const parsed = loginSchema.safeParse(request.body);
     if (!parsed.success) {
+      logUiWarn(request, 'ui_login_validation_failed', {
+        details: parsed.error.flatten()
+      });
       throw new AppError(400, 'validation_error', 'Invalid login payload.', parsed.error.flatten());
     }
 
     const rateKey = buildLoginLimitKey(request, parsed.data.username);
+    logUiDebug(request, 'ui_login_rate_limit_check', {
+      username: parsed.data.username,
+      rateKey
+    });
     assertLoginAllowed(rateKey);
 
     const user = db.getUserForLogin(parsed.data.username);
 
     if (!user || user.is_active !== 1) {
       registerLoginFailure(rateKey);
+      logUiWarn(request, 'ui_login_failed_invalid_credentials', {
+        username: parsed.data.username
+      });
       throw new AppError(401, 'invalid_credentials', 'Invalid username or password.');
     }
 
@@ -803,6 +867,10 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     if (!isPasswordValid) {
       registerLoginFailure(rateKey);
+      logUiWarn(request, 'ui_login_failed_wrong_password', {
+        username: parsed.data.username,
+        userId: user.id
+      });
       throw new AppError(401, 'invalid_credentials', 'Invalid username or password.');
     }
 
@@ -831,6 +899,14 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       serializeCookie('mcp_csrf', csrfToken, { secure, maxAgeSeconds: ttlSeconds })
     ]);
 
+    logUiInfo(request, 'ui_login_success', {
+      userId: user.id,
+      username: user.username,
+      role: user.role,
+      sessionId,
+      ttlSeconds
+    });
+
     reply.send({
       ok: true,
       me: buildMePayload(db, {
@@ -845,6 +921,12 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
   fastify.post('/auth/logout', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
+    logUiInfo(request, 'ui_logout_requested', {
+      userId: principal.userId,
+      username: principal.username,
+      role: principal.role,
+      sessionId: principal.sessionId
+    });
     db.invalidateSession(principal.sessionId);
 
     const secure = shouldUseSecureCookies(request);
@@ -854,11 +936,21 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       serializeExpiredCookie('mcp_csrf', secure)
     ]);
 
+    logUiInfo(request, 'ui_logout_success', {
+      userId: principal.userId,
+      sessionId: principal.sessionId
+    });
+
     reply.send({ ok: true });
   });
 
   fastify.get('/auth/me', async (request, reply) => {
     const principal = requireSession(request, db);
+    logUiDebug(request, 'ui_auth_me', {
+      userId: principal.userId,
+      username: principal.username,
+      role: principal.role
+    });
 
     reply.send({
       ok: true,
@@ -876,6 +968,11 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       settings: db.getUserSettings(user.id)
     }));
 
+    logUiInfo(request, 'ui_admin_list_users', {
+      actorUserId: principal.userId,
+      count: usersWithSettings.length
+    });
+
     reply.send({
       ok: true,
       users: usersWithSettings
@@ -889,6 +986,9 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     const parsed = createUserSchema.safeParse(request.body);
     if (!parsed.success) {
+      logUiWarn(request, 'ui_admin_create_user_validation_failed', {
+        details: parsed.error.flatten()
+      });
       throw new AppError(400, 'validation_error', 'Invalid create-user payload.', parsed.error.flatten());
     }
 
@@ -905,6 +1005,15 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
 
     const key = parsed.data.issueApiKey ? issueApiKey(db, userId, parsed.data.apiKeyLabel) : undefined;
+
+    logUiInfo(request, 'ui_admin_create_user_success', {
+      actorUserId: principal.userId,
+      createdUserId: userId,
+      username: parsed.data.username,
+      role: parsed.data.role,
+      writeModeEnabled: parsed.data.writeModeEnabled,
+      apiKeyIssued: Boolean(key)
+    });
 
     reply.code(201).send({
       ok: true,
@@ -925,6 +1034,10 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     const body = toggleUserActiveSchema.safeParse(request.body);
 
     if (!params.success || !body.success) {
+      logUiWarn(request, 'ui_admin_set_user_active_validation_failed', {
+        params: params.success ? undefined : params.error.flatten(),
+        body: body.success ? undefined : body.error.flatten()
+      });
       throw new AppError(400, 'validation_error', 'Invalid user active payload.', {
         params: params.success ? undefined : params.error.flatten(),
         body: body.success ? undefined : body.error.flatten()
@@ -932,6 +1045,12 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     }
 
     db.setUserActive(params.data.userId, body.data.active);
+
+    logUiInfo(request, 'ui_admin_set_user_active_success', {
+      actorUserId: principal.userId,
+      targetUserId: params.data.userId,
+      active: body.data.active
+    });
 
     reply.send({
       ok: true,
@@ -949,6 +1068,10 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     const body = toggleWriteModeSchema.safeParse(request.body);
 
     if (!params.success || !body.success) {
+      logUiWarn(request, 'ui_admin_set_user_write_mode_validation_failed', {
+        params: params.success ? undefined : params.error.flatten(),
+        body: body.success ? undefined : body.error.flatten()
+      });
       throw new AppError(400, 'validation_error', 'Invalid write-mode payload.', {
         params: params.success ? undefined : params.error.flatten(),
         body: body.success ? undefined : body.error.flatten()
@@ -956,6 +1079,12 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     }
 
     db.setUserWriteMode(params.data.userId, body.data.writeModeEnabled);
+
+    logUiInfo(request, 'ui_admin_set_user_write_mode_success', {
+      actorUserId: principal.userId,
+      targetUserId: params.data.userId,
+      writeModeEnabled: body.data.writeModeEnabled
+    });
 
     reply.send({
       ok: true,
@@ -968,9 +1097,15 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     const principal = requireSession(request, db);
     requireAdminSession(principal);
 
+    const apiKeys = db.listApiKeys();
+    logUiInfo(request, 'ui_admin_list_api_keys', {
+      actorUserId: principal.userId,
+      count: apiKeys.length
+    });
+
     reply.send({
       ok: true,
-      apiKeys: db.listApiKeys()
+      apiKeys
     });
   });
 
@@ -981,10 +1116,20 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     const parsed = createApiKeySchema.safeParse(request.body);
     if (!parsed.success) {
+      logUiWarn(request, 'ui_admin_create_api_key_validation_failed', {
+        details: parsed.error.flatten()
+      });
       throw new AppError(400, 'validation_error', 'Invalid create-api-key payload.', parsed.error.flatten());
     }
 
     const key = issueApiKey(db, parsed.data.userId, parsed.data.label);
+
+    logUiInfo(request, 'ui_admin_create_api_key_success', {
+      actorUserId: principal.userId,
+      targetUserId: parsed.data.userId,
+      keyId: key.keyId,
+      label: parsed.data.label
+    });
 
     reply.code(201).send({
       ok: true,
@@ -1001,10 +1146,18 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     const parsed = keyIdParamSchema.safeParse(request.params);
     if (!parsed.success) {
+      logUiWarn(request, 'ui_admin_revoke_api_key_validation_failed', {
+        details: parsed.error.flatten()
+      });
       throw new AppError(400, 'validation_error', 'Invalid revoke key payload.', parsed.error.flatten());
     }
 
     db.revokeApiKey(parsed.data.keyId);
+
+    logUiInfo(request, 'ui_admin_revoke_api_key_success', {
+      actorUserId: principal.userId,
+      keyId: parsed.data.keyId
+    });
 
     reply.send({
       ok: true,
@@ -1020,6 +1173,12 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     const target = db.getLinkwardenTarget();
     const whitelist = db.listWhitelist();
 
+    logUiInfo(request, 'ui_admin_get_linkwarden_config', {
+      actorUserId: principal.userId,
+      targetConfigured: Boolean(target),
+      whitelistCount: whitelist.length
+    });
+
     reply.send({
       ok: true,
       target,
@@ -1034,6 +1193,9 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     const parsed = updateLinkwardenSchema.safeParse(request.body);
     if (!parsed.success) {
+      logUiWarn(request, 'ui_admin_update_linkwarden_validation_failed', {
+        details: parsed.error.flatten()
+      });
       throw new AppError(400, 'validation_error', 'Invalid Linkwarden update payload.', parsed.error.flatten());
     }
 
@@ -1045,11 +1207,13 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       : currentWhitelist.map((entry) => ({ type: entry.type, value: entry.value }));
 
     if (nextWhitelist.length === 0) {
+      logUiWarn(request, 'ui_admin_update_linkwarden_invalid_whitelist_empty');
       throw new AppError(400, 'invalid_whitelist', 'Whitelist cannot be empty.');
     }
 
     const nextBaseUrl = parsed.data.baseUrl ?? currentTarget?.baseUrl;
     if (!nextBaseUrl) {
+      logUiWarn(request, 'ui_admin_update_linkwarden_missing_target');
       throw new AppError(400, 'linkwarden_target_missing', 'Linkwarden base URL is not configured.');
     }
 
@@ -1070,6 +1234,14 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       db.replaceWhitelist(nextWhitelist);
     }
 
+    logUiInfo(request, 'ui_admin_update_linkwarden_success', {
+      actorUserId: principal.userId,
+      baseUrlUpdated: Boolean(parsed.data.baseUrl),
+      tokenUpdated: Boolean(parsed.data.linkwardenApiToken),
+      whitelistUpdated: Boolean(parsed.data.whitelistEntries),
+      whitelistCount: db.listWhitelist().length
+    });
+
     reply.send({
       ok: true,
       target: db.getLinkwardenTarget(),
@@ -1081,9 +1253,15 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     const principal = requireSession(request, db);
     requireAdminSession(principal);
 
+    const whitelist = db.listWhitelist();
+    logUiDebug(request, 'ui_admin_get_whitelist', {
+      actorUserId: principal.userId,
+      count: whitelist.length
+    });
+
     reply.send({
       ok: true,
-      whitelist: db.listWhitelist()
+      whitelist
     });
   });
 
@@ -1094,11 +1272,15 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     const parsed = setWhitelistSchema.safeParse(request.body);
     if (!parsed.success) {
+      logUiWarn(request, 'ui_admin_set_whitelist_validation_failed', {
+        details: parsed.error.flatten()
+      });
       throw new AppError(400, 'validation_error', 'Invalid whitelist payload.', parsed.error.flatten());
     }
 
     const normalized = normalizeWhitelistEntries(parsed.data.whitelistEntries);
     if (normalized.length === 0) {
+      logUiWarn(request, 'ui_admin_set_whitelist_invalid_empty');
       throw new AppError(400, 'invalid_whitelist', 'Whitelist cannot be empty.');
     }
 
@@ -1109,6 +1291,11 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     db.replaceWhitelist(normalized);
 
+    logUiInfo(request, 'ui_admin_set_whitelist_success', {
+      actorUserId: principal.userId,
+      whitelistCount: normalized.length
+    });
+
     reply.send({
       ok: true,
       whitelist: db.listWhitelist()
@@ -1117,6 +1304,10 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
   fastify.get('/ui/user/me', async (request, reply) => {
     const principal = requireSession(request, db);
+    logUiDebug(request, 'ui_user_me', {
+      userId: principal.userId,
+      username: principal.username
+    });
 
     reply.send({
       ok: true,
@@ -1130,10 +1321,18 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     const parsed = toggleWriteModeSchema.safeParse(request.body);
     if (!parsed.success) {
+      logUiWarn(request, 'ui_user_set_write_mode_validation_failed', {
+        details: parsed.error.flatten()
+      });
       throw new AppError(400, 'validation_error', 'Invalid write-mode payload.', parsed.error.flatten());
     }
 
     db.setUserWriteMode(principal.userId, parsed.data.writeModeEnabled);
+
+    logUiInfo(request, 'ui_user_set_write_mode_success', {
+      userId: principal.userId,
+      writeModeEnabled: parsed.data.writeModeEnabled
+    });
 
     reply.send({
       ok: true,
@@ -1145,9 +1344,15 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
   fastify.get('/ui/user/api-keys', async (request, reply) => {
     const principal = requireSession(request, db);
 
+    const apiKeys = db.listApiKeys(principal.userId);
+    logUiDebug(request, 'ui_user_list_api_keys', {
+      userId: principal.userId,
+      count: apiKeys.length
+    });
+
     reply.send({
       ok: true,
-      apiKeys: db.listApiKeys(principal.userId)
+      apiKeys
     });
   });
 
@@ -1157,10 +1362,19 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     const parsed = createOwnApiKeySchema.safeParse(request.body);
     if (!parsed.success) {
+      logUiWarn(request, 'ui_user_create_api_key_validation_failed', {
+        details: parsed.error.flatten()
+      });
       throw new AppError(400, 'validation_error', 'Invalid create-api-key payload.', parsed.error.flatten());
     }
 
     const key = issueApiKey(db, principal.userId, parsed.data.label);
+
+    logUiInfo(request, 'ui_user_create_api_key_success', {
+      userId: principal.userId,
+      keyId: key.keyId,
+      label: parsed.data.label
+    });
 
     reply.code(201).send({
       ok: true,
@@ -1176,10 +1390,18 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     const parsed = keyIdParamSchema.safeParse(request.params);
     if (!parsed.success) {
+      logUiWarn(request, 'ui_user_revoke_api_key_validation_failed', {
+        details: parsed.error.flatten()
+      });
       throw new AppError(400, 'validation_error', 'Invalid revoke key payload.', parsed.error.flatten());
     }
 
     db.revokeApiKey(parsed.data.keyId, principal.userId);
+
+    logUiInfo(request, 'ui_user_revoke_api_key_success', {
+      userId: principal.userId,
+      keyId: parsed.data.keyId
+    });
 
     reply.send({
       ok: true,

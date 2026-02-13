@@ -10,6 +10,7 @@ import { createValidatedLinkwardenClient } from '../linkwarden/runtime.js';
 import { computeReorgPlan } from '../planning/reorg.js';
 import type { AuthenticatedPrincipal, BulkUpdateRequest, LinkItem, PlanItem, PlanScope } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
+import { errorForLog, sanitizeForLog } from '../utils/logger.js';
 import {
   bulkUpdateSchema,
   applyPlanSchema,
@@ -52,11 +53,28 @@ function normalizeTagIds(tagIds: number[]): number[] {
 // This helper enforces role and write-mode policy before mutating operations.
 function assertWriteAccess(context: ToolRuntimeContext): void {
   if (context.principal.role !== 'admin' && context.principal.role !== 'user') {
+    context.logger.warn(
+      {
+        event: 'tool_write_access_denied_role',
+        userId: context.principal.userId,
+        username: context.principal.username,
+        role: context.principal.role
+      },
+      'tool_write_access_denied_role'
+    );
     throw new AppError(403, 'forbidden', 'Role is not allowed to execute write operations.');
   }
 
   const settings = context.db.getUserSettings(context.principal.userId);
   if (!settings.writeModeEnabled) {
+    context.logger.warn(
+      {
+        event: 'tool_write_access_denied_write_mode_disabled',
+        userId: context.principal.userId,
+        username: context.principal.username
+      },
+      'tool_write_access_denied_write_mode_disabled'
+    );
     throw new AppError(
       403,
       'write_mode_disabled',
@@ -121,7 +139,31 @@ function computeBulkTagResult(current: number[], updates: number[] | undefined, 
 
 // This helper creates a Linkwarden client from currently unlocked runtime secrets.
 function getClient(context: ToolRuntimeContext): LinkwardenClient {
-  return createValidatedLinkwardenClient(context.configStore, context.db);
+  return createValidatedLinkwardenClient(context.configStore, context.db, context.logger);
+}
+
+// This helper returns compact result metadata to keep tool completion logs concise.
+function summarizeToolOutput(output: ToolCallResult): Record<string, unknown> {
+  const payload = output.structuredContent;
+
+  if ('paging' in payload) {
+    return sanitizeForLog({
+      paging: payload.paging
+    }) as Record<string, unknown>;
+  }
+
+  if ('plan_id' in payload || 'applied' in payload) {
+    return sanitizeForLog({
+      plan_id: payload.plan_id,
+      applied: payload.applied,
+      failures: Array.isArray(payload.failures) ? payload.failures.length : undefined,
+      warnings: Array.isArray(payload.warnings) ? payload.warnings.length : undefined
+    }) as Record<string, unknown>;
+  }
+
+  return sanitizeForLog({
+    keys: Object.keys(payload)
+  }) as Record<string, unknown>;
 }
 
 // This function handles linkwarden_search_links with bounded output and paging metadata.
@@ -204,6 +246,16 @@ async function loadScopeLinks(context: ToolRuntimeContext, scope: PlanScope | un
 // This function handles linkwarden_plan_reorg by persisting a dry-run plan with preview and warnings.
 async function handlePlanReorg(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = planReorgSchema.parse(args);
+  context.logger.info(
+    {
+      event: 'tool_plan_reorg_started',
+      strategy: input.strategy,
+      previewLimit: input.previewLimit,
+      scope: sanitizeForLog(input.scope)
+    },
+    'tool_plan_reorg_started'
+  );
+
   const links = await loadScopeLinks(context, input.scope);
   const computation = computeReorgPlan(input.strategy, input.parameters, links);
   const ttlHours = context.configStore.getRuntimeConfig().planTtlHours;
@@ -222,6 +274,18 @@ async function handlePlanReorg(args: unknown, context: ToolRuntimeContext): Prom
     expiresAt
   });
 
+  context.logger.info(
+    {
+      event: 'tool_plan_reorg_created',
+      planId,
+      expiresAt,
+      scanned: computation.summary.scanned,
+      changes: computation.summary.changes,
+      warnings: computation.warnings.length
+    },
+    'tool_plan_reorg_created'
+  );
+
   return mcpResult({
     plan_id: planId,
     expires_at: expiresAt,
@@ -235,18 +299,49 @@ async function handlePlanReorg(args: unknown, context: ToolRuntimeContext): Prom
 async function handleApplyPlan(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = applyPlanSchema.parse(args);
   assertWriteAccess(context);
+  context.logger.info(
+    {
+      event: 'tool_apply_plan_started',
+      planId: input.plan_id,
+      actor: context.actor
+    },
+    'tool_apply_plan_started'
+  );
 
   const planData = context.db.getPlanWithItems(input.plan_id);
   if (!planData) {
+    context.logger.warn(
+      {
+        event: 'tool_apply_plan_not_found',
+        planId: input.plan_id
+      },
+      'tool_apply_plan_not_found'
+    );
     throw new AppError(404, 'plan_not_found', `Plan ${input.plan_id} not found.`);
   }
 
   if (planData.plan.status !== 'draft') {
+    context.logger.warn(
+      {
+        event: 'tool_apply_plan_invalid_status',
+        planId: input.plan_id,
+        status: planData.plan.status
+      },
+      'tool_apply_plan_invalid_status'
+    );
     throw new AppError(409, 'plan_not_applicable', `Plan status is ${planData.plan.status}, expected draft.`);
   }
 
   if (new Date(planData.plan.expiresAt).getTime() < Date.now()) {
     context.db.updatePlanStatus(input.plan_id, 'expired');
+    context.logger.warn(
+      {
+        event: 'tool_apply_plan_expired',
+        planId: input.plan_id,
+        expiresAt: planData.plan.expiresAt
+      },
+      'tool_apply_plan_expired'
+    );
     throw new AppError(409, 'plan_expired', 'Plan is expired and can no longer be applied.');
   }
 
@@ -383,6 +478,16 @@ async function handleApplyPlan(args: unknown, context: ToolRuntimeContext): Prom
       context.db.finishPlanRun(runId, 'failed', { applied, failures });
     }
 
+    context.logger.info(
+      {
+        event: 'tool_apply_plan_completed',
+        planId: input.plan_id,
+        applied,
+        failures: failures.length
+      },
+      'tool_apply_plan_completed'
+    );
+
     return mcpResult({
       plan_id: input.plan_id,
       applied,
@@ -394,6 +499,17 @@ async function handleApplyPlan(args: unknown, context: ToolRuntimeContext): Prom
       failures,
       fatalError: error instanceof Error ? error.message : 'unknown'
     });
+
+    context.logger.error(
+      {
+        event: 'tool_apply_plan_failed',
+        planId: input.plan_id,
+        applied,
+        failures: failures.length,
+        error: errorForLog(error)
+      },
+      'tool_apply_plan_failed'
+    );
 
     throw error;
   }
@@ -448,6 +564,15 @@ async function handleUpdateLink(args: unknown, context: ToolRuntimeContext): Pro
 // This function handles linkwarden_bulk_update_links with dry-run preview and optional apply.
 async function handleBulkUpdate(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = bulkUpdateSchema.parse(args);
+  context.logger.info(
+    {
+      event: 'tool_bulk_update_started',
+      dryRun: input.dryRun,
+      mode: input.mode,
+      linkCount: input.linkIds.length
+    },
+    'tool_bulk_update_started'
+  );
   const client = getClient(context);
 
   const sampledLinks = await Promise.all(input.linkIds.map((linkId) => client.getLink(linkId)));
@@ -470,6 +595,14 @@ async function handleBulkUpdate(args: unknown, context: ToolRuntimeContext): Pro
   });
 
   if (input.dryRun) {
+    context.logger.info(
+      {
+        event: 'tool_bulk_update_dry_run_completed',
+        linkCount: input.linkIds.length,
+        previewCount: preview.length
+      },
+      'tool_bulk_update_dry_run_completed'
+    );
     return mcpResult({
       dryRun: true,
       summary: {
@@ -631,14 +764,63 @@ export async function executeTool(
   args: unknown,
   context: ToolRuntimeContext
 ): Promise<ToolCallResult> {
+  const startedAt = Date.now();
+  context.logger.info(
+    {
+      event: 'mcp_tool_execution_started',
+      toolName,
+      actor: context.actor,
+      userId: context.principal.userId,
+      username: context.principal.username,
+      role: context.principal.role,
+      apiKeyId: context.principal.apiKeyId,
+      args: sanitizeForLog(args)
+    },
+    'mcp_tool_execution_started'
+  );
+
   const handler = toolHandlers[toolName];
   if (!handler) {
+    context.logger.warn(
+      {
+        event: 'mcp_tool_not_found',
+        toolName,
+        actor: context.actor
+      },
+      'mcp_tool_not_found'
+    );
     throw new AppError(404, 'tool_not_found', `Unknown tool: ${toolName}`);
   }
 
   try {
-    return await handler(args, context);
+    const result = await handler(args, context);
+
+    context.logger.info(
+      {
+        event: 'mcp_tool_execution_completed',
+        toolName,
+        actor: context.actor,
+        userId: context.principal.userId,
+        durationMs: Date.now() - startedAt,
+        result: summarizeToolOutput(result)
+      },
+      'mcp_tool_execution_completed'
+    );
+
+    return result;
   } catch (error) {
+    context.logger.error(
+      {
+        event: 'mcp_tool_execution_failed',
+        toolName,
+        actor: context.actor,
+        userId: context.principal.userId,
+        durationMs: Date.now() - startedAt,
+        error: errorForLog(error)
+      },
+      'mcp_tool_execution_failed'
+    );
+
     if (error instanceof z.ZodError) {
       throw new AppError(400, 'validation_error', 'Tool input validation failed.', error.flatten());
     }

@@ -71,7 +71,17 @@ function issueApiKey(db: SqliteStore, userId: number, label: string): { token: s
 
 // This function registers setup endpoints used by first-run deployment and recovery workflows.
 export function registerSetupRoutes(fastify: FastifyInstance, configStore: ConfigStore, db: SqliteStore): void {
-  fastify.get('/setup/status', async () => {
+  fastify.get('/setup/status', async (request) => {
+    request.log.debug(
+      {
+        event: 'setup_status_requested',
+        initialized: configStore.isInitialized(),
+        unlocked: configStore.isUnlocked(),
+        hasUsers: db.hasAnyUser()
+      },
+      'setup_status_requested'
+    );
+
     return {
       ok: true,
       initialized: configStore.isInitialized(),
@@ -81,11 +91,31 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
   });
 
   fastify.post('/setup/initialize', async (request, reply) => {
+    request.log.info(
+      {
+        event: 'setup_initialize_requested',
+        ip: request.ip
+      },
+      'setup_initialize_requested'
+    );
+
     if (configStore.isInitialized()) {
+      request.log.warn(
+        {
+          event: 'setup_initialize_rejected_already_initialized'
+        },
+        'setup_initialize_rejected_already_initialized'
+      );
       throw new AppError(409, 'already_initialized', 'Server setup has already been completed.');
     }
 
     if (db.hasAnyUser()) {
+      request.log.warn(
+        {
+          event: 'setup_initialize_rejected_existing_users'
+        },
+        'setup_initialize_rejected_existing_users'
+      );
       throw new AppError(
         409,
         'existing_users_detected',
@@ -95,11 +125,39 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
 
     const parsed = initializeSchema.safeParse(request.body);
     if (!parsed.success) {
+      request.log.warn(
+        {
+          event: 'setup_initialize_validation_failed',
+          details: parsed.error.flatten()
+        },
+        'setup_initialize_validation_failed'
+      );
       throw new AppError(400, 'validation_error', 'Invalid setup payload.', parsed.error.flatten());
     }
 
+    request.log.info(
+      {
+        event: 'setup_initialize_payload_valid',
+        adminUsername: parsed.data.adminUsername,
+        whitelistCount: parsed.data.whitelistEntries.length,
+        adminWriteModeDefault: parsed.data.adminWriteModeDefault,
+        issueAdminApiKey: parsed.data.issueAdminApiKey,
+        requestTimeoutMs: parsed.data.requestTimeoutMs ?? 10_000,
+        maxRetries: parsed.data.maxRetries ?? 3,
+        retryBaseDelayMs: parsed.data.retryBaseDelayMs ?? 350,
+        planTtlHours: parsed.data.planTtlHours ?? 24
+      },
+      'setup_initialize_payload_valid'
+    );
+
     const normalizedWhitelist = normalizeWhitelistEntries(parsed.data.whitelistEntries);
     if (normalizedWhitelist.length === 0) {
+      request.log.warn(
+        {
+          event: 'setup_initialize_invalid_whitelist_empty'
+        },
+        'setup_initialize_invalid_whitelist_empty'
+      );
       throw new AppError(400, 'invalid_whitelist', 'Whitelist cannot be empty.');
     }
 
@@ -135,6 +193,18 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
 
     const bootstrapToken = parsed.data.issueAdminApiKey ? issueApiKey(db, adminUserId, 'bootstrap-admin') : undefined;
 
+    request.log.info(
+      {
+        event: 'setup_initialize_completed',
+        adminUserId,
+        adminUsername: parsed.data.adminUsername,
+        whitelistCount: normalizedWhitelist.length,
+        linkwardenBaseUrl: parsed.data.linkwardenBaseUrl,
+        bootstrapTokenIssued: Boolean(bootstrapToken)
+      },
+      'setup_initialize_completed'
+    );
+
     reply.code(201).send({
       ok: true,
       initialized: true,
@@ -148,16 +218,44 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
   });
 
   fastify.post('/setup/unlock', async (request, reply) => {
+    request.log.info(
+      {
+        event: 'setup_unlock_requested',
+        ip: request.ip
+      },
+      'setup_unlock_requested'
+    );
+
     if (!configStore.isInitialized()) {
+      request.log.warn(
+        {
+          event: 'setup_unlock_rejected_not_initialized'
+        },
+        'setup_unlock_rejected_not_initialized'
+      );
       throw new AppError(400, 'not_initialized', 'Server setup has not been completed yet.');
     }
 
     const parsed = unlockSchema.safeParse(request.body);
     if (!parsed.success) {
+      request.log.warn(
+        {
+          event: 'setup_unlock_validation_failed',
+          details: parsed.error.flatten()
+        },
+        'setup_unlock_validation_failed'
+      );
       throw new AppError(400, 'validation_error', 'Invalid unlock payload.', parsed.error.flatten());
     }
 
     configStore.unlock(parsed.data.passphrase);
+
+    request.log.info(
+      {
+        event: 'setup_unlock_success'
+      },
+      'setup_unlock_success'
+    );
 
     reply.send({
       ok: true,

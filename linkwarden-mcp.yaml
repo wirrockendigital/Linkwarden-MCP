@@ -3,9 +3,10 @@ version: "3.9"
 
 services:
   linkwarden-mcp:
-    image: ${MCP_IMAGE}
+    image: docker.io/wirrockendigital/linkwarden-mcp:latest
     container_name: ${MCP_CONTAINER_NAME}
     restart: ${MCP_RESTART_POLICY}
+    user: "${MCP_RUN_UID}:${MCP_RUN_GID}"
     environment:
       HOST: ${MCP_HOST}
       PORT: ${MCP_PORT}

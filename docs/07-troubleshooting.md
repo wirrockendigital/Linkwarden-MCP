@@ -67,3 +67,22 @@ Prüfen:
 - Netzwerkroute zu Linkwarden
 - Linkwarden Token und Base-URL
 
+## Debug-Logs aktivieren und auslesen
+
+Empfehlung:
+
+- in `linkwarden-mcp.env` auf `MCP_LOG_LEVEL=debug` setzen
+- Stack neu deployen
+
+Logs lesen:
+
+```bash
+docker logs -f linkwarden-mcp
+```
+
+Typische Event-Namen in den JSON-Logs:
+
+- `http_request_start`, `http_request_complete`, `http_request_failed`
+- `ui_login_attempt`, `ui_login_success`, `csrf_validation_failed`
+- `mcp_auth_success`, `mcp_rpc_request_received`, `mcp_tool_execution_started`
+- `linkwarden_request_started`, `linkwarden_request_retry_scheduled`, `linkwarden_request_completed`

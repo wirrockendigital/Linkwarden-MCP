@@ -42,23 +42,63 @@ export function constantTimeEquals(left: string, right: string): boolean {
 export function createMcpAuthGuard(configStore: ConfigStore, db: SqliteStore) {
   return async function mcpAuthGuard(request: FastifyRequest, reply: FastifyReply): Promise<AuthContext> {
     if (!configStore.isInitialized()) {
+      request.log?.warn?.(
+        {
+          event: 'mcp_auth_denied_not_initialized',
+          requestId: request.id
+        },
+        'mcp_auth_denied_not_initialized'
+      );
       throw new AppError(503, 'not_initialized', 'Server setup has not been completed.');
     }
 
     if (!configStore.isUnlocked()) {
+      request.log?.warn?.(
+        {
+          event: 'mcp_auth_denied_config_locked',
+          requestId: request.id
+        },
+        'mcp_auth_denied_config_locked'
+      );
       throw new AppError(503, 'config_locked', 'Server is locked. Unlock setup first.');
     }
 
     const token = extractBearerToken(request.headers.authorization);
     if (!token) {
+      request.log?.warn?.(
+        {
+          event: 'mcp_auth_missing_bearer',
+          requestId: request.id
+        },
+        'mcp_auth_missing_bearer'
+      );
       reply.header('WWW-Authenticate', 'Bearer');
       throw new AppError(401, 'unauthorized', 'Missing MCP access token.');
     }
 
     const principal = db.authenticateByTokenHash(hashApiToken(token));
     if (principal) {
+      request.log?.info?.(
+        {
+          event: 'mcp_auth_success',
+          requestId: request.id,
+          userId: principal.userId,
+          username: principal.username,
+          role: principal.role,
+          apiKeyId: principal.apiKeyId
+        },
+        'mcp_auth_success'
+      );
       return { principal };
     }
+
+    request.log?.warn?.(
+      {
+        event: 'mcp_auth_invalid_bearer',
+        requestId: request.id
+      },
+      'mcp_auth_invalid_bearer'
+    );
 
     reply.header('WWW-Authenticate', 'Bearer');
     throw new AppError(401, 'unauthorized', 'Invalid MCP access token.');
@@ -81,8 +121,26 @@ export function authenticateSession(request: FastifyRequest, db: SqliteStore): S
 export function requireSession(request: FastifyRequest, db: SqliteStore): SessionPrincipal {
   const principal = authenticateSession(request, db);
   if (!principal) {
+    request.log?.warn?.(
+      {
+        event: 'session_missing_or_expired',
+        requestId: request.id
+      },
+      'session_missing_or_expired'
+    );
     throw new AppError(401, 'session_expired', 'Session missing or expired.');
   }
+
+  request.log?.debug?.(
+    {
+      event: 'session_auth_success',
+      requestId: request.id,
+      userId: principal.userId,
+      username: principal.username,
+      role: principal.role
+    },
+    'session_auth_success'
+  );
 
   return principal;
 }
@@ -102,6 +160,21 @@ export function requireCsrf(request: FastifyRequest): void {
   const normalizedHeader = Array.isArray(headerToken) ? headerToken[0] : headerToken;
 
   if (!cookieToken || !normalizedHeader || !constantTimeEquals(cookieToken, normalizedHeader)) {
+    request.log?.warn?.(
+      {
+        event: 'csrf_validation_failed',
+        requestId: request.id
+      },
+      'csrf_validation_failed'
+    );
     throw new AppError(403, 'csrf_invalid', 'Missing or invalid CSRF token.');
   }
+
+  request.log?.debug?.(
+    {
+      event: 'csrf_validation_success',
+      requestId: request.id
+    },
+    'csrf_validation_success'
+  );
 }

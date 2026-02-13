@@ -44,16 +44,25 @@ Hinweis:
 
 - Im Stack ist **kein** `ports:` Mapping enthalten (gewollt).
 - Zugriff erfolgt intern über `192.168.123.220:8080` und extern über den DSM Reverse Proxy.
+- Der Container läuft als konfigurierbarer User über `MCP_RUN_UID`/`MCP_RUN_GID`.
 
 Wichtige Env-Werte in `linkwarden-mcp.env`:
 
 - `MCP_DOCKER_NETWORK=allmydocker-net`
 - `MCP_STATIC_IP=192.168.123.220`
+- `MCP_RUN_UID=1061`
+- `MCP_RUN_GID=1061`
 - `MCP_VOLUME_HOST=/volume2/docker/linkwarden-mcp/data`
 - `MCP_MASTER_PASSPHRASE_HOST_FILE=/volume2/docker/linkwarden-mcp/master.passphrase`
 - `MCP_MASTER_PASSPHRASE_FILE=/run/secrets/linkwarden-mcp-master-passphrase`
+- `MCP_LOG_LEVEL=debug`
 - `MCP_SESSION_TTL_HOURS=12`
 - `MCP_COOKIE_SECURE=auto`
+
+Hinweis zu Logs:
+
+- `MCP_LOG_LEVEL=debug` loggt alle Debug-Events (empfohlen für Fehlersuche)
+- für ruhigeren Betrieb kannst du auf `info` zurückstellen
 
 ## First-Run Setup im Browser
 
@@ -174,6 +183,25 @@ git push origin v0.1.0
 
 - `GET /health`: Prozess lebt
 - `GET /ready`: Setup + Unlock + User + Target + Whitelist + Linkwarden erreichbar
+
+## Debug-Logging
+
+Die Anwendung loggt strukturiert als JSON auf `stdout` (Container-Logs).
+Events umfassen u. a.:
+
+- HTTP Request-Start/Ende inkl. Laufzeit
+- Setup/Login/Session/CSRF Entscheidungen
+- Admin/User UI-Aktionen
+- MCP Auth + JSON-RPC Methoden + Tool-Ausführung
+- Linkwarden Upstream Calls inkl. Retry/Timeout
+
+Wichtige Kommandos:
+
+```bash
+docker logs -f linkwarden-mcp
+```
+
+Bei Portainer: `Containers` -> `linkwarden-mcp` -> `Logs`.
 
 ## Weitere Dokumentation
 

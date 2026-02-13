@@ -9,3 +9,6 @@ coverage/
 # Keep local milestone notes out of git history.
 milestone.md
 milestone.*.md
+
+# Ignore Synology/SMB temporary delete marker files.
+.smbdelete*
