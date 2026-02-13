@@ -149,6 +149,9 @@ Ab jetzt gilt:
   - `ghcr.io/<github-owner>/linkwarden-mcp`
   - `docker.io/<dockerhub-user>/linkwarden-mcp`
   gepusht
+- verwendete Repository-Secrets:
+  - `GHCR_USERNAME`, `GHCR_TOKEN`
+  - `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`
 
 Beispiel für neues Release:
 
