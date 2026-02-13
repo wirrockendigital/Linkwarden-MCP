@@ -139,6 +139,24 @@ Beispielprompts:
 - `Erstelle mit linkwarden_plan_reorg eine tag-by-keywords Planung für "spf dkim dmarc mta-sts dane" und zeige Preview`
 - `Wende plan_id XYZ mit linkwarden_apply_plan confirm APPLY an`
 
+## Versionierung und automatische Docker-Releases
+
+Ab jetzt gilt:
+
+- jedes neue Git-Tag im Format `vX.Y.Z` triggert automatisch einen Build
+- das GitHub-Action-Workflow-File liegt unter `.github/workflows/release-docker.yml`
+- bei Tag-Push wird automatisch zu `ghcr.io/<github-owner>/linkwarden-mcp` gepusht
+- optional wird zusätzlich zu Docker Hub gepusht, wenn diese Repo-Secrets gesetzt sind:
+  - `DOCKERHUB_USERNAME`
+  - `DOCKERHUB_TOKEN`
+
+Beispiel für neues Release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Sicherheitsmodell
 
 - `/mcp` akzeptiert nur `Authorization: Bearer <API_KEY>`
