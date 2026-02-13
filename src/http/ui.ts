@@ -71,15 +71,18 @@ const whitelistEntrySchema = z.object({
 const updateLinkwardenSchema = z
   .object({
     baseUrl: z.string().url().optional(),
-    linkwardenApiToken: z.string().min(20).optional(),
     whitelistEntries: z.array(whitelistEntrySchema).min(1).max(200).optional()
   })
-  .refine((payload) => Boolean(payload.baseUrl || payload.linkwardenApiToken || payload.whitelistEntries), {
+  .refine((payload) => Boolean(payload.baseUrl || payload.whitelistEntries), {
     message: 'At least one field must be updated.'
   });
 
 const setWhitelistSchema = z.object({
   whitelistEntries: z.array(whitelistEntrySchema).min(1).max(200)
+});
+
+const setLinkwardenTokenSchema = z.object({
+  token: z.string().min(20).max(500)
 });
 
 const userIdParamSchema = z.object({
@@ -264,8 +267,22 @@ function ensureCsrfCookie(request: FastifyRequest, reply: FastifyReply): { csrfT
   return { csrfToken, secure };
 }
 
+// This helper normalizes one optional post-login redirect path and prevents open redirects.
+function sanitizeNextPath(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('/') || trimmed.startsWith('//')) {
+    return null;
+  }
+
+  return trimmed;
+}
+
 // This helper sends the standard login page for initialized systems without session.
-function renderLoginPage(csrfToken: string): string {
+function renderLoginPage(csrfToken: string, nextPath: string | null): string {
   return `<!doctype html>
 <html lang="de">
 <head>
@@ -297,6 +314,7 @@ function renderLoginPage(csrfToken: string): string {
   </div>
 <script>
 const csrfToken = ${JSON.stringify(csrfToken)};
+const nextPath = ${JSON.stringify(nextPath)};
 
 async function login() {
   const payload = {
@@ -317,7 +335,7 @@ async function login() {
   document.getElementById('result').textContent = JSON.stringify(json, null, 2);
 
   if (res.ok) {
-    window.location.href = '/';
+    window.location.href = nextPath || '/';
   }
 }
 </script>
@@ -355,8 +373,12 @@ function renderFirstRunPage(csrfToken: string): string {
     <input id="adminPassword" type="password" />
     <label for="baseUrl">Linkwarden Base URL</label>
     <input id="baseUrl" placeholder="http://linkwarden:3000" />
-    <label for="apiToken">Linkwarden API Token</label>
+    <label for="apiToken">Linkwarden API Key -> MCP</label>
     <input id="apiToken" type="password" />
+    <label for="oauthClientId">OAuth Client ID (optional)</label>
+    <input id="oauthClientId" placeholder="chatgpt-client-id" />
+    <label for="oauthClientSecret">OAuth Client Secret (optional)</label>
+    <input id="oauthClientSecret" type="password" />
     <label for="whitelist">Whitelist (eine Zeile je Eintrag, Format: domain:host oder ip:1.2.3.4 oder cidr:192.168.0.0/24)</label>
     <textarea id="whitelist" placeholder="domain:linkwarden.internal\nip:192.168.123.10"></textarea>
     <label><input id="adminWriteModeDefault" type="checkbox" /> Admin Write-Mode initial aktivieren</label>
@@ -401,6 +423,8 @@ async function initializeSetup() {
     adminPassword: document.getElementById('adminPassword').value,
     linkwardenBaseUrl: document.getElementById('baseUrl').value,
     linkwardenApiToken: document.getElementById('apiToken').value,
+    oauthClientId: document.getElementById('oauthClientId').value || undefined,
+    oauthClientSecret: document.getElementById('oauthClientSecret').value || undefined,
     whitelistEntries,
     adminWriteModeDefault: document.getElementById('adminWriteModeDefault').checked,
     issueAdminApiKey: document.getElementById('issueAdminApiKey').checked
@@ -499,22 +523,22 @@ function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): st
     <select id="newRole"><option value="user">user</option><option value="admin">admin</option></select>
     <label><input id="newWriteMode" type="checkbox" /> Write-Mode aktiv</label>
     <button onclick="createUser()">Benutzer anlegen</button>
-    <label for="toggleUserId">User ID für Aktiv/Deaktiv</label>
-    <input id="toggleUserId" type="number" />
+    <label for="toggleUserSelect">Benutzer für Aktiv/Deaktiv</label>
+    <select id="toggleUserSelect"></select>
     <label><input id="toggleUserActive" type="checkbox" checked /> Aktiv</label>
     <button onclick="setUserActive()">Aktiv-Status setzen</button>
-    <label for="writeModeUserId">User ID für Write-Mode</label>
-    <input id="writeModeUserId" type="number" />
+    <label for="writeModeUserSelect">Benutzer für Write-Mode</label>
+    <select id="writeModeUserSelect"></select>
     <label><input id="writeModeForUser" type="checkbox" /> Write-Mode aktiv</label>
     <button onclick="setUserWriteMode()">Write-Mode pro User setzen</button>
   </div>
 
   <div class="card">
-    <h2>Admin: API Keys</h2>
-    <button onclick="loadAdminKeys()">Alle API Keys laden</button>
+    <h2>Admin: MCP API Keys -> AI</h2>
+    <button onclick="loadAdminKeys()">Alle MCP API Keys laden</button>
     <pre id="adminKeysResult">Noch nicht geladen</pre>
-    <label for="apiKeyUserId">User ID</label>
-    <input id="apiKeyUserId" type="number" />
+    <label for="apiKeyUserSelect">Benutzer für neuen MCP API Key</label>
+    <select id="apiKeyUserSelect"></select>
     <label for="apiKeyLabel">Key Label</label>
     <input id="apiKeyLabel" value="default" />
     <button onclick="issueAdminKey()">API Key ausstellen</button>
@@ -524,13 +548,20 @@ function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): st
   </div>
 
   <div class="card">
+    <h2>Admin: Linkwarden API Key -> MCP (pro User)</h2>
+    <label for="linkwardenTokenUserSelect">Benutzer</label>
+    <select id="linkwardenTokenUserSelect"></select>
+    <label for="linkwardenTokenValue">Linkwarden API Key</label>
+    <input id="linkwardenTokenValue" type="password" />
+    <button onclick="setUserLinkwardenToken()">Linkwarden API Key speichern</button>
+  </div>
+
+  <div class="card">
     <h2>Admin: Linkwarden Ziel + Whitelist</h2>
     <button onclick="loadLinkwardenConfig()">Aktuelle Konfiguration laden</button>
     <pre id="linkwardenConfigResult">Noch nicht geladen</pre>
     <label for="lwBaseUrl">Neue Base URL (optional)</label>
     <input id="lwBaseUrl" placeholder="http://linkwarden:3000" />
-    <label for="lwToken">Neuer API Token (optional)</label>
-    <input id="lwToken" type="password" />
     <label for="lwWhitelist">Neue Whitelist (optional, Zeilenformat type:value)</label>
     <textarea id="lwWhitelist" placeholder="domain:linkwarden.internal\nip:192.168.123.10"></textarea>
     <button onclick="updateLinkwardenConfig()">Linkwarden Konfiguration speichern</button>
@@ -570,8 +601,16 @@ function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): st
   </div>
 
   <div class="card">
-    <h2>Meine API Keys</h2>
-    <button onclick="loadOwnKeys()">Meine API Keys laden</button>
+    <h2>Mein Linkwarden API Key -> MCP</h2>
+    <p id="selfLinkwardenStatus">Status: unbekannt</p>
+    <label for="selfLinkwardenToken">Linkwarden API Key</label>
+    <input id="selfLinkwardenToken" type="password" />
+    <button onclick="setOwnLinkwardenToken()">Linkwarden API Key speichern</button>
+  </div>
+
+  <div class="card">
+    <h2>Meine MCP API Keys -> AI</h2>
+    <button onclick="loadOwnKeys()">Meine MCP API Keys laden</button>
     <pre id="ownKeysResult">Noch nicht geladen</pre>
     <label for="ownKeyLabel">Key Label</label>
     <input id="ownKeyLabel" value="default" />
@@ -590,6 +629,8 @@ function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): st
 
 <script>
 const csrfToken = ${JSON.stringify(csrfToken)};
+const isAdmin = ${JSON.stringify(principal.role === 'admin')};
+let usersCache = [];
 
 function parseWhitelistInput(value) {
   return value
@@ -605,6 +646,28 @@ function parseWhitelistInput(value) {
       const entryValue = line.slice(idx + 1).trim();
       return { type, value: entryValue };
     });
+}
+
+function updateUserSelect(selectId) {
+  const select = document.getElementById(selectId);
+  if (!select) {
+    return;
+  }
+
+  select.innerHTML = '';
+  for (const user of usersCache) {
+    const option = document.createElement('option');
+    option.value = String(user.id);
+    option.textContent = user.username;
+    select.appendChild(option);
+  }
+}
+
+function refreshAdminUserSelects() {
+  updateUserSelect('toggleUserSelect');
+  updateUserSelect('writeModeUserSelect');
+  updateUserSelect('apiKeyUserSelect');
+  updateUserSelect('linkwardenTokenUserSelect');
 }
 
 async function api(url, options = {}) {
@@ -637,6 +700,8 @@ async function loadMe() {
   document.getElementById('meResult').textContent = JSON.stringify(json, null, 2);
   if (res.ok) {
     document.getElementById('selfWriteMode').checked = Boolean(json?.me?.settings?.writeModeEnabled);
+    const status = json?.me?.linkwardenTokenConfigured ? 'Status: konfiguriert' : 'Status: fehlt';
+    document.getElementById('selfLinkwardenStatus').textContent = status;
   }
 }
 
@@ -645,6 +710,15 @@ async function setOwnWriteMode() {
     method: 'POST',
     body: JSON.stringify({ writeModeEnabled: document.getElementById('selfWriteMode').checked })
   });
+  await loadMe();
+}
+
+async function setOwnLinkwardenToken() {
+  await api('/ui/user/linkwarden-token', {
+    method: 'POST',
+    body: JSON.stringify({ token: document.getElementById('selfLinkwardenToken').value })
+  });
+  document.getElementById('selfLinkwardenToken').value = '';
   await loadMe();
 }
 
@@ -675,6 +749,10 @@ async function loadUsers() {
   const res = await fetch('/ui/admin/users');
   const json = await res.json();
   document.getElementById('usersResult').textContent = JSON.stringify(json, null, 2);
+  if (res.ok) {
+    usersCache = Array.isArray(json.users) ? json.users : [];
+    refreshAdminUserSelects();
+  }
 }
 
 async function createUser() {
@@ -691,7 +769,7 @@ async function createUser() {
 }
 
 async function setUserActive() {
-  const userId = document.getElementById('toggleUserId').value;
+  const userId = document.getElementById('toggleUserSelect').value;
   await api('/ui/admin/users/' + encodeURIComponent(userId) + '/active', {
     method: 'POST',
     body: JSON.stringify({ active: document.getElementById('toggleUserActive').checked })
@@ -700,7 +778,7 @@ async function setUserActive() {
 }
 
 async function setUserWriteMode() {
-  const userId = document.getElementById('writeModeUserId').value;
+  const userId = document.getElementById('writeModeUserSelect').value;
   await api('/ui/admin/users/' + encodeURIComponent(userId) + '/write-mode', {
     method: 'POST',
     body: JSON.stringify({ writeModeEnabled: document.getElementById('writeModeForUser').checked })
@@ -718,7 +796,7 @@ async function issueAdminKey() {
   await api('/ui/admin/api-keys', {
     method: 'POST',
     body: JSON.stringify({
-      userId: Number(document.getElementById('apiKeyUserId').value),
+      userId: Number(document.getElementById('apiKeyUserSelect').value),
       label: document.getElementById('apiKeyLabel').value
     })
   });
@@ -743,14 +821,10 @@ async function loadLinkwardenConfig() {
 async function updateLinkwardenConfig() {
   const payload = {};
   const baseUrl = document.getElementById('lwBaseUrl').value.trim();
-  const token = document.getElementById('lwToken').value.trim();
   const whitelistText = document.getElementById('lwWhitelist').value.trim();
 
   if (baseUrl) {
     payload.baseUrl = baseUrl;
-  }
-  if (token) {
-    payload.linkwardenApiToken = token;
   }
   if (whitelistText) {
     payload.whitelistEntries = parseWhitelistInput(whitelistText);
@@ -764,8 +838,21 @@ async function updateLinkwardenConfig() {
   await loadLinkwardenConfig();
 }
 
+async function setUserLinkwardenToken() {
+  const userId = Number(document.getElementById('linkwardenTokenUserSelect').value);
+  await api('/ui/admin/users/' + encodeURIComponent(userId) + '/linkwarden-token', {
+    method: 'POST',
+    body: JSON.stringify({ token: document.getElementById('linkwardenTokenValue').value })
+  });
+  document.getElementById('linkwardenTokenValue').value = '';
+  await loadUsers();
+}
+
 loadMe();
 loadOwnKeys();
+if (isAdmin) {
+  loadUsers();
+}
 </script>
 </body>
 </html>`;
@@ -775,6 +862,7 @@ loadOwnKeys();
 function buildMePayload(db: SqliteStore, principal: SessionPrincipal): Record<string, unknown> {
   const user = db.getUserById(principal.userId);
   const settings = db.getUserSettings(principal.userId);
+  const linkwardenTokenConfigured = db.hasUserLinkwardenToken(principal.userId);
 
   return {
     id: user.id,
@@ -783,6 +871,7 @@ function buildMePayload(db: SqliteStore, principal: SessionPrincipal): Record<st
     isActive: user.isActive,
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,
+    linkwardenTokenConfigured,
     settings
   };
 }
@@ -806,8 +895,10 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     const principal = authenticateSession(request, db);
     if (!principal) {
+      const query = (request.query ?? {}) as Record<string, unknown>;
+      const nextPath = sanitizeNextPath(query.next);
       logUiInfo(request, 'ui_render_login');
-      reply.type('text/html').send(renderLoginPage(csrfToken));
+      reply.type('text/html').send(renderLoginPage(csrfToken, nextPath));
       return;
     }
 
@@ -965,7 +1056,8 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     const users = db.listUsers();
     const usersWithSettings = users.map((user) => ({
       ...user,
-      settings: db.getUserSettings(user.id)
+      settings: db.getUserSettings(user.id),
+      linkwardenTokenConfigured: db.hasUserLinkwardenToken(user.id)
     }));
 
     logUiInfo(request, 'ui_admin_list_users', {
@@ -1090,6 +1182,40 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       ok: true,
       userId: params.data.userId,
       writeModeEnabled: body.data.writeModeEnabled
+    });
+  });
+
+  fastify.post('/ui/admin/users/:userId/linkwarden-token', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+    requireAdminSession(principal);
+
+    const params = userIdParamSchema.safeParse(request.params);
+    const body = setLinkwardenTokenSchema.safeParse(request.body);
+
+    if (!params.success || !body.success) {
+      logUiWarn(request, 'ui_admin_set_linkwarden_token_validation_failed', {
+        params: params.success ? undefined : params.error.flatten(),
+        body: body.success ? undefined : body.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid Linkwarden token payload.', {
+        params: params.success ? undefined : params.error.flatten(),
+        body: body.success ? undefined : body.error.flatten()
+      });
+    }
+
+    const encryptedToken = configStore.encryptSecret(body.data.token);
+    db.setUserLinkwardenToken(params.data.userId, encryptedToken);
+
+    logUiInfo(request, 'ui_admin_set_linkwarden_token_success', {
+      actorUserId: principal.userId,
+      targetUserId: params.data.userId
+    });
+
+    reply.send({
+      ok: true,
+      userId: params.data.userId,
+      linkwardenTokenConfigured: true
     });
   });
 
@@ -1219,13 +1345,6 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     assertBaseUrlWhitelisted(nextBaseUrl, toWhitelistRecords(nextWhitelist));
 
-    if (parsed.data.linkwardenApiToken) {
-      configStore.updateConfig((current) => ({
-        ...current,
-        linkwardenApiToken: parsed.data.linkwardenApiToken ?? current.linkwardenApiToken
-      }));
-    }
-
     if (parsed.data.baseUrl) {
       db.setLinkwardenTarget(parsed.data.baseUrl);
     }
@@ -1237,7 +1356,6 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     logUiInfo(request, 'ui_admin_update_linkwarden_success', {
       actorUserId: principal.userId,
       baseUrlUpdated: Boolean(parsed.data.baseUrl),
-      tokenUpdated: Boolean(parsed.data.linkwardenApiToken),
       whitelistUpdated: Boolean(parsed.data.whitelistEntries),
       whitelistCount: db.listWhitelist().length
     });
@@ -1338,6 +1456,32 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       ok: true,
       userId: principal.userId,
       writeModeEnabled: parsed.data.writeModeEnabled
+    });
+  });
+
+  fastify.post('/ui/user/linkwarden-token', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+
+    const parsed = setLinkwardenTokenSchema.safeParse(request.body);
+    if (!parsed.success) {
+      logUiWarn(request, 'ui_user_set_linkwarden_token_validation_failed', {
+        details: parsed.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid Linkwarden token payload.', parsed.error.flatten());
+    }
+
+    const encryptedToken = configStore.encryptSecret(parsed.data.token);
+    db.setUserLinkwardenToken(principal.userId, encryptedToken);
+
+    logUiInfo(request, 'ui_user_set_linkwarden_token_success', {
+      userId: principal.userId
+    });
+
+    reply.send({
+      ok: true,
+      userId: principal.userId,
+      linkwardenTokenConfigured: true
     });
   });
 

@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { ConfigStore } from '../config/config-store.js';
 import { SqliteStore } from '../db/database.js';
 import { LinkwardenClient } from '../linkwarden/client.js';
-import { createValidatedLinkwardenClient } from '../linkwarden/runtime.js';
+import { createUserLinkwardenClient } from '../linkwarden/runtime.js';
 import { computeReorgPlan } from '../planning/reorg.js';
 import type { AuthenticatedPrincipal, BulkUpdateRequest, LinkItem, PlanItem, PlanScope } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
@@ -139,7 +139,7 @@ function computeBulkTagResult(current: number[], updates: number[] | undefined, 
 
 // This helper creates a Linkwarden client from currently unlocked runtime secrets.
 function getClient(context: ToolRuntimeContext): LinkwardenClient {
-  return createValidatedLinkwardenClient(context.configStore, context.db, context.logger);
+  return createUserLinkwardenClient(context.configStore, context.db, context.principal.userId, context.logger);
 }
 
 // This helper returns compact result metadata to keep tool completion logs concise.

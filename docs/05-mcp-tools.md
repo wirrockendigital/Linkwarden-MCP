@@ -16,6 +16,7 @@
 
 - Listen/Suche sind paginiert und limitiert
 - Schreibvorgänge benötigen aktivierten **benutzerspezifischen** Write-Mode
+- Jeder Benutzer benötigt einen eigenen `Linkwarden API Key -> MCP`
 - Reorganisation ist immer zweistufig:
   1. `linkwarden_plan_reorg` (Dry-run)
   2. `linkwarden_apply_plan` mit `confirm="APPLY"`

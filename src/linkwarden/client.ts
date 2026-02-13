@@ -30,11 +30,13 @@ interface BulkReplaceInput {
 export class LinkwardenClient {
   private readonly baseUrl: string;
   private readonly config: RuntimeConfig;
+  private readonly token: string;
   private readonly logger?: FastifyBaseLogger;
 
-  public constructor(baseUrl: string, config: RuntimeConfig, logger?: FastifyBaseLogger) {
+  public constructor(baseUrl: string, config: RuntimeConfig, token: string, logger?: FastifyBaseLogger) {
     this.baseUrl = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
     this.config = config;
+    this.token = token;
     this.logger = logger?.child({
       component: 'linkwarden_client'
     });
@@ -116,7 +118,7 @@ export class LinkwardenClient {
         const response = await fetch(this.buildUrl(path, options?.query), {
           method,
           headers: {
-            Authorization: `Bearer ${this.config.linkwardenApiToken}`,
+            Authorization: `Bearer ${this.token}`,
             'Content-Type': 'application/json'
           },
           body: options?.body ? JSON.stringify(options.body) : undefined,

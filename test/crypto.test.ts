@@ -1,17 +1,25 @@
 // This test suite verifies encryption/decryption correctness and passphrase verifier behavior.
 
 import { describe, expect, it } from 'vitest';
-import { decryptRuntimeConfig, encryptRuntimeConfig, createPassphraseVerifier, verifyPassphrase } from '../src/config/crypto.js';
+import {
+  decryptRuntimeConfig,
+  encryptRuntimeConfig,
+  createPassphraseVerifier,
+  verifyPassphrase,
+  encryptSecret,
+  decryptSecret
+} from '../src/config/crypto.js';
 import type { RuntimeConfig } from '../src/types/domain.js';
 import { AppError } from '../src/utils/errors.js';
 
 describe('crypto helpers', () => {
   const config: RuntimeConfig = {
-    linkwardenApiToken: 'token-abcdefghijklmnopqrstuvwxyz',
     requestTimeoutMs: 10000,
     maxRetries: 3,
     retryBaseDelayMs: 350,
-    planTtlHours: 24
+    planTtlHours: 24,
+    oauthClientId: 'chatgpt-client',
+    oauthClientSecret: 'chatgpt-secret-value'
   };
 
   it('encrypts and decrypts config round-trip', () => {
@@ -32,5 +40,12 @@ describe('crypto helpers', () => {
 
     expect(verifyPassphrase('this-is-a-strong-passphrase', verifier)).toBe(true);
     expect(verifyPassphrase('this-is-not-correct', verifier)).toBe(false);
+  });
+
+  it('encrypts and decrypts secrets round-trip', () => {
+    const payload = encryptSecret('linkwarden-secret-token', 'this-is-a-strong-passphrase');
+    const decrypted = decryptSecret(payload, 'this-is-a-strong-passphrase');
+
+    expect(decrypted).toBe('linkwarden-secret-token');
   });
 });

@@ -16,7 +16,6 @@ describe('mcp write-mode gate', () => {
       },
       configStore: {
         getRuntimeConfig: () => ({
-          linkwardenApiToken: 'token-abcdefghijklmnopqrstuvwxyz',
           requestTimeoutMs: 10000,
           maxRetries: 1,
           retryBaseDelayMs: 100,

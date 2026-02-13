@@ -3,7 +3,7 @@
 ## Secret-Handling
 
 - Keine hardcodierten Secrets
-- Linkwarden-Token liegt verschlüsselt in `/data/config.enc`
+- Linkwarden API Keys liegen pro Benutzer verschlüsselt in `/data/state.db`
 - Verschlüsselung über Master-Passphrase (AES-GCM + PBKDF2)
 - API-Keys werden nur gehasht gespeichert
 
@@ -11,8 +11,10 @@
 
 ### MCP
 
-- `Authorization: Bearer <MCP_API_KEY>` auf `/mcp`
-- Token ist einem Benutzerkonto zugeordnet
+- OAuth 2.0 Bearer Token auf `/mcp` (Standard für ChatGPT Connector)
+- MCP API-Key als Legacy-Fallback bleibt möglich
+- Token ist immer einem Benutzerkonto zugeordnet
+- Bei fehlendem/ungültigem Token liefert `/mcp` einen OAuth-kompatiblen `WWW-Authenticate`-Challenge
 
 ### Browser-UI
 
@@ -49,4 +51,3 @@ Jeder Write wird protokolliert mit:
 - Zielobjekten
 - Before/After Summary
 - Outcome (success/failed)
-

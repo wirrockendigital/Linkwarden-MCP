@@ -14,7 +14,8 @@ Du konfigurierst:
 - `adminUsername`
 - `adminPassword`
 - `linkwardenBaseUrl`
-- `linkwardenApiToken`
+- `Linkwarden API Key -> MCP`
+- optional `OAuth Client ID` + `OAuth Client Secret` (für statischen Connector-Client)
 - Whitelist-Einträge (`domain`, `ip`, `cidr`)
 
 ## Wo wird die `masterPassphrase` konfiguriert?
@@ -55,16 +56,17 @@ curl -X POST http://192.168.123.220:8080/setup/unlock \
 1. Login auf `GET /`
 2. Benutzer und API-Keys verwalten
 3. Linkwarden Target + Whitelist pflegen
-4. Write-Mode pro Benutzer steuern
+4. Linkwarden API Key -> MCP pro Benutzer setzen/rotieren
+5. Write-Mode pro Benutzer steuern
 
 ### User-Flow
 
 1. Login auf `GET /`
 2. Eigenen Write-Mode toggeln
-3. Eigene API-Keys verwalten
+3. Eigenen Linkwarden API Key -> MCP setzen
+4. Eigene MCP API-Keys verwalten
 
 ## Health und Readiness
 
 - `GET /health` -> Prozess lebt
 - `GET /ready` -> Setup/Unlock/User/Whitelist/Target/Upstream sind geprüft
-

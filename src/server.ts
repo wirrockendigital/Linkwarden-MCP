@@ -5,9 +5,10 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ConfigStore } from './config/config-store.js';
 import { SqliteStore } from './db/database.js';
+import { registerOAuthRoutes } from './http/oauth.js';
 import { registerSetupRoutes } from './http/setup.js';
 import { registerUiRoutes } from './http/ui.js';
-import { createValidatedLinkwardenClient } from './linkwarden/runtime.js';
+import { createValidatedLinkwardenClientWithToken } from './linkwarden/runtime.js';
 import { registerMcpRoutes } from './mcp/protocol.js';
 import { AppError, normalizeError } from './utils/errors.js';
 import { buildLoggerOptions, errorForLog, sanitizeForLog } from './utils/logger.js';
@@ -37,6 +38,27 @@ export function createServer(): ServerResources {
     bodyLimit: 1024 * 1024,
     trustProxy: true
   });
+
+  // This parser enables OAuth token endpoint requests using application/x-www-form-urlencoded payloads.
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'string' },
+    (request, body, done) => {
+      try {
+        const raw = typeof body === 'string' ? body : '';
+        const params = new URLSearchParams(raw);
+        const normalized: Record<string, string> = {};
+
+        for (const [key, value] of params.entries()) {
+          normalized[key] = value;
+        }
+
+        done(null, normalized);
+      } catch (error) {
+        done(error as Error, undefined);
+      }
+    }
+  );
 
   const db = new SqliteStore(dbPath);
   const configStore = new ConfigStore({
@@ -161,9 +183,26 @@ export function createServer(): ServerResources {
 
     let upstreamReachable = false;
     try {
-      const client = createValidatedLinkwardenClient(configStore, db, app.log);
-      await client.listTags({ limit: 1, offset: 0 });
-      upstreamReachable = true;
+      const tokenOwner = db.getAnyUserWithLinkwardenToken();
+      if (!tokenOwner) {
+        app.log.warn(
+          {
+            event: 'readiness_missing_user_token'
+          },
+          'readiness_missing_user_token'
+        );
+        upstreamReachable = false;
+      } else {
+        const tokenEnc = db.getUserLinkwardenToken(tokenOwner.userId);
+        if (!tokenEnc) {
+          upstreamReachable = false;
+        } else {
+          const token = configStore.decryptSecret(tokenEnc);
+          const client = createValidatedLinkwardenClientWithToken(configStore, db, token, app.log);
+          await client.listTags({ limit: 1, offset: 0 });
+          upstreamReachable = true;
+        }
+      }
     } catch {
       app.log.warn(
         {
@@ -200,6 +239,7 @@ export function createServer(): ServerResources {
 
   registerUiRoutes(app, configStore, db);
   registerSetupRoutes(app, configStore, db);
+  registerOAuthRoutes(app, { configStore, db });
   registerMcpRoutes(app, { configStore, db });
 
   // This handler maps internal exceptions into structured JSON errors.

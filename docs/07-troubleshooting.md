@@ -4,14 +4,16 @@
 
 Ursachen:
 
-- falscher Bearer-Token im Connector
-- API-Key revoked
+- OAuth-Token im Connector abgelaufen/ungültig
+- OAuth-Client-Konfiguration (Client ID/Secret) passt nicht zum Server
+- API-Key revoked (nur Legacy-Fallback)
 - Benutzer deaktiviert
 
 Lösung:
 
-- im Admin-UI neuen API-Key ausstellen
-- Connector-Token in ChatGPT aktualisieren
+- OAuth-Flow im Connector neu durchführen
+- statische OAuth Client ID/Secret in Connector und First-Run-Konfiguration abgleichen
+- falls Legacy-API-Key genutzt wird: im Admin-UI neuen API-Key ausstellen und im Connector aktualisieren
 
 ## `403 write_mode_disabled`
 
@@ -22,6 +24,17 @@ Ursache:
 Lösung:
 
 - im User-UI oder Admin-UI den Write-Mode für diesen Benutzer aktivieren
+
+## `409 linkwarden_token_missing`
+
+Ursache:
+
+- Für den Benutzer ist noch kein Linkwarden API Key -> MCP gesetzt
+
+Lösung:
+
+- im User-UI den eigenen Linkwarden API Key setzen
+- oder als Admin den Linkwarden API Key pro Benutzer setzen
 
 ## `403 base_url_not_whitelisted`
 

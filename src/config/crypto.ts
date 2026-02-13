@@ -63,19 +63,78 @@ export function decryptRuntimeConfig(payload: EncryptedConfig, passphrase: strin
     const decipher = createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(authTag);
     const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-    const parsed = JSON.parse(decrypted.toString('utf8')) as RuntimeConfig;
+    const parsed = JSON.parse(decrypted.toString('utf8')) as Partial<RuntimeConfig>;
 
-    if (!parsed.linkwardenApiToken) {
-      throw new AppError(400, 'invalid_config_payload', 'Encrypted config is missing required fields.');
-    }
-
-    return parsed;
+    return {
+      requestTimeoutMs: Number.isFinite(parsed.requestTimeoutMs)
+        ? Number(parsed.requestTimeoutMs)
+        : 10_000,
+      maxRetries: Number.isFinite(parsed.maxRetries) ? Number(parsed.maxRetries) : 3,
+      retryBaseDelayMs: Number.isFinite(parsed.retryBaseDelayMs) ? Number(parsed.retryBaseDelayMs) : 350,
+      planTtlHours: Number.isFinite(parsed.planTtlHours) ? Number(parsed.planTtlHours) : 24,
+      oauthClientId:
+        typeof parsed.oauthClientId === 'string' && parsed.oauthClientId.trim().length > 0
+          ? parsed.oauthClientId.trim()
+          : undefined,
+      oauthClientSecret:
+        typeof parsed.oauthClientSecret === 'string' && parsed.oauthClientSecret.trim().length > 0
+          ? parsed.oauthClientSecret.trim()
+          : undefined
+    };
   } catch (error) {
     if (error instanceof AppError) {
       throw error;
     }
 
     throw new AppError(401, 'invalid_passphrase', 'Passphrase is invalid or config is corrupted.');
+  }
+}
+
+// This function encrypts an arbitrary secret string for storage in SQLite.
+export function encryptSecret(value: string, passphrase: string, iterations = 210_000): EncryptedConfig {
+  const salt = randomBytes(16);
+  const iv = randomBytes(12);
+  const key = deriveKey(passphrase, salt, iterations);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const plaintext = Buffer.from(value, 'utf8');
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+
+  return {
+    version: 1,
+    cipher: 'aes-256-gcm',
+    kdf: 'pbkdf2-sha512',
+    iterations,
+    saltB64: salt.toString('base64'),
+    ivB64: iv.toString('base64'),
+    ciphertextB64: encrypted.toString('base64'),
+    authTagB64: authTag.toString('base64')
+  };
+}
+
+// This function decrypts a stored secret string using the master passphrase.
+export function decryptSecret(payload: EncryptedConfig, passphrase: string): string {
+  if (payload.version !== 1 || payload.cipher !== 'aes-256-gcm' || payload.kdf !== 'pbkdf2-sha512') {
+    throw new AppError(400, 'unsupported_secret_format', 'Unsupported encrypted secret format.');
+  }
+
+  const salt = decodeBase64(payload.saltB64, 'saltB64');
+  const iv = decodeBase64(payload.ivB64, 'ivB64');
+  const ciphertext = decodeBase64(payload.ciphertextB64, 'ciphertextB64');
+  const authTag = decodeBase64(payload.authTagB64, 'authTagB64');
+
+  try {
+    const key = deriveKey(passphrase, salt, payload.iterations);
+    const decipher = createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(authTag);
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return decrypted.toString('utf8');
+  } catch (error) {
+    if (error instanceof AppError) {
+      throw error;
+    }
+
+    throw new AppError(401, 'invalid_passphrase', 'Passphrase is invalid or secret is corrupted.');
   }
 }
 

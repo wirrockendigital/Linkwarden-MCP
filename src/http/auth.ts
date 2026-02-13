@@ -6,6 +6,7 @@ import { ConfigStore } from '../config/config-store.js';
 import { SqliteStore } from '../db/database.js';
 import type { AuthenticatedPrincipal, SessionPrincipal } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
+import { buildBearerChallenge, getAcceptedResources } from '../utils/oauth.js';
 import { hashApiToken, parseCookies } from '../utils/security.js';
 
 export interface AuthContext {
@@ -72,24 +73,60 @@ export function createMcpAuthGuard(configStore: ConfigStore, db: SqliteStore) {
         },
         'mcp_auth_missing_bearer'
       );
-      reply.header('WWW-Authenticate', 'Bearer');
+      reply.header(
+        'WWW-Authenticate',
+        buildBearerChallenge(request, 'invalid_token', 'Missing bearer token for MCP request.')
+      );
       throw new AppError(401, 'unauthorized', 'Missing MCP access token.');
     }
 
-    const principal = db.authenticateByTokenHash(hashApiToken(token));
-    if (principal) {
+    const tokenHash = hashApiToken(token);
+    let oauthPrincipal: AuthenticatedPrincipal | null = null;
+    try {
+      oauthPrincipal = db.authenticateOAuthAccessToken(tokenHash, getAcceptedResources(request));
+    } catch (error) {
+      request.log?.warn?.(
+        {
+          event: 'mcp_auth_oauth_resource_resolution_failed',
+          requestId: request.id,
+          message: error instanceof Error ? error.message : String(error)
+        },
+        'mcp_auth_oauth_resource_resolution_failed'
+      );
+      oauthPrincipal = null;
+    }
+
+    if (oauthPrincipal) {
       request.log?.info?.(
         {
           event: 'mcp_auth_success',
           requestId: request.id,
-          userId: principal.userId,
-          username: principal.username,
-          role: principal.role,
-          apiKeyId: principal.apiKeyId
+          authMethod: 'oauth',
+          userId: oauthPrincipal.userId,
+          username: oauthPrincipal.username,
+          role: oauthPrincipal.role,
+          apiKeyId: oauthPrincipal.apiKeyId
         },
         'mcp_auth_success'
       );
-      return { principal };
+      return { principal: oauthPrincipal };
+    }
+
+    const apiKeyPrincipal = db.authenticateByTokenHash(tokenHash);
+    if (apiKeyPrincipal) {
+      request.log?.info?.(
+        {
+          event: 'mcp_auth_success',
+          requestId: request.id,
+          authMethod: 'api_key',
+          userId: apiKeyPrincipal.userId,
+          username: apiKeyPrincipal.username,
+          role: apiKeyPrincipal.role,
+          apiKeyId: apiKeyPrincipal.apiKeyId
+        },
+        'mcp_auth_success'
+      );
+      return { principal: apiKeyPrincipal };
     }
 
     request.log?.warn?.(
@@ -100,7 +137,7 @@ export function createMcpAuthGuard(configStore: ConfigStore, db: SqliteStore) {
       'mcp_auth_invalid_bearer'
     );
 
-    reply.header('WWW-Authenticate', 'Bearer');
+    reply.header('WWW-Authenticate', buildBearerChallenge(request, 'invalid_token', 'Bearer token is invalid or expired.'));
     throw new AppError(401, 'unauthorized', 'Invalid MCP access token.');
   };
 }

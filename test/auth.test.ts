@@ -20,6 +20,7 @@ describe('auth helpers', () => {
     } as any;
 
     const db = {
+      authenticateOAuthAccessToken: () => null,
       authenticateByTokenHash: () => null
     } as any;
 
@@ -39,6 +40,7 @@ describe('auth helpers', () => {
     } as any;
 
     const db = {
+      authenticateOAuthAccessToken: () => null,
       authenticateByTokenHash: () => ({
         userId: 2,
         username: 'alice',
@@ -49,7 +51,7 @@ describe('auth helpers', () => {
 
     const guard = createMcpAuthGuard(configStore, db);
 
-    const request = { headers: { authorization: 'Bearer expected-token' } } as any;
+    const request = { headers: { authorization: 'Bearer expected-token', host: 'localhost:8080' }, protocol: 'http' } as any;
     const reply = { header: () => undefined } as any;
 
     await expect(guard(request, reply)).resolves.toMatchObject({
@@ -57,6 +59,62 @@ describe('auth helpers', () => {
         username: 'alice'
       }
     });
+  });
+
+  it('accepts valid oauth token when initialized and unlocked', async () => {
+    const configStore = {
+      isInitialized: () => true,
+      isUnlocked: () => true,
+      getRuntimeConfig: () => ({})
+    } as any;
+
+    const db = {
+      authenticateOAuthAccessToken: () => ({
+        userId: 7,
+        username: 'oauth-user',
+        role: 'user',
+        apiKeyId: 'oauth:token-1'
+      }),
+      authenticateByTokenHash: () => null
+    } as any;
+
+    const guard = createMcpAuthGuard(configStore, db);
+
+    const request = { headers: { authorization: 'Bearer oauth-token', host: 'localhost:8080' }, protocol: 'http' } as any;
+    const reply = { header: () => undefined } as any;
+
+    await expect(guard(request, reply)).resolves.toMatchObject({
+      principal: {
+        username: 'oauth-user',
+        apiKeyId: 'oauth:token-1'
+      }
+    });
+  });
+
+  it('returns oauth bearer challenge when bearer token is missing', async () => {
+    const configStore = {
+      isInitialized: () => true,
+      isUnlocked: () => true,
+      getRuntimeConfig: () => ({})
+    } as any;
+
+    const db = {
+      authenticateOAuthAccessToken: () => null,
+      authenticateByTokenHash: () => null
+    } as any;
+
+    const headers: Record<string, string> = {};
+    const reply = {
+      header: (name: string, value: string) => {
+        headers[name] = value;
+      }
+    } as any;
+
+    const guard = createMcpAuthGuard(configStore, db);
+    const request = { headers: { host: 'localhost:8080' }, protocol: 'http' } as any;
+
+    await expect(guard(request, reply)).rejects.toBeInstanceOf(AppError);
+    expect(headers['WWW-Authenticate']).toContain('resource_metadata=');
   });
 
   it('reads session principal from cookie token hash', () => {

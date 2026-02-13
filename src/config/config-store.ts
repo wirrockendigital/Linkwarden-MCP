@@ -7,7 +7,9 @@ import type { EncryptedConfig, RuntimeConfig, SetupPayload } from '../types/doma
 import { AppError } from '../utils/errors.js';
 import {
   createPassphraseVerifier,
+  decryptSecret,
   decryptRuntimeConfig,
+  encryptSecret,
   encryptRuntimeConfig
 } from './crypto.js';
 
@@ -49,11 +51,12 @@ export class ConfigStore {
     }
 
     const config: RuntimeConfig = {
-      linkwardenApiToken: payload.linkwardenApiToken,
       requestTimeoutMs: payload.requestTimeoutMs ?? 10_000,
       maxRetries: payload.maxRetries ?? 3,
       retryBaseDelayMs: payload.retryBaseDelayMs ?? 350,
-      planTtlHours: payload.planTtlHours ?? 24
+      planTtlHours: payload.planTtlHours ?? 24,
+      oauthClientId: payload.oauthClientId?.trim() ? payload.oauthClientId.trim() : undefined,
+      oauthClientSecret: payload.oauthClientSecret?.trim() ? payload.oauthClientSecret.trim() : undefined
     };
 
     const encrypted = encryptRuntimeConfig(config, payload.masterPassphrase);
@@ -109,5 +112,23 @@ export class ConfigStore {
     }
 
     return this.runtimeConfig;
+  }
+
+  // This method encrypts arbitrary secret strings with the active master passphrase.
+  public encryptSecret(value: string): EncryptedConfig {
+    if (!this.activePassphrase) {
+      throw new AppError(503, 'config_locked', 'Runtime secrets are locked. Unlock required.');
+    }
+
+    return encryptSecret(value, this.activePassphrase);
+  }
+
+  // This method decrypts arbitrary secret strings with the active master passphrase.
+  public decryptSecret(payload: EncryptedConfig): string {
+    if (!this.activePassphrase) {
+      throw new AppError(503, 'config_locked', 'Runtime secrets are locked. Unlock required.');
+    }
+
+    return decryptSecret(payload, this.activePassphrase);
   }
 }

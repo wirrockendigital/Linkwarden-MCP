@@ -6,6 +6,7 @@ Er verbindet ChatGPT (Developer Mode / Custom MCP Connector) mit deiner selbstge
 ## Was der Container macht
 
 - Stellt einen **Remote MCP Server** via **Streamable HTTP** unter `POST /mcp` bereit
+- Unterstützt OAuth 2.0 für ChatGPT MCP Connectoren (`/.well-known`, `/authorize`, `/token`)
 - Nutzt intern die Linkwarden REST API (`/api/v1/...`)
 - Hat eine browserbasierte Admin/User-Oberfläche unter `GET /`
 - Unterstützt Multi-User mit Rollen `admin` und `user`
@@ -60,6 +61,9 @@ Wichtige Env-Werte in `linkwarden-mcp.env`:
 - `MCP_LOG_LEVEL=debug`
 - `MCP_SESSION_TTL_HOURS=12`
 - `MCP_COOKIE_SECURE=auto`
+- `MCP_PUBLIC_BASE_URL=https://mcp.deine-domain.tld`
+- `MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=1800`
+- `MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS=2592000`
 - `MCP_HOST_BIND_IP=127.0.0.1`
 - `MCP_HOST_PORT=39227`
 
@@ -83,10 +87,16 @@ Nach dem ersten Start:
    - `adminUsername`
    - `adminPassword`
    - `linkwardenBaseUrl`
-   - `linkwardenApiToken`
+   - `Linkwarden API Key -> MCP`
+   - optional `OAuth Client ID` + `OAuth Client Secret` (für statischen OAuth-Client)
    - `whitelistEntries` (Pflicht, kein Allow-All)
 3. Optional kannst du direkt einen initialen Admin-MCP-Key generieren lassen
 4. Danach login mit Admin-Zugang im selben UI
+
+Hinweis:
+
+- Der im Setup eingegebene `Linkwarden API Key -> MCP` wird dem Admin-User zugeordnet.
+- Jeder weitere Benutzer muss seinen eigenen Linkwarden API Key setzen (oder der Admin setzt ihn).
 
 Whitelist-Format im UI:
 
@@ -131,24 +141,30 @@ curl -X POST http://192.168.123.220:8080/setup/unlock \
 - API-Keys ausstellen/revoken
 - Write-Mode pro Benutzer setzen
 - Linkwarden-Ziel und Whitelist pflegen
-- Linkwarden API-Token rotieren
+- Linkwarden API Keys pro Benutzer setzen/rotieren
 
 ### User kann
 
 - Eigene Daten sehen
 - Eigenen Write-Mode ein/ausschalten
+- Eigenen Linkwarden API Key -> MCP setzen
 - Eigene API-Keys erstellen/revoken
 
 Keine Selbstregistrierung vorhanden.
 
-## ChatGPT Developer Mode: Custom MCP Connector
+## ChatGPT Developer Mode: Custom MCP Connector (OAuth)
 
 1. In ChatGPT (Workspace Admin) Developer Mode für MCP Connectoren aktivieren
 2. Custom Connector anlegen:
    - Name: `linkwarden-mcp`
    - Server URL: `https://<deine-domain>/mcp`
-   - Auth: Bearer Token
-   - Token: pro Benutzer eigener MCP-API-Key aus Admin-UI
+   - Auth: OAuth 2.0
+   - Authorization URL: `https://<deine-domain>/authorize`
+   - Token URL: `https://<deine-domain>/token`
+   - Scopes: `mcp.read mcp.write offline_access`
+   - Optional `Client ID`/`Client Secret`:
+   - Wenn im First-Run gesetzt, exakt diese Werte im Connector eintragen.
+   - Wenn nicht gesetzt, kann dynamische Client-Registrierung über `/register` genutzt werden.
 3. Tool Discovery testen (`tools/list`)
 
 Beispielprompts:
@@ -180,9 +196,14 @@ git push origin v0.1.0
 
 ## Sicherheitsmodell
 
-- `/mcp` akzeptiert nur `Authorization: Bearer <API_KEY>`
+- `/mcp` akzeptiert OAuth-Bearer-Tokens (ChatGPT Connector Standard)
+- MCP API Keys bleiben als Legacy-Fallback für manuelle Integrationen verfügbar
 - API-Keys werden gehasht gespeichert
-- Secrets liegen verschlüsselt in `/data/config.enc`
+- Runtime-Config (inkl. optionaler OAuth Client-Daten) liegt verschlüsselt in `/data/config.enc`
+- Pro-User Linkwarden API Keys liegen verschlüsselt in `/data/state.db`
+- Pro Benutzer gibt es zwei getrennte Keys:
+- `Linkwarden API Key -> MCP` (vom jeweiligen Linkwarden-User)
+- `MCP API Key -> AI` (für ChatGPT/AI)
 - Schreiboperationen benötigen benutzerspezifischen Write-Mode (`user_settings.write_mode_enabled=true`)
 - Reorg ist immer 2-stufig (plan + apply)
 - Audit-Log erfasst Actor/Tool/Targets/Before-After/Outcome

@@ -7,8 +7,12 @@ import type { PassphraseVerifier } from '../config/crypto.js';
 import type {
   AuditEntry,
   AuthenticatedPrincipal,
+  EncryptedSecret,
   LinkwardenTarget,
   LinkwardenWhitelistEntry,
+  OAuthAuthorizationCodeRecord,
+  OAuthClientRecord,
+  OAuthTokenRecord,
   PlanItem,
   PlanScope,
   PlanSummary,
@@ -69,6 +73,57 @@ interface SessionRow {
   role: string;
   expires_at: string;
   invalidated: number;
+}
+
+interface OAuthClientRow {
+  client_id: string;
+  client_name: string;
+  redirect_uris_json: string;
+  token_endpoint_auth_method: string;
+  client_secret_hash: string | null;
+  created_at: string;
+  updated_at: string;
+  is_active: number;
+}
+
+interface OAuthAuthorizationCodeRow {
+  user_id: number;
+  username: string;
+  role: string;
+  client_id: string;
+  redirect_uri: string;
+  code_challenge: string;
+  code_challenge_method: string;
+  scope: string;
+  resource: string;
+  expires_at: string;
+  used_at: string | null;
+}
+
+interface OAuthTokenAuthRow {
+  token_id: string;
+  user_id: number;
+  username: string;
+  role: string;
+  client_id: string;
+  scope: string;
+  resource: string;
+  access_expires_at: string;
+  refresh_expires_at: string;
+  revoked: number;
+}
+
+interface OAuthRefreshRow {
+  token_id: string;
+  user_id: number;
+  username: string;
+  role: string;
+  client_id: string;
+  scope: string;
+  resource: string;
+  access_expires_at: string;
+  refresh_expires_at: string;
+  revoked: number;
 }
 
 export interface StoredUser {
@@ -142,6 +197,13 @@ export class SqliteStore {
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS user_linkwarden_tokens (
+        user_id INTEGER PRIMARY KEY,
+        token_enc TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS api_keys (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         key_id TEXT NOT NULL UNIQUE,
@@ -172,6 +234,64 @@ export class SqliteStore {
 
       CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash);
       CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+
+      CREATE INDEX IF NOT EXISTS idx_user_linkwarden_tokens_user_id ON user_linkwarden_tokens(user_id);
+
+      CREATE TABLE IF NOT EXISTS oauth_clients (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_id TEXT NOT NULL UNIQUE,
+        client_name TEXT NOT NULL,
+        redirect_uris_json TEXT NOT NULL,
+        token_endpoint_auth_method TEXT NOT NULL CHECK (token_endpoint_auth_method IN ('none', 'client_secret_post')),
+        client_secret_hash TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS oauth_authorization_codes (
+        code_hash TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        client_id TEXT NOT NULL,
+        redirect_uri TEXT NOT NULL,
+        code_challenge TEXT NOT NULL,
+        code_challenge_method TEXT NOT NULL CHECK (code_challenge_method IN ('S256')),
+        scope TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_oauth_authorization_codes_user_id
+      ON oauth_authorization_codes(user_id);
+      CREATE INDEX IF NOT EXISTS idx_oauth_authorization_codes_client_id
+      ON oauth_authorization_codes(client_id);
+      CREATE INDEX IF NOT EXISTS idx_oauth_authorization_codes_expires_at
+      ON oauth_authorization_codes(expires_at);
+
+      CREATE TABLE IF NOT EXISTS oauth_tokens (
+        token_id TEXT NOT NULL UNIQUE,
+        access_token_hash TEXT NOT NULL PRIMARY KEY,
+        refresh_token_hash TEXT NOT NULL UNIQUE,
+        user_id INTEGER NOT NULL,
+        client_id TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        access_expires_at TEXT NOT NULL,
+        refresh_expires_at TEXT NOT NULL,
+        revoked INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_used_at TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_oauth_tokens_user_id ON oauth_tokens(user_id);
+      CREATE INDEX IF NOT EXISTS idx_oauth_tokens_client_id ON oauth_tokens(client_id);
+      CREATE INDEX IF NOT EXISTS idx_oauth_tokens_refresh_token_hash ON oauth_tokens(refresh_token_hash);
+      CREATE INDEX IF NOT EXISTS idx_oauth_tokens_access_expires_at ON oauth_tokens(access_expires_at);
 
       CREATE TABLE IF NOT EXISTS linkwarden_target (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -585,6 +705,71 @@ export class SqliteStore {
       .run(userId, enabled ? 1 : 0, now);
   }
 
+  // This method stores the encrypted Linkwarden API token for a specific user.
+  public setUserLinkwardenToken(userId: number, token: EncryptedSecret): void {
+    const now = new Date().toISOString();
+    this.getUserById(userId);
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO user_linkwarden_tokens (user_id, token_enc, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          token_enc = excluded.token_enc,
+          updated_at = excluded.updated_at
+      `
+      )
+      .run(userId, JSON.stringify(token), now);
+  }
+
+  // This method returns the encrypted Linkwarden API token for a user, if configured.
+  public getUserLinkwardenToken(userId: number): EncryptedSecret | null {
+    const row = this.db
+      .prepare('SELECT token_enc FROM user_linkwarden_tokens WHERE user_id = ?')
+      .get(userId) as { token_enc: string } | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    return parseJson<EncryptedSecret>(row.token_enc, 'user_linkwarden_tokens.token_enc');
+  }
+
+  // This method checks whether a user has configured a Linkwarden API token.
+  public hasUserLinkwardenToken(userId: number): boolean {
+    const row = this.db
+      .prepare('SELECT 1 AS present FROM user_linkwarden_tokens WHERE user_id = ? LIMIT 1')
+      .get(userId) as { present: number } | undefined;
+
+    return Boolean(row?.present);
+  }
+
+  // This method returns one active user with a configured Linkwarden token, preferring admins.
+  public getAnyUserWithLinkwardenToken(): { userId: number; role: UserRole } | null {
+    const row = this.db
+      .prepare(
+        `
+        SELECT u.id AS user_id, u.role
+        FROM users u
+        JOIN user_linkwarden_tokens t ON t.user_id = u.id
+        WHERE u.is_active = 1
+        ORDER BY CASE WHEN u.role = 'admin' THEN 0 ELSE 1 END, u.id ASC
+        LIMIT 1
+      `
+      )
+      .get() as { user_id: number; role: string } | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    return {
+      userId: row.user_id,
+      role: row.role as UserRole
+    };
+  }
+
   // This method creates a new API key metadata row using a pre-hashed token.
   public createApiKey(userId: number, label: string, keyId: string, tokenHash: string): void {
     const now = new Date().toISOString();
@@ -657,6 +842,367 @@ export class SqliteStore {
     if (result.changes === 0) {
       throw new AppError(404, 'api_key_not_found', `API key ${keyId} not found.`);
     }
+  }
+
+  // This method creates or updates one OAuth client registration record.
+  public upsertOAuthClient(input: {
+    clientId: string;
+    clientName: string;
+    redirectUris: string[];
+    tokenEndpointAuthMethod: 'none' | 'client_secret_post';
+    clientSecretHash?: string;
+  }): OAuthClientRecord {
+    const now = new Date().toISOString();
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO oauth_clients (
+          client_id,
+          client_name,
+          redirect_uris_json,
+          token_endpoint_auth_method,
+          client_secret_hash,
+          is_active,
+          created_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT(client_id) DO UPDATE SET
+          client_name = excluded.client_name,
+          redirect_uris_json = excluded.redirect_uris_json,
+          token_endpoint_auth_method = excluded.token_endpoint_auth_method,
+          client_secret_hash = excluded.client_secret_hash,
+          is_active = 1,
+          updated_at = excluded.updated_at
+      `
+      )
+      .run(
+        input.clientId,
+        input.clientName,
+        JSON.stringify(input.redirectUris),
+        input.tokenEndpointAuthMethod,
+        input.clientSecretHash ?? null,
+        now,
+        now
+      );
+
+    const client = this.getOAuthClient(input.clientId);
+    if (!client) {
+      throw new AppError(500, 'oauth_client_store_failed', 'Failed to persist OAuth client.');
+    }
+
+    return client;
+  }
+
+  // This method returns one OAuth client by client-id when active.
+  public getOAuthClient(clientId: string): OAuthClientRecord | null {
+    const row = this.db
+      .prepare(
+        `
+        SELECT
+          client_id,
+          client_name,
+          redirect_uris_json,
+          token_endpoint_auth_method,
+          client_secret_hash,
+          created_at,
+          updated_at,
+          is_active
+        FROM oauth_clients
+        WHERE client_id = ?
+        LIMIT 1
+      `
+      )
+      .get(clientId) as OAuthClientRow | undefined;
+
+    if (!row || row.is_active !== 1) {
+      return null;
+    }
+
+    return {
+      clientId: row.client_id,
+      clientName: row.client_name,
+      redirectUris: parseJson<string[]>(row.redirect_uris_json, 'oauth_clients.redirect_uris_json'),
+      tokenEndpointAuthMethod: row.token_endpoint_auth_method as OAuthClientRecord['tokenEndpointAuthMethod'],
+      clientSecretHash: row.client_secret_hash ?? undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+  }
+
+  // This method stores one short-lived OAuth authorization code for later token exchange.
+  public createOAuthAuthorizationCode(input: {
+    codeHash: string;
+    userId: number;
+    clientId: string;
+    redirectUri: string;
+    codeChallenge: string;
+    codeChallengeMethod: 'S256';
+    scope: string;
+    resource: string;
+    expiresAt: string;
+  }): void {
+    const now = new Date().toISOString();
+    this.getUserById(input.userId);
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO oauth_authorization_codes (
+          code_hash,
+          user_id,
+          client_id,
+          redirect_uri,
+          code_challenge,
+          code_challenge_method,
+          scope,
+          resource,
+          expires_at,
+          used_at,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+      `
+      )
+      .run(
+        input.codeHash,
+        input.userId,
+        input.clientId,
+        input.redirectUri,
+        input.codeChallenge,
+        input.codeChallengeMethod,
+        input.scope,
+        input.resource,
+        input.expiresAt,
+        now
+      );
+  }
+
+  // This method atomically consumes one OAuth authorization code and rejects replay attempts.
+  public consumeOAuthAuthorizationCode(
+    codeHash: string,
+    clientId: string,
+    redirectUri: string
+  ): OAuthAuthorizationCodeRecord | null {
+    const nowIso = new Date().toISOString();
+
+    const tx = this.db.transaction(() => {
+      const row = this.db
+        .prepare(
+          `
+          SELECT
+            c.user_id,
+            u.username,
+            u.role,
+            c.client_id,
+            c.redirect_uri,
+            c.code_challenge,
+            c.code_challenge_method,
+            c.scope,
+            c.resource,
+            c.expires_at,
+            c.used_at
+          FROM oauth_authorization_codes c
+          JOIN users u ON u.id = c.user_id
+          WHERE c.code_hash = ?
+            AND c.client_id = ?
+            AND c.redirect_uri = ?
+            AND u.is_active = 1
+          LIMIT 1
+        `
+        )
+        .get(codeHash, clientId, redirectUri) as OAuthAuthorizationCodeRow | undefined;
+
+      if (!row) {
+        return null;
+      }
+
+      if (row.used_at !== null) {
+        return null;
+      }
+
+      if (new Date(row.expires_at).getTime() <= Date.now()) {
+        return null;
+      }
+
+      const result = this.db
+        .prepare('UPDATE oauth_authorization_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL')
+        .run(nowIso, codeHash);
+      if (result.changes !== 1) {
+        return null;
+      }
+
+      return {
+        userId: row.user_id,
+        username: row.username,
+        role: row.role as UserRole,
+        clientId: row.client_id,
+        redirectUri: row.redirect_uri,
+        codeChallenge: row.code_challenge,
+        codeChallengeMethod: row.code_challenge_method as OAuthAuthorizationCodeRecord['codeChallengeMethod'],
+        scope: row.scope,
+        resource: row.resource,
+        expiresAt: row.expires_at
+      } satisfies OAuthAuthorizationCodeRecord;
+    });
+
+    return tx();
+  }
+
+  // This method stores one OAuth access+refresh token pair.
+  public createOAuthToken(input: {
+    tokenId: string;
+    accessTokenHash: string;
+    refreshTokenHash: string;
+    userId: number;
+    clientId: string;
+    scope: string;
+    resource: string;
+    accessExpiresAt: string;
+    refreshExpiresAt: string;
+  }): void {
+    const now = new Date().toISOString();
+    this.getUserById(input.userId);
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO oauth_tokens (
+          token_id,
+          access_token_hash,
+          refresh_token_hash,
+          user_id,
+          client_id,
+          scope,
+          resource,
+          access_expires_at,
+          refresh_expires_at,
+          revoked,
+          created_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      `
+      )
+      .run(
+        input.tokenId,
+        input.accessTokenHash,
+        input.refreshTokenHash,
+        input.userId,
+        input.clientId,
+        input.scope,
+        input.resource,
+        input.accessExpiresAt,
+        input.refreshExpiresAt,
+        now,
+        now
+      );
+  }
+
+  // This method validates OAuth bearer tokens for MCP access and updates last-used metadata.
+  public authenticateOAuthAccessToken(tokenHash: string, acceptedResources: string[]): AuthenticatedPrincipal | null {
+    const row = this.db
+      .prepare(
+        `
+        SELECT
+          t.token_id,
+          t.user_id,
+          u.username,
+          u.role,
+          t.client_id,
+          t.scope,
+          t.resource,
+          t.access_expires_at,
+          t.refresh_expires_at,
+          t.revoked
+        FROM oauth_tokens t
+        JOIN users u ON u.id = t.user_id
+        WHERE t.access_token_hash = ?
+          AND u.is_active = 1
+        LIMIT 1
+      `
+      )
+      .get(tokenHash) as OAuthTokenAuthRow | undefined;
+
+    if (!row || row.revoked === 1) {
+      return null;
+    }
+
+    if (new Date(row.access_expires_at).getTime() <= Date.now()) {
+      return null;
+    }
+
+    if (!acceptedResources.includes(row.resource)) {
+      return null;
+    }
+
+    this.db
+      .prepare('UPDATE oauth_tokens SET last_used_at = ?, updated_at = ? WHERE token_id = ?')
+      .run(new Date().toISOString(), new Date().toISOString(), row.token_id);
+
+    return {
+      userId: row.user_id,
+      username: row.username,
+      role: row.role as UserRole,
+      apiKeyId: `oauth:${row.token_id}`
+    };
+  }
+
+  // This method consumes a refresh token and revokes it to enforce refresh rotation.
+  public consumeOAuthRefreshToken(refreshTokenHash: string): OAuthTokenRecord | null {
+    const nowIso = new Date().toISOString();
+
+    const tx = this.db.transaction(() => {
+      const row = this.db
+        .prepare(
+          `
+          SELECT
+            t.token_id,
+            t.user_id,
+            u.username,
+            u.role,
+            t.client_id,
+            t.scope,
+            t.resource,
+            t.access_expires_at,
+            t.refresh_expires_at,
+            t.revoked
+          FROM oauth_tokens t
+          JOIN users u ON u.id = t.user_id
+          WHERE t.refresh_token_hash = ?
+            AND u.is_active = 1
+          LIMIT 1
+        `
+        )
+        .get(refreshTokenHash) as OAuthRefreshRow | undefined;
+
+      if (!row || row.revoked === 1) {
+        return null;
+      }
+
+      if (new Date(row.refresh_expires_at).getTime() <= Date.now()) {
+        return null;
+      }
+
+      const result = this.db
+        .prepare('UPDATE oauth_tokens SET revoked = 1, updated_at = ? WHERE token_id = ? AND revoked = 0')
+        .run(nowIso, row.token_id);
+      if (result.changes !== 1) {
+        return null;
+      }
+
+      return {
+        tokenId: row.token_id,
+        userId: row.user_id,
+        username: row.username,
+        role: row.role as UserRole,
+        clientId: row.client_id,
+        scope: row.scope,
+        resource: row.resource,
+        accessExpiresAt: row.access_expires_at,
+        refreshExpiresAt: row.refresh_expires_at
+      } satisfies OAuthTokenRecord;
+    });
+
+    return tx();
   }
 
   // This method verifies a hashed API token and returns the authenticated principal.

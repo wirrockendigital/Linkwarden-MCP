@@ -7,10 +7,11 @@ import { AppError } from '../utils/errors.js';
 import { assertBaseUrlWhitelisted } from '../utils/whitelist.js';
 import { LinkwardenClient } from './client.js';
 
-// This helper builds one validated Linkwarden client from runtime config, target, and whitelist.
-export function createValidatedLinkwardenClient(
+// This helper builds one validated Linkwarden client from runtime config, target, whitelist, and token.
+export function createValidatedLinkwardenClientWithToken(
   configStore: ConfigStore,
   db: SqliteStore,
+  token: string,
   logger?: FastifyBaseLogger
 ): LinkwardenClient {
   const runtimeConfig = configStore.getRuntimeConfig();
@@ -33,5 +34,21 @@ export function createValidatedLinkwardenClient(
     'linkwarden_runtime_client_built'
   );
 
-  return new LinkwardenClient(target.baseUrl, runtimeConfig, logger);
+  return new LinkwardenClient(target.baseUrl, runtimeConfig, token, logger);
+}
+
+// This helper builds a Linkwarden client for a specific authenticated user.
+export function createUserLinkwardenClient(
+  configStore: ConfigStore,
+  db: SqliteStore,
+  userId: number,
+  logger?: FastifyBaseLogger
+): LinkwardenClient {
+  const tokenEnc = db.getUserLinkwardenToken(userId);
+  if (!tokenEnc) {
+    throw new AppError(409, 'linkwarden_token_missing', 'Linkwarden API token is not configured for this user.');
+  }
+
+  const token = configStore.decryptSecret(tokenEnc);
+  return createValidatedLinkwardenClientWithToken(configStore, db, token, logger);
 }

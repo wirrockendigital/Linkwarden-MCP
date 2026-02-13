@@ -87,12 +87,15 @@ export interface EncryptedConfig {
   authTagB64: string;
 }
 
+export type EncryptedSecret = EncryptedConfig;
+
 export interface RuntimeConfig {
-  linkwardenApiToken: string;
   requestTimeoutMs: number;
   maxRetries: number;
   retryBaseDelayMs: number;
   planTtlHours: number;
+  oauthClientId?: string;
+  oauthClientSecret?: string;
 }
 
 export interface SetupPayload {
@@ -101,6 +104,8 @@ export interface SetupPayload {
   adminPassword: string;
   linkwardenBaseUrl: string;
   linkwardenApiToken: string;
+  oauthClientId?: string;
+  oauthClientSecret?: string;
   whitelistEntries: Array<{
     type: WhitelistType;
     value: string;
@@ -119,6 +124,43 @@ export interface AuthenticatedPrincipal {
   username: string;
   role: UserRole;
   apiKeyId: string;
+}
+
+export type AuthMethod = 'api_key' | 'oauth';
+
+export interface OAuthClientRecord {
+  clientId: string;
+  clientName: string;
+  redirectUris: string[];
+  tokenEndpointAuthMethod: 'none' | 'client_secret_post';
+  clientSecretHash?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OAuthAuthorizationCodeRecord {
+  userId: number;
+  username: string;
+  role: UserRole;
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  codeChallengeMethod: 'S256';
+  scope: string;
+  resource: string;
+  expiresAt: string;
+}
+
+export interface OAuthTokenRecord {
+  tokenId: string;
+  userId: number;
+  username: string;
+  role: UserRole;
+  clientId: string;
+  scope: string;
+  resource: string;
+  accessExpiresAt: string;
+  refreshExpiresAt: string;
 }
 
 export interface SessionPrincipal {

@@ -20,6 +20,8 @@ const initializeSchema = z.object({
   adminPassword: z.string().min(12).max(200),
   linkwardenBaseUrl: z.string().url(),
   linkwardenApiToken: z.string().min(20),
+  oauthClientId: z.string().min(3).max(255).optional(),
+  oauthClientSecret: z.string().min(8).max(500).optional(),
   whitelistEntries: z.array(whitelistEntrySchema).min(1).max(200),
   adminWriteModeDefault: z.boolean().default(false),
   issueAdminApiKey: z.boolean().default(true),
@@ -27,6 +29,9 @@ const initializeSchema = z.object({
   maxRetries: z.number().int().min(0).max(8).optional(),
   retryBaseDelayMs: z.number().int().min(50).max(5000).optional(),
   planTtlHours: z.number().int().min(1).max(168).optional()
+}).refine((payload) => !payload.oauthClientSecret || Boolean(payload.oauthClientId), {
+  message: 'oauthClientId is required when oauthClientSecret is set.',
+  path: ['oauthClientId']
 });
 
 const unlockSchema = z.object({
@@ -145,7 +150,9 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
         requestTimeoutMs: parsed.data.requestTimeoutMs ?? 10_000,
         maxRetries: parsed.data.maxRetries ?? 3,
         retryBaseDelayMs: parsed.data.retryBaseDelayMs ?? 350,
-        planTtlHours: parsed.data.planTtlHours ?? 24
+        planTtlHours: parsed.data.planTtlHours ?? 24,
+        oauthClientConfigured: Boolean(parsed.data.oauthClientId?.trim()),
+        oauthClientSecretConfigured: Boolean(parsed.data.oauthClientSecret?.trim())
       },
       'setup_initialize_payload_valid'
     );
@@ -169,6 +176,8 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
       adminPassword: parsed.data.adminPassword,
       linkwardenBaseUrl: parsed.data.linkwardenBaseUrl,
       linkwardenApiToken: parsed.data.linkwardenApiToken,
+      oauthClientId: parsed.data.oauthClientId,
+      oauthClientSecret: parsed.data.oauthClientSecret,
       whitelistEntries: normalizedWhitelist,
       adminWriteModeDefault: parsed.data.adminWriteModeDefault,
       requestTimeoutMs: parsed.data.requestTimeoutMs,
@@ -188,6 +197,9 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
       writeModeEnabled: parsed.data.adminWriteModeDefault
     });
 
+    const encryptedToken = configStore.encryptSecret(parsed.data.linkwardenApiToken);
+    db.setUserLinkwardenToken(adminUserId, encryptedToken);
+
     db.setLinkwardenTarget(parsed.data.linkwardenBaseUrl);
     db.replaceWhitelist(normalizedWhitelist);
 
@@ -200,7 +212,9 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
         adminUsername: parsed.data.adminUsername,
         whitelistCount: normalizedWhitelist.length,
         linkwardenBaseUrl: parsed.data.linkwardenBaseUrl,
-        bootstrapTokenIssued: Boolean(bootstrapToken)
+        bootstrapTokenIssued: Boolean(bootstrapToken),
+        adminLinkwardenTokenConfigured: true,
+        oauthClientConfigured: Boolean(parsed.data.oauthClientId?.trim())
       },
       'setup_initialize_completed'
     );

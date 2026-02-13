@@ -33,6 +33,9 @@ Konfiguration über Env:
 - `MCP_RUN_GID=1061`
 - `MCP_HOST_BIND_IP=127.0.0.1`
 - `MCP_HOST_PORT=39227`
+- `MCP_PUBLIC_BASE_URL=https://mcp.deine-domain.tld`
+- `MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=1800`
+- `MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS=2592000`
 
 Der Container wird mit diesen Werten gestartet:
 
@@ -56,6 +59,7 @@ Empfohlen:
 
 - Extern: `https://mcp.deine-domain.tld`
 - Intern: `http://192.168.123.220:8080`
+- `MCP_PUBLIC_BASE_URL` muss auf die externe HTTPS-URL zeigen, damit OAuth-Metadata korrekt ist.
 
 Nach dem Deploy öffnest du intern `http://192.168.123.220:8080/` für Setup/Login.
 

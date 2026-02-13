@@ -6,18 +6,19 @@
 
 Datenfluss:
 
-1. ChatGPT Connector sendet MCP-Requests an `POST /mcp`
-2. `linkwarden-mcp` authentifiziert den Benutzer über Bearer API-Key
+1. ChatGPT Connector nutzt OAuth 2.0 (`/authorize`, `/token`) und sendet MCP-Requests an `POST /mcp`
+2. `linkwarden-mcp` authentifiziert den Benutzer primär über OAuth Bearer Token (API-Key nur Legacy-Fallback)
 3. Tool-Aufrufe werden gegen Linkwarden (`/api/v1/...`) ausgeführt
 4. Antworten gehen als MCP Tool-Result zurück
 
 ## Persistenz
 
-- `/data/config.enc`: verschlüsselte Runtime-Secrets (Linkwarden API Token)
+- `/data/config.enc`: verschlüsselte Runtime-Settings (Timeouts, Retries, Plan-TTL)
 - `/data/state.db`: SQLite für
   - Users
   - User Settings (Write-Mode pro User)
   - API Keys
+  - Linkwarden API Keys pro User (verschlüsselt)
   - Sessions
   - Linkwarden Target + Whitelist
   - Reorg-Pläne / Plan-Runs
@@ -27,6 +28,11 @@ Datenfluss:
 
 - `GET /` -> Setup/Login/Dashboard UI
 - `POST /mcp` -> Streamable HTTP MCP
+- `GET /.well-known/oauth-protected-resource` -> OAuth Resource Metadata
+- `GET /.well-known/oauth-authorization-server` -> OAuth Authorization Server Metadata
+- `GET /authorize` -> OAuth Authorization Endpoint
+- `POST /token` -> OAuth Token Endpoint
+- `POST /register` -> optionale Dynamic Client Registration
 - `GET /health` -> Liveness
 - `GET /ready` -> Readiness
 - `POST /setup/initialize` -> First-Run Setup
@@ -37,4 +43,3 @@ Datenfluss:
 - passt direkt zu ChatGPT Custom MCP Connector
 - einfacher Reverse-Proxy-Betrieb als SSE
 - klare Request/Response-Semantik
-
