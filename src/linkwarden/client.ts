@@ -332,9 +332,9 @@ export class LinkwardenClient {
     return this.mapLink(response);
   }
 
-  // This method patches a single link and returns normalized output.
+  // This method updates a single link using the documented PUT endpoint and returns normalized output.
   public async updateLink(id: number, updates: Record<string, unknown>): Promise<LinkItem> {
-    const response = await this.request<any>('PATCH', `/api/v1/links/${id}`, {
+    const response = await this.request<any>('PUT', `/api/v1/links/${id}`, {
       body: updates
     });
 

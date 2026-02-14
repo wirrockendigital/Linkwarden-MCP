@@ -19,6 +19,16 @@ export const searchLinksSchema = z.object({
   archived: z.boolean().optional()
 });
 
+// This schema keeps the generic connector search tool aligned with OpenAI search/fetch expectations.
+export const connectorSearchSchema = z.object({
+  query: z.string().min(1)
+});
+
+// This schema keeps the generic connector fetch tool input compact and deterministic.
+export const connectorFetchSchema = z.object({
+  id: z.string().min(1)
+});
+
 export const listCollectionsSchema = z.object({
   limit: pagingSchema.limit,
   offset: pagingSchema.offset
@@ -87,6 +97,8 @@ export const suggestTaxonomySchema = z.object({
 
 // This registry maps tool names to runtime schemas.
 export const toolSchemas = {
+  search: connectorSearchSchema,
+  fetch: connectorFetchSchema,
   linkwarden_search_links: searchLinksSchema,
   linkwarden_list_collections: listCollectionsSchema,
   linkwarden_list_tags: listTagsSchema,
@@ -101,6 +113,16 @@ export const toolSchemas = {
 // This helper exports tool metadata used by MCP tools/list responses.
 export function buildToolList(): McpTool[] {
   return [
+    {
+      name: 'search',
+      description: 'Connector-compatible search tool that returns results[] with id, title, and url.',
+      inputSchema: zodToJsonSchema(connectorSearchSchema, 'search') as Record<string, unknown>
+    },
+    {
+      name: 'fetch',
+      description: 'Connector-compatible fetch tool that returns one document by id.',
+      inputSchema: zodToJsonSchema(connectorFetchSchema, 'fetch') as Record<string, unknown>
+    },
     {
       name: 'linkwarden_search_links',
       description: 'Search links by text query with optional collection/tag/archive filters and paging.',

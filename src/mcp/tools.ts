@@ -14,6 +14,8 @@ import { errorForLog, sanitizeForLog } from '../utils/logger.js';
 import {
   bulkUpdateSchema,
   applyPlanSchema,
+  connectorFetchSchema,
+  connectorSearchSchema,
   getLinkSchema,
   listCollectionsSchema,
   listTagsSchema,
@@ -188,6 +190,61 @@ async function handleSearchLinks(args: unknown, context: ToolRuntimeContext): Pr
       offset: input.offset,
       returned: result.items.length,
       total: result.total
+    }
+  });
+}
+
+// This function provides the generic `search` tool contract expected by OpenAI connector examples.
+async function handleConnectorSearch(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = connectorSearchSchema.parse(args);
+  const client = getClient(context);
+  const result = await client.searchLinks({
+    query: input.query,
+    limit: 20,
+    offset: 0
+  });
+
+  return mcpResult({
+    results: result.items.map((item) => ({
+      id: String(item.id),
+      title: item.title,
+      url: item.url
+    }))
+  });
+}
+
+// This function provides the generic `fetch` tool contract expected by OpenAI connector examples.
+async function handleConnectorFetch(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = connectorFetchSchema.parse(args);
+
+  // This guard keeps the wrapper deterministic by accepting only positive numeric Linkwarden ids.
+  const linkId = Number(input.id);
+  if (!Number.isInteger(linkId) || linkId <= 0) {
+    throw new AppError(400, 'validation_error', 'fetch id must be a positive numeric link id.');
+  }
+
+  const client = getClient(context);
+  const link = await client.getLink(linkId);
+
+  // This fallback text keeps the response useful even when the Linkwarden description is empty.
+  const textLines = [`URL: ${link.url}`];
+  if (link.description) {
+    textLines.push('', link.description);
+  }
+
+  return mcpResult({
+    id: String(link.id),
+    title: link.title,
+    text: textLines.join('\n'),
+    url: link.url,
+    metadata: {
+      source: 'linkwarden',
+      linkId: link.id,
+      archived: link.archived ?? null,
+      collection: link.collection?.name ?? null,
+      tags: link.tags.map((tag) => tag.name),
+      createdAt: link.createdAt ?? null,
+      updatedAt: link.updatedAt ?? null
     }
   });
 }
@@ -747,6 +804,8 @@ async function handleSuggestTaxonomy(args: unknown, context: ToolRuntimeContext)
 }
 
 const toolHandlers: Record<string, (args: unknown, context: ToolRuntimeContext) => Promise<ToolCallResult>> = {
+  search: handleConnectorSearch,
+  fetch: handleConnectorFetch,
   linkwarden_search_links: handleSearchLinks,
   linkwarden_list_collections: handleListCollections,
   linkwarden_list_tags: handleListTags,
