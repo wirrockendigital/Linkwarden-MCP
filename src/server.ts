@@ -38,6 +38,20 @@ function buildRequestHeaderSnapshot(headers: Record<string, unknown>): Record<st
   }) as Record<string, unknown>;
 }
 
+// This helper validates internal next paths and prevents open redirects from root bridge handling.
+function normalizeInternalNextPath(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('/') || trimmed.startsWith('//')) {
+    return null;
+  }
+
+  return trimmed;
+}
+
 // This function builds and configures the full HTTP application.
 export function createServer(): ServerResources {
   const dataDir = process.env.DATA_DIR ?? '/data';
@@ -177,8 +191,15 @@ export function createServer(): ServerResources {
     };
   });
 
-  // This endpoint keeps the root domain dedicated to MCP and machine-facing metadata.
-  app.get('/', async () => {
+  // This endpoint keeps root machine-facing and only bridges OAuth login bootstrap to /admin when needed.
+  app.get('/', async (request, reply) => {
+    const query = (request.query ?? {}) as Record<string, unknown>;
+    const nextPath = normalizeInternalNextPath(query.next);
+    if (nextPath) {
+      reply.redirect(`/admin?next=${encodeURIComponent(nextPath)}`);
+      return;
+    }
+
     return {
       ok: true,
       service: 'linkwarden-mcp',

@@ -9,6 +9,7 @@ Er verbindet ChatGPT (Developer Mode / Custom MCP Connector) mit deiner selbstge
 - Unterstützt OAuth 2.0 für ChatGPT MCP Connectoren (`/.well-known`, `/authorize`, `/token`)
 - Nutzt intern die Linkwarden REST API (`/api/v1/...`)
 - Hat eine browserbasierte Admin/User-Oberfläche unter `GET /admin`
+- Nutzt `GET /` nur als MCP-Service-Root und OAuth-Login-Bridge nach `/admin?next=...` (keine Root-WebUI)
 - Unterstützt Multi-User mit Rollen `admin` und `user`
 - Erzwingt pro Benutzer einen eigenen `write_mode_enabled` für Schreiboperationen
 - Erzwingt Dry-run/Apply-Sicherheit für Reorg-Pläne (`confirm="APPLY"`)
@@ -154,6 +155,10 @@ Keine Selbstregistrierung vorhanden.
    - Wenn im First-Run gesetzt, exakt diese Werte im Connector eintragen.
    - Wenn nicht gesetzt, kann dynamische Client-Registrierung über `/register` genutzt werden.
 3. Tool Discovery testen (`tools/list`)
+
+Hinweis:
+
+- Wenn OAuth ohne bestehende Session startet, erfolgt der Login-Bootstrap über Root (`/?next=...`) und wird serverseitig sicher auf `/admin?next=...` umgeleitet.
 
 Beispielprompts:
 

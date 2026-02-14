@@ -97,6 +97,11 @@ function normalizeObjectBody(input: unknown): Record<string, unknown> {
 
 // This helper returns one absolute login redirect target for session bootstrap.
 function buildLoginRedirectTarget(request: FastifyRequest): string {
+  if (request.url.startsWith('/admin')) {
+    const next = encodeURIComponent(request.url);
+    return `/admin?next=${next}`;
+  }
+
   const next = encodeURIComponent(request.url);
   return `/?next=${next}`;
 }
