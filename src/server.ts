@@ -177,23 +177,30 @@ export function createServer(): ServerResources {
     };
   });
 
+  // This endpoint keeps the root domain dedicated to MCP and machine-facing metadata.
+  app.get('/', async () => {
+    return {
+      ok: true,
+      service: 'linkwarden-mcp',
+      mcpEndpoint: '/mcp'
+    };
+  });
+
   // This endpoint indicates whether setup, unlock, user bootstrap, and Linkwarden reachability are ready.
   app.get('/ready', async () => {
     const initialized = configStore.isInitialized();
     const unlocked = configStore.isUnlocked();
     const hasUsers = db.hasAnyUser();
     const target = db.getLinkwardenTarget();
-    const whitelistCount = db.listWhitelist().length;
 
-    if (!initialized || !unlocked || !hasUsers || !target || whitelistCount === 0) {
+    if (!initialized || !unlocked || !hasUsers || !target) {
       app.log.info(
         {
           event: 'readiness_failed_local_state',
           initialized,
           unlocked,
           hasUsers,
-          linkwardenTargetConfigured: Boolean(target),
-          whitelistConfigured: whitelistCount > 0
+          linkwardenTargetConfigured: Boolean(target)
         },
         'readiness_failed_local_state'
       );
@@ -204,7 +211,6 @@ export function createServer(): ServerResources {
         unlocked,
         hasUsers,
         linkwardenTargetConfigured: Boolean(target),
-        whitelistConfigured: whitelistCount > 0,
         upstreamReachable: false
       };
     }
@@ -248,19 +254,17 @@ export function createServer(): ServerResources {
         unlocked,
         hasUsers,
         linkwardenTargetConfigured: Boolean(target),
-        whitelistConfigured: whitelistCount > 0,
         upstreamReachable
       },
       'readiness_evaluated'
     );
 
     return {
-      ok: initialized && unlocked && hasUsers && Boolean(target) && whitelistCount > 0 && upstreamReachable,
+      ok: initialized && unlocked && hasUsers && Boolean(target) && upstreamReachable,
       initialized,
       unlocked,
       hasUsers,
       linkwardenTargetConfigured: Boolean(target),
-      whitelistConfigured: whitelistCount > 0,
       upstreamReachable
     };
   });

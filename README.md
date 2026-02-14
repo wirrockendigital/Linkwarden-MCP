@@ -8,7 +8,7 @@ Er verbindet ChatGPT (Developer Mode / Custom MCP Connector) mit deiner selbstge
 - Stellt einen **Remote MCP Server** via **Streamable HTTP** unter `POST /mcp` bereit
 - Unterstützt OAuth 2.0 für ChatGPT MCP Connectoren (`/.well-known`, `/authorize`, `/token`)
 - Nutzt intern die Linkwarden REST API (`/api/v1/...`)
-- Hat eine browserbasierte Admin/User-Oberfläche unter `GET /`
+- Hat eine browserbasierte Admin/User-Oberfläche unter `GET /admin`
 - Unterstützt Multi-User mit Rollen `admin` und `user`
 - Erzwingt pro Benutzer einen eigenen `write_mode_enabled` für Schreiboperationen
 - Erzwingt Dry-run/Apply-Sicherheit für Reorg-Pläne (`confirm="APPLY"`)
@@ -70,7 +70,7 @@ Wichtige Env-Werte in `linkwarden-mcp.env`:
 Optionaler Direktzugriff per NAS-IP:
 
 - Beispiel: `MCP_HOST_BIND_IP=192.168.123.50`
-- dann ist die UI/MCP direkt über `http://192.168.123.50:39227` erreichbar
+- dann ist die UI/MCP direkt über `http://192.168.123.50:39227/admin` bzw. `http://192.168.123.50:39227/mcp` erreichbar
 
 Hinweis zu Logs:
 
@@ -81,7 +81,7 @@ Hinweis zu Logs:
 
 Nach dem ersten Start:
 
-1. Öffne `http://192.168.123.220:8080/`
+1. Öffne `http://192.168.123.220:8080/admin`
 2. Fülle den First-Run Setup-Dialog aus:
    - `masterPassphrase`
    - `adminUsername`
@@ -89,7 +89,6 @@ Nach dem ersten Start:
    - `linkwardenBaseUrl`
    - `Linkwarden API Key -> MCP`
    - optional `OAuth Client ID` + `OAuth Client Secret` (für statischen OAuth-Client)
-   - `whitelistEntries` (Pflicht, kein Allow-All)
 3. Optional kannst du direkt einen initialen Admin-MCP-Key generieren lassen
 4. Danach login mit Admin-Zugang im selben UI
 
@@ -97,17 +96,6 @@ Hinweis:
 
 - Der im Setup eingegebene `Linkwarden API Key -> MCP` wird dem Admin-User zugeordnet.
 - Jeder weitere Benutzer muss seinen eigenen Linkwarden API Key setzen (oder der Admin setzt ihn).
-
-Whitelist-Format im UI:
-
-- `domain:linkwarden.internal`
-- `ip:192.168.123.10`
-- `cidr:192.168.123.0/24`
-
-Nicht erlaubt:
-
-- Wildcards (`*.example.com`)
-- `0.0.0.0/0`, `::/0`
 
 ## Annahmen
 
@@ -127,12 +115,12 @@ Damit der Container nach Neustart ohne manuelles Unlock direkt läuft:
 Fallback (nur wenn Auto-Unlock fehlschlägt):
 
 ```bash
-curl -X POST http://192.168.123.220:8080/setup/unlock \
+curl -X POST http://192.168.123.220:8080/admin/setup/unlock \
   -H 'content-type: application/json' \
   -d '{"passphrase":"<dein-master-passphrase>"}'
 ```
 
-## Admin- und User-Oberfläche (`GET /`)
+## Admin- und User-Oberfläche (`GET /admin`)
 
 ### Admin kann
 
@@ -140,7 +128,7 @@ curl -X POST http://192.168.123.220:8080/setup/unlock \
 - Rollen vergeben (`admin`/`user`)
 - API-Keys ausstellen/revoken
 - Write-Mode pro Benutzer setzen
-- Linkwarden-Ziel und Whitelist pflegen
+- Linkwarden-Ziel pflegen
 - Linkwarden API Keys pro Benutzer setzen/rotieren
 
 ### User kann
@@ -212,7 +200,7 @@ git push origin v0.1.0
 ## Health und Readiness
 
 - `GET /health`: Prozess lebt
-- `GET /ready`: Setup + Unlock + User + Target + Whitelist + Linkwarden erreichbar
+- `GET /ready`: Setup + Unlock + User + Target + Linkwarden erreichbar
 
 ## Debug-Logging
 

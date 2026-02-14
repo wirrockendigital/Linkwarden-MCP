@@ -9,7 +9,6 @@ import type {
   AuthenticatedPrincipal,
   EncryptedSecret,
   LinkwardenTarget,
-  LinkwardenWhitelistEntry,
   OAuthAuthorizationCodeRecord,
   OAuthClientRecord,
   OAuthTokenRecord,
@@ -20,8 +19,7 @@ import type {
   SessionPrincipal,
   StoredPlan,
   UserRole,
-  UserSettings,
-  WhitelistType
+  UserSettings
 } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
 import { parseJson } from '../utils/json.js';
@@ -298,16 +296,6 @@ export class SqliteStore {
         base_url TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
-
-      CREATE TABLE IF NOT EXISTS linkwarden_whitelist (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        entry_type TEXT NOT NULL CHECK (entry_type IN ('domain', 'ip', 'cidr')),
-        entry_value TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_linkwarden_whitelist_unique
-      ON linkwarden_whitelist(entry_type, entry_value);
 
       CREATE TABLE IF NOT EXISTS plans (
         plan_id TEXT PRIMARY KEY,
@@ -1334,44 +1322,6 @@ export class SqliteStore {
       baseUrl: row.base_url,
       updatedAt: row.updated_at
     };
-  }
-
-  // This method replaces whitelist entries atomically to keep allowlist policy coherent.
-  public replaceWhitelist(entries: Array<{ type: WhitelistType; value: string }>): void {
-    const now = new Date().toISOString();
-
-    const tx = this.db.transaction(() => {
-      this.db.prepare('DELETE FROM linkwarden_whitelist').run();
-      const insert = this.db.prepare(
-        'INSERT INTO linkwarden_whitelist (entry_type, entry_value, created_at) VALUES (?, ?, ?)'
-      );
-
-      for (const entry of entries) {
-        insert.run(entry.type, entry.value, now);
-      }
-    });
-
-    tx();
-  }
-
-  // This method lists all Linkwarden whitelist entries in deterministic order.
-  public listWhitelist(): LinkwardenWhitelistEntry[] {
-    const rows = this.db
-      .prepare(
-        `
-        SELECT id, entry_type, entry_value, created_at
-        FROM linkwarden_whitelist
-        ORDER BY id ASC
-      `
-      )
-      .all() as Array<{ id: number; entry_type: string; entry_value: string; created_at: string }>;
-
-    return rows.map((row) => ({
-      id: row.id,
-      type: row.entry_type as WhitelistType,
-      value: row.entry_value,
-      createdAt: row.created_at
-    }));
   }
 
   // This method persists a generated reorganization plan together with all item changes.

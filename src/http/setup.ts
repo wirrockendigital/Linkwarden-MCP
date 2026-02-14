@@ -6,13 +6,6 @@ import { ConfigStore } from '../config/config-store.js';
 import { SqliteStore } from '../db/database.js';
 import { AppError } from '../utils/errors.js';
 import { hashPassword, generateApiToken, hashApiToken } from '../utils/security.js';
-import { assertBaseUrlWhitelisted, normalizeWhitelistEntry } from '../utils/whitelist.js';
-import type { LinkwardenWhitelistEntry } from '../types/domain.js';
-
-const whitelistEntrySchema = z.object({
-  type: z.enum(['domain', 'ip', 'cidr']),
-  value: z.string().min(1).max(255)
-});
 
 const initializeSchema = z.object({
   masterPassphrase: z.string().min(12),
@@ -22,7 +15,6 @@ const initializeSchema = z.object({
   linkwardenApiToken: z.string().min(20),
   oauthClientId: z.string().min(3).max(255).optional(),
   oauthClientSecret: z.string().min(8).max(500).optional(),
-  whitelistEntries: z.array(whitelistEntrySchema).min(1).max(200),
   adminWriteModeDefault: z.boolean().default(false),
   issueAdminApiKey: z.boolean().default(true),
   requestTimeoutMs: z.number().int().min(1000).max(60000).optional(),
@@ -38,35 +30,6 @@ const unlockSchema = z.object({
   passphrase: z.string().min(12)
 });
 
-// This helper normalizes and validates all whitelist entries before persistence.
-function normalizeWhitelistEntries(entries: z.infer<typeof whitelistEntrySchema>[]): Array<{
-  type: 'domain' | 'ip' | 'cidr';
-  value: string;
-}> {
-  const normalized = entries.map((entry) => normalizeWhitelistEntry(entry.type, entry.value));
-
-  const deduped = new Map<string, (typeof normalized)[number]>();
-  for (const entry of normalized) {
-    deduped.set(`${entry.type}:${entry.value}`, entry);
-  }
-
-  return [...deduped.values()];
-}
-
-// This helper adapts setup whitelist entries to the whitelist validator contract.
-function toStoredWhitelistEntries(
-  entries: Array<{ type: 'domain' | 'ip' | 'cidr'; value: string }>
-): LinkwardenWhitelistEntry[] {
-  const now = new Date().toISOString();
-
-  return entries.map((entry, index) => ({
-    id: index + 1,
-    type: entry.type,
-    value: entry.value,
-    createdAt: now
-  }));
-}
-
 // This helper generates and stores one API key for the given user.
 function issueApiKey(db: SqliteStore, userId: number, label: string): { token: string; keyId: string } {
   const generated = generateApiToken();
@@ -76,7 +39,7 @@ function issueApiKey(db: SqliteStore, userId: number, label: string): { token: s
 
 // This function registers setup endpoints used by first-run deployment and recovery workflows.
 export function registerSetupRoutes(fastify: FastifyInstance, configStore: ConfigStore, db: SqliteStore): void {
-  fastify.get('/setup/status', async (request) => {
+  fastify.get('/admin/setup/status', async (request) => {
     request.log.debug(
       {
         event: 'setup_status_requested',
@@ -95,7 +58,7 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
     };
   });
 
-  fastify.post('/setup/initialize', async (request, reply) => {
+  fastify.post('/admin/setup/initialize', async (request, reply) => {
     request.log.info(
       {
         event: 'setup_initialize_requested',
@@ -144,7 +107,6 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
       {
         event: 'setup_initialize_payload_valid',
         adminUsername: parsed.data.adminUsername,
-        whitelistCount: parsed.data.whitelistEntries.length,
         adminWriteModeDefault: parsed.data.adminWriteModeDefault,
         issueAdminApiKey: parsed.data.issueAdminApiKey,
         requestTimeoutMs: parsed.data.requestTimeoutMs ?? 10_000,
@@ -157,19 +119,6 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
       'setup_initialize_payload_valid'
     );
 
-    const normalizedWhitelist = normalizeWhitelistEntries(parsed.data.whitelistEntries);
-    if (normalizedWhitelist.length === 0) {
-      request.log.warn(
-        {
-          event: 'setup_initialize_invalid_whitelist_empty'
-        },
-        'setup_initialize_invalid_whitelist_empty'
-      );
-      throw new AppError(400, 'invalid_whitelist', 'Whitelist cannot be empty.');
-    }
-
-    assertBaseUrlWhitelisted(parsed.data.linkwardenBaseUrl, toStoredWhitelistEntries(normalizedWhitelist));
-
     configStore.initialize({
       masterPassphrase: parsed.data.masterPassphrase,
       adminUsername: parsed.data.adminUsername,
@@ -178,7 +127,6 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
       linkwardenApiToken: parsed.data.linkwardenApiToken,
       oauthClientId: parsed.data.oauthClientId,
       oauthClientSecret: parsed.data.oauthClientSecret,
-      whitelistEntries: normalizedWhitelist,
       adminWriteModeDefault: parsed.data.adminWriteModeDefault,
       requestTimeoutMs: parsed.data.requestTimeoutMs,
       maxRetries: parsed.data.maxRetries,
@@ -201,7 +149,6 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
     db.setUserLinkwardenToken(adminUserId, encryptedToken);
 
     db.setLinkwardenTarget(parsed.data.linkwardenBaseUrl);
-    db.replaceWhitelist(normalizedWhitelist);
 
     const bootstrapToken = parsed.data.issueAdminApiKey ? issueApiKey(db, adminUserId, 'bootstrap-admin') : undefined;
 
@@ -210,7 +157,6 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
         event: 'setup_initialize_completed',
         adminUserId,
         adminUsername: parsed.data.adminUsername,
-        whitelistCount: normalizedWhitelist.length,
         linkwardenBaseUrl: parsed.data.linkwardenBaseUrl,
         bootstrapTokenIssued: Boolean(bootstrapToken),
         adminLinkwardenTokenConfigured: true,
@@ -231,7 +177,7 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
     });
   });
 
-  fastify.post('/setup/unlock', async (request, reply) => {
+  fastify.post('/admin/setup/unlock', async (request, reply) => {
     request.log.info(
       {
         event: 'setup_unlock_requested',

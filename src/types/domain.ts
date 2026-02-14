@@ -106,10 +106,6 @@ export interface SetupPayload {
   linkwardenApiToken: string;
   oauthClientId?: string;
   oauthClientSecret?: string;
-  whitelistEntries: Array<{
-    type: WhitelistType;
-    value: string;
-  }>;
   adminWriteModeDefault: boolean;
   requestTimeoutMs?: number;
   maxRetries?: number;
@@ -174,15 +170,6 @@ export interface UserSettings {
   userId: number;
   writeModeEnabled: boolean;
   updatedAt: string;
-}
-
-export type WhitelistType = 'domain' | 'ip' | 'cidr';
-
-export interface LinkwardenWhitelistEntry {
-  id: number;
-  type: WhitelistType;
-  value: string;
-  createdAt: string;
 }
 
 export interface LinkwardenTarget {

@@ -5,7 +5,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { ConfigStore } from '../config/config-store.js';
 import { SqliteStore } from '../db/database.js';
-import type { LinkwardenWhitelistEntry, SessionPrincipal, UserRole } from '../types/domain.js';
+import type { SessionPrincipal, UserRole } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
 import { sanitizeForLog } from '../utils/logger.js';
 import {
@@ -19,7 +19,6 @@ import {
   serializeExpiredCookie,
   verifyPassword
 } from '../utils/security.js';
-import { assertBaseUrlWhitelisted, normalizeWhitelistEntry } from '../utils/whitelist.js';
 import { authenticateSession, requireAdminSession, requireCsrf, requireSession } from './auth.js';
 
 interface LoginAttemptState {
@@ -63,23 +62,13 @@ const createOwnApiKeySchema = z.object({
   label: z.string().min(2).max(100).default('default')
 });
 
-const whitelistEntrySchema = z.object({
-  type: z.enum(['domain', 'ip', 'cidr']),
-  value: z.string().min(1).max(255)
-});
-
 const updateLinkwardenSchema = z
   .object({
-    baseUrl: z.string().url().optional(),
-    whitelistEntries: z.array(whitelistEntrySchema).min(1).max(200).optional()
+    baseUrl: z.string().url().optional()
   })
-  .refine((payload) => Boolean(payload.baseUrl || payload.whitelistEntries), {
+  .refine((payload) => Boolean(payload.baseUrl), {
     message: 'At least one field must be updated.'
   });
-
-const setWhitelistSchema = z.object({
-  whitelistEntries: z.array(whitelistEntrySchema).min(1).max(200)
-});
 
 const setLinkwardenTokenSchema = z.object({
   token: z.string().min(20).max(500)
@@ -219,33 +208,6 @@ function clearLoginFailures(key: string): void {
   loginAttempts.delete(key);
 }
 
-// This helper normalizes and validates all whitelist entries before storage.
-function normalizeWhitelistEntries(entries: Array<{ type: 'domain' | 'ip' | 'cidr'; value: string }>): Array<{
-  type: 'domain' | 'ip' | 'cidr';
-  value: string;
-}> {
-  const normalized = entries.map((entry) => normalizeWhitelistEntry(entry.type, entry.value));
-  const deduped = new Map<string, (typeof normalized)[number]>();
-
-  for (const entry of normalized) {
-    deduped.set(`${entry.type}:${entry.value}`, entry);
-  }
-
-  return [...deduped.values()];
-}
-
-// This helper adapts whitelist entries to the validator shape used for base-url checks.
-function toWhitelistRecords(entries: Array<{ type: 'domain' | 'ip' | 'cidr'; value: string }>): LinkwardenWhitelistEntry[] {
-  const now = new Date().toISOString();
-
-  return entries.map((entry, index) => ({
-    id: index + 1,
-    type: entry.type,
-    value: entry.value,
-    createdAt: now
-  }));
-}
-
 // This helper issues one API token for a user and stores only its hash.
 function issueApiKey(db: SqliteStore, userId: number, label: string): { token: string; keyId: string } {
   const generated = generateApiToken();
@@ -322,7 +284,7 @@ async function login() {
     password: document.getElementById('password').value
   };
 
-  const res = await fetch('/auth/login', {
+  const res = await fetch('/admin/auth/login', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -335,7 +297,7 @@ async function login() {
   document.getElementById('result').textContent = JSON.stringify(json, null, 2);
 
   if (res.ok) {
-    window.location.href = nextPath || '/';
+    window.location.href = nextPath || '/admin';
   }
 }
 </script>
@@ -364,7 +326,7 @@ function renderFirstRunPage(csrfToken: string): string {
 <body>
   <h1>linkwarden-mcp First-Run Setup</h1>
   <div class="card">
-    <p>Richte hier den ersten Admin, Linkwarden-Ziel und die verpflichtende Whitelist ein.</p>
+    <p>Richte hier den ersten Admin und das Linkwarden-Ziel ein.</p>
     <label for="masterPassphrase">Master-Passphrase</label>
     <input id="masterPassphrase" type="password" />
     <label for="adminUsername">Admin-Benutzername</label>
@@ -379,8 +341,6 @@ function renderFirstRunPage(csrfToken: string): string {
     <input id="oauthClientId" placeholder="chatgpt-client-id" />
     <label for="oauthClientSecret">OAuth Client Secret (optional)</label>
     <input id="oauthClientSecret" type="password" />
-    <label for="whitelist">Whitelist (eine Zeile je Eintrag, Format: domain:host oder ip:1.2.3.4 oder cidr:192.168.0.0/24)</label>
-    <textarea id="whitelist" placeholder="domain:linkwarden.internal\nip:192.168.123.10"></textarea>
     <label><input id="adminWriteModeDefault" type="checkbox" /> Admin Write-Mode initial aktivieren</label>
     <label><input id="issueAdminApiKey" type="checkbox" checked /> Initialen Admin-MCP-Key erzeugen (einmalig anzeigen)</label>
     <button onclick="initializeSetup()">Setup abschließen</button>
@@ -392,31 +352,7 @@ function renderFirstRunPage(csrfToken: string): string {
 <script>
 const csrfToken = ${JSON.stringify(csrfToken)};
 
-function parseWhitelistInput(value) {
-  return value
-    .split(/\\r?\\n+/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const idx = line.indexOf(':');
-      if (idx === -1) {
-        throw new Error('Ungültige Whitelist-Zeile: ' + line);
-      }
-      const type = line.slice(0, idx).trim();
-      const entryValue = line.slice(idx + 1).trim();
-      return { type, value: entryValue };
-    });
-}
-
 async function initializeSetup() {
-  let whitelistEntries = [];
-  try {
-    whitelistEntries = parseWhitelistInput(document.getElementById('whitelist').value);
-  } catch (error) {
-    document.getElementById('result').textContent = String(error);
-    return;
-  }
-
   const payload = {
     masterPassphrase: document.getElementById('masterPassphrase').value,
     adminUsername: document.getElementById('adminUsername').value,
@@ -425,12 +361,11 @@ async function initializeSetup() {
     linkwardenApiToken: document.getElementById('apiToken').value,
     oauthClientId: document.getElementById('oauthClientId').value || undefined,
     oauthClientSecret: document.getElementById('oauthClientSecret').value || undefined,
-    whitelistEntries,
     adminWriteModeDefault: document.getElementById('adminWriteModeDefault').checked,
     issueAdminApiKey: document.getElementById('issueAdminApiKey').checked
   };
 
-  const res = await fetch('/setup/initialize', {
+  const res = await fetch('/admin/setup/initialize', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -443,7 +378,7 @@ async function initializeSetup() {
   document.getElementById('result').textContent = JSON.stringify(json, null, 2);
 
   if (res.ok) {
-    window.location.href = '/';
+    window.location.href = '/admin';
   }
 }
 </script>
@@ -484,7 +419,7 @@ function renderUnlockPage(csrfToken: string): string {
 const csrfToken = ${JSON.stringify(csrfToken)};
 
 async function unlockConfig() {
-  const res = await fetch('/setup/unlock', {
+  const res = await fetch('/admin/setup/unlock', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -498,7 +433,7 @@ async function unlockConfig() {
   const json = await res.json();
   document.getElementById('result').textContent = JSON.stringify(json, null, 2);
   if (res.ok) {
-    window.location.href = '/';
+    window.location.href = '/admin';
   }
 }
 </script>
@@ -557,13 +492,11 @@ function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): st
   </div>
 
   <div class="card">
-    <h2>Admin: Linkwarden Ziel + Whitelist</h2>
+    <h2>Admin: Linkwarden Ziel</h2>
     <button onclick="loadLinkwardenConfig()">Aktuelle Konfiguration laden</button>
     <pre id="linkwardenConfigResult">Noch nicht geladen</pre>
-    <label for="lwBaseUrl">Neue Base URL (optional)</label>
+    <label for="lwBaseUrl">Neue Base URL</label>
     <input id="lwBaseUrl" placeholder="http://linkwarden:3000" />
-    <label for="lwWhitelist">Neue Whitelist (optional, Zeilenformat type:value)</label>
-    <textarea id="lwWhitelist" placeholder="domain:linkwarden.internal\nip:192.168.123.10"></textarea>
     <button onclick="updateLinkwardenConfig()">Linkwarden Konfiguration speichern</button>
   </div>
       `
@@ -632,22 +565,6 @@ const csrfToken = ${JSON.stringify(csrfToken)};
 const isAdmin = ${JSON.stringify(principal.role === 'admin')};
 let usersCache = [];
 
-function parseWhitelistInput(value) {
-  return value
-    .split(/\\r?\\n+/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const idx = line.indexOf(':');
-      if (idx === -1) {
-        throw new Error('Ungültige Whitelist-Zeile: ' + line);
-      }
-      const type = line.slice(0, idx).trim();
-      const entryValue = line.slice(idx + 1).trim();
-      return { type, value: entryValue };
-    });
-}
-
 function updateUserSelect(selectId) {
   const select = document.getElementById(selectId);
   if (!select) {
@@ -690,12 +607,12 @@ async function api(url, options = {}) {
 }
 
 async function logout() {
-  await api('/auth/logout', { method: 'POST', body: '{}' });
-  window.location.href = '/';
+  await api('/admin/auth/logout', { method: 'POST', body: '{}' });
+  window.location.href = '/admin';
 }
 
 async function loadMe() {
-  const res = await fetch('/auth/me');
+  const res = await fetch('/admin/auth/me');
   const json = await res.json();
   document.getElementById('meResult').textContent = JSON.stringify(json, null, 2);
   if (res.ok) {
@@ -706,7 +623,7 @@ async function loadMe() {
 }
 
 async function setOwnWriteMode() {
-  await api('/ui/user/write-mode', {
+  await api('/admin/ui/user/write-mode', {
     method: 'POST',
     body: JSON.stringify({ writeModeEnabled: document.getElementById('selfWriteMode').checked })
   });
@@ -714,7 +631,7 @@ async function setOwnWriteMode() {
 }
 
 async function setOwnLinkwardenToken() {
-  await api('/ui/user/linkwarden-token', {
+  await api('/admin/ui/user/linkwarden-token', {
     method: 'POST',
     body: JSON.stringify({ token: document.getElementById('selfLinkwardenToken').value })
   });
@@ -723,13 +640,13 @@ async function setOwnLinkwardenToken() {
 }
 
 async function loadOwnKeys() {
-  const res = await fetch('/ui/user/api-keys');
+  const res = await fetch('/admin/ui/user/api-keys');
   const json = await res.json();
   document.getElementById('ownKeysResult').textContent = JSON.stringify(json, null, 2);
 }
 
 async function issueOwnKey() {
-  await api('/ui/user/api-keys', {
+  await api('/admin/ui/user/api-keys', {
     method: 'POST',
     body: JSON.stringify({ label: document.getElementById('ownKeyLabel').value })
   });
@@ -738,7 +655,7 @@ async function issueOwnKey() {
 
 async function revokeOwnKey() {
   const keyId = document.getElementById('ownRevokeKeyId').value;
-  await api('/ui/user/api-keys/' + encodeURIComponent(keyId) + '/revoke', {
+  await api('/admin/ui/user/api-keys/' + encodeURIComponent(keyId) + '/revoke', {
     method: 'POST',
     body: '{}'
   });
@@ -746,7 +663,7 @@ async function revokeOwnKey() {
 }
 
 async function loadUsers() {
-  const res = await fetch('/ui/admin/users');
+  const res = await fetch('/admin/ui/admin/users');
   const json = await res.json();
   document.getElementById('usersResult').textContent = JSON.stringify(json, null, 2);
   if (res.ok) {
@@ -756,7 +673,7 @@ async function loadUsers() {
 }
 
 async function createUser() {
-  await api('/ui/admin/users', {
+  await api('/admin/ui/admin/users', {
     method: 'POST',
     body: JSON.stringify({
       username: document.getElementById('newUsername').value,
@@ -770,7 +687,7 @@ async function createUser() {
 
 async function setUserActive() {
   const userId = document.getElementById('toggleUserSelect').value;
-  await api('/ui/admin/users/' + encodeURIComponent(userId) + '/active', {
+  await api('/admin/ui/admin/users/' + encodeURIComponent(userId) + '/active', {
     method: 'POST',
     body: JSON.stringify({ active: document.getElementById('toggleUserActive').checked })
   });
@@ -779,7 +696,7 @@ async function setUserActive() {
 
 async function setUserWriteMode() {
   const userId = document.getElementById('writeModeUserSelect').value;
-  await api('/ui/admin/users/' + encodeURIComponent(userId) + '/write-mode', {
+  await api('/admin/ui/admin/users/' + encodeURIComponent(userId) + '/write-mode', {
     method: 'POST',
     body: JSON.stringify({ writeModeEnabled: document.getElementById('writeModeForUser').checked })
   });
@@ -787,13 +704,13 @@ async function setUserWriteMode() {
 }
 
 async function loadAdminKeys() {
-  const res = await fetch('/ui/admin/api-keys');
+  const res = await fetch('/admin/ui/admin/api-keys');
   const json = await res.json();
   document.getElementById('adminKeysResult').textContent = JSON.stringify(json, null, 2);
 }
 
 async function issueAdminKey() {
-  await api('/ui/admin/api-keys', {
+  await api('/admin/ui/admin/api-keys', {
     method: 'POST',
     body: JSON.stringify({
       userId: Number(document.getElementById('apiKeyUserSelect').value),
@@ -805,7 +722,7 @@ async function issueAdminKey() {
 
 async function revokeAdminKey() {
   const keyId = document.getElementById('revokeKeyId').value;
-  await api('/ui/admin/api-keys/' + encodeURIComponent(keyId) + '/revoke', {
+  await api('/admin/ui/admin/api-keys/' + encodeURIComponent(keyId) + '/revoke', {
     method: 'POST',
     body: '{}'
   });
@@ -813,7 +730,7 @@ async function revokeAdminKey() {
 }
 
 async function loadLinkwardenConfig() {
-  const res = await fetch('/ui/admin/linkwarden');
+  const res = await fetch('/admin/ui/admin/linkwarden');
   const json = await res.json();
   document.getElementById('linkwardenConfigResult').textContent = JSON.stringify(json, null, 2);
 }
@@ -821,16 +738,12 @@ async function loadLinkwardenConfig() {
 async function updateLinkwardenConfig() {
   const payload = {};
   const baseUrl = document.getElementById('lwBaseUrl').value.trim();
-  const whitelistText = document.getElementById('lwWhitelist').value.trim();
 
   if (baseUrl) {
     payload.baseUrl = baseUrl;
   }
-  if (whitelistText) {
-    payload.whitelistEntries = parseWhitelistInput(whitelistText);
-  }
 
-  await api('/ui/admin/linkwarden', {
+  await api('/admin/ui/admin/linkwarden', {
     method: 'POST',
     body: JSON.stringify(payload)
   });
@@ -840,7 +753,7 @@ async function updateLinkwardenConfig() {
 
 async function setUserLinkwardenToken() {
   const userId = Number(document.getElementById('linkwardenTokenUserSelect').value);
-  await api('/ui/admin/users/' + encodeURIComponent(userId) + '/linkwarden-token', {
+  await api('/admin/ui/admin/users/' + encodeURIComponent(userId) + '/linkwarden-token', {
     method: 'POST',
     body: JSON.stringify({ token: document.getElementById('linkwardenTokenValue').value })
   });
@@ -876,9 +789,9 @@ function buildMePayload(db: SqliteStore, principal: SessionPrincipal): Record<st
   };
 }
 
-// This function registers root UI, auth/session routes, and admin/user JSON APIs.
+// This function registers admin UI, auth/session routes, and admin/user JSON APIs.
 export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigStore, db: SqliteStore): void {
-  fastify.get('/', async (request, reply) => {
+  fastify.get('/admin', async (request, reply) => {
     const { csrfToken } = ensureCsrfCookie(request, reply);
 
     if (!configStore.isInitialized()) {
@@ -910,11 +823,15 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     reply.type('text/html').send(renderDashboardPage(principal, csrfToken));
   });
 
-  fastify.get('/setup', async (_request, reply) => {
-    reply.redirect('/');
+  fastify.get('/admin/', async (_request, reply) => {
+    reply.redirect('/admin');
   });
 
-  fastify.post('/auth/login', async (request, reply) => {
+  fastify.get('/admin/setup', async (_request, reply) => {
+    reply.redirect('/admin');
+  });
+
+  fastify.post('/admin/auth/login', async (request, reply) => {
     logUiInfo(request, 'ui_login_attempt');
 
     if (!configStore.isInitialized()) {
@@ -1009,7 +926,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.post('/auth/logout', async (request, reply) => {
+  fastify.post('/admin/auth/logout', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
     logUiInfo(request, 'ui_logout_requested', {
@@ -1035,7 +952,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     reply.send({ ok: true });
   });
 
-  fastify.get('/auth/me', async (request, reply) => {
+  fastify.get('/admin/auth/me', async (request, reply) => {
     const principal = requireSession(request, db);
     logUiDebug(request, 'ui_auth_me', {
       userId: principal.userId,
@@ -1049,7 +966,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.get('/ui/admin/users', async (request, reply) => {
+  fastify.get('/admin/ui/admin/users', async (request, reply) => {
     const principal = requireSession(request, db);
     requireAdminSession(principal);
 
@@ -1071,7 +988,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.post('/ui/admin/users', async (request, reply) => {
+  fastify.post('/admin/ui/admin/users', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
     requireAdminSession(principal);
@@ -1117,7 +1034,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.post('/ui/admin/users/:userId/active', async (request, reply) => {
+  fastify.post('/admin/ui/admin/users/:userId/active', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
     requireAdminSession(principal);
@@ -1151,7 +1068,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.post('/ui/admin/users/:userId/write-mode', async (request, reply) => {
+  fastify.post('/admin/ui/admin/users/:userId/write-mode', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
     requireAdminSession(principal);
@@ -1185,7 +1102,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.post('/ui/admin/users/:userId/linkwarden-token', async (request, reply) => {
+  fastify.post('/admin/ui/admin/users/:userId/linkwarden-token', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
     requireAdminSession(principal);
@@ -1219,7 +1136,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.get('/ui/admin/api-keys', async (request, reply) => {
+  fastify.get('/admin/ui/admin/api-keys', async (request, reply) => {
     const principal = requireSession(request, db);
     requireAdminSession(principal);
 
@@ -1235,7 +1152,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.post('/ui/admin/api-keys', async (request, reply) => {
+  fastify.post('/admin/ui/admin/api-keys', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
     requireAdminSession(principal);
@@ -1265,7 +1182,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.post('/ui/admin/api-keys/:keyId/revoke', async (request, reply) => {
+  fastify.post('/admin/ui/admin/api-keys/:keyId/revoke', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
     requireAdminSession(principal);
@@ -1292,27 +1209,24 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.get('/ui/admin/linkwarden', async (request, reply) => {
+  fastify.get('/admin/ui/admin/linkwarden', async (request, reply) => {
     const principal = requireSession(request, db);
     requireAdminSession(principal);
 
     const target = db.getLinkwardenTarget();
-    const whitelist = db.listWhitelist();
 
     logUiInfo(request, 'ui_admin_get_linkwarden_config', {
       actorUserId: principal.userId,
-      targetConfigured: Boolean(target),
-      whitelistCount: whitelist.length
+      targetConfigured: Boolean(target)
     });
 
     reply.send({
       ok: true,
-      target,
-      whitelist
+      target
     });
   });
 
-  fastify.post('/ui/admin/linkwarden', async (request, reply) => {
+  fastify.post('/admin/ui/admin/linkwarden', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
     requireAdminSession(principal);
@@ -1325,102 +1239,25 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       throw new AppError(400, 'validation_error', 'Invalid Linkwarden update payload.', parsed.error.flatten());
     }
 
-    const currentTarget = db.getLinkwardenTarget();
-    const currentWhitelist = db.listWhitelist();
-
-    const nextWhitelist = parsed.data.whitelistEntries
-      ? normalizeWhitelistEntries(parsed.data.whitelistEntries)
-      : currentWhitelist.map((entry) => ({ type: entry.type, value: entry.value }));
-
-    if (nextWhitelist.length === 0) {
-      logUiWarn(request, 'ui_admin_update_linkwarden_invalid_whitelist_empty');
-      throw new AppError(400, 'invalid_whitelist', 'Whitelist cannot be empty.');
-    }
-
-    const nextBaseUrl = parsed.data.baseUrl ?? currentTarget?.baseUrl;
-    if (!nextBaseUrl) {
+    if (!parsed.data.baseUrl) {
       logUiWarn(request, 'ui_admin_update_linkwarden_missing_target');
       throw new AppError(400, 'linkwarden_target_missing', 'Linkwarden base URL is not configured.');
     }
 
-    assertBaseUrlWhitelisted(nextBaseUrl, toWhitelistRecords(nextWhitelist));
-
-    if (parsed.data.baseUrl) {
-      db.setLinkwardenTarget(parsed.data.baseUrl);
-    }
-
-    if (parsed.data.whitelistEntries) {
-      db.replaceWhitelist(nextWhitelist);
-    }
+    db.setLinkwardenTarget(parsed.data.baseUrl);
 
     logUiInfo(request, 'ui_admin_update_linkwarden_success', {
       actorUserId: principal.userId,
-      baseUrlUpdated: Boolean(parsed.data.baseUrl),
-      whitelistUpdated: Boolean(parsed.data.whitelistEntries),
-      whitelistCount: db.listWhitelist().length
+      baseUrlUpdated: true
     });
 
     reply.send({
       ok: true,
-      target: db.getLinkwardenTarget(),
-      whitelist: db.listWhitelist()
+      target: db.getLinkwardenTarget()
     });
   });
 
-  fastify.get('/ui/admin/whitelist', async (request, reply) => {
-    const principal = requireSession(request, db);
-    requireAdminSession(principal);
-
-    const whitelist = db.listWhitelist();
-    logUiDebug(request, 'ui_admin_get_whitelist', {
-      actorUserId: principal.userId,
-      count: whitelist.length
-    });
-
-    reply.send({
-      ok: true,
-      whitelist
-    });
-  });
-
-  fastify.post('/ui/admin/whitelist', async (request, reply) => {
-    requireCsrf(request);
-    const principal = requireSession(request, db);
-    requireAdminSession(principal);
-
-    const parsed = setWhitelistSchema.safeParse(request.body);
-    if (!parsed.success) {
-      logUiWarn(request, 'ui_admin_set_whitelist_validation_failed', {
-        details: parsed.error.flatten()
-      });
-      throw new AppError(400, 'validation_error', 'Invalid whitelist payload.', parsed.error.flatten());
-    }
-
-    const normalized = normalizeWhitelistEntries(parsed.data.whitelistEntries);
-    if (normalized.length === 0) {
-      logUiWarn(request, 'ui_admin_set_whitelist_invalid_empty');
-      throw new AppError(400, 'invalid_whitelist', 'Whitelist cannot be empty.');
-    }
-
-    const target = db.getLinkwardenTarget();
-    if (target) {
-      assertBaseUrlWhitelisted(target.baseUrl, toWhitelistRecords(normalized));
-    }
-
-    db.replaceWhitelist(normalized);
-
-    logUiInfo(request, 'ui_admin_set_whitelist_success', {
-      actorUserId: principal.userId,
-      whitelistCount: normalized.length
-    });
-
-    reply.send({
-      ok: true,
-      whitelist: db.listWhitelist()
-    });
-  });
-
-  fastify.get('/ui/user/me', async (request, reply) => {
+  fastify.get('/admin/ui/user/me', async (request, reply) => {
     const principal = requireSession(request, db);
     logUiDebug(request, 'ui_user_me', {
       userId: principal.userId,
@@ -1433,7 +1270,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.post('/ui/user/write-mode', async (request, reply) => {
+  fastify.post('/admin/ui/user/write-mode', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
 
@@ -1459,7 +1296,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.post('/ui/user/linkwarden-token', async (request, reply) => {
+  fastify.post('/admin/ui/user/linkwarden-token', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
 
@@ -1485,7 +1322,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.get('/ui/user/api-keys', async (request, reply) => {
+  fastify.get('/admin/ui/user/api-keys', async (request, reply) => {
     const principal = requireSession(request, db);
 
     const apiKeys = db.listApiKeys(principal.userId);
@@ -1500,7 +1337,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.post('/ui/user/api-keys', async (request, reply) => {
+  fastify.post('/admin/ui/user/api-keys', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
 
@@ -1528,7 +1365,7 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
-  fastify.post('/ui/user/api-keys/:keyId/revoke', async (request, reply) => {
+  fastify.post('/admin/ui/user/api-keys/:keyId/revoke', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
 
