@@ -53,6 +53,24 @@ const toggleWriteModeSchema = z.object({
   writeModeEnabled: z.boolean()
 });
 
+const setOfflinePolicySchema = z
+  .object({
+    offlineDays: z.number().int().min(1).max(365),
+    minConsecutiveFailures: z.number().int().min(1).max(30),
+    action: z.enum(['archive', 'delete', 'none']),
+    archiveCollectionId: z.number().int().positive().nullable().optional()
+  })
+  .superRefine((payload, ctx) => {
+    // This validation requires a destination collection only when archive action is selected.
+    if (payload.action === 'archive' && !payload.archiveCollectionId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['archiveCollectionId'],
+        message: 'archiveCollectionId is required when action=archive.'
+      });
+    }
+  });
+
 const createApiKeySchema = z.object({
   userId: z.number().int().positive(),
   label: z.string().min(2).max(100).default('default')
@@ -466,6 +484,21 @@ function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): st
     <select id="writeModeUserSelect"></select>
     <label><input id="writeModeForUser" type="checkbox" /> Write-Mode aktiv</label>
     <button onclick="setUserWriteMode()">Write-Mode pro User setzen</button>
+    <label for="offlinePolicyUserSelect">Benutzer für 404-Policy</label>
+    <select id="offlinePolicyUserSelect"></select>
+    <label for="offlineDaysForUser">Offline-Tage bis Aktion</label>
+    <input id="offlineDaysForUser" type="number" min="1" max="365" value="14" />
+    <label for="offlineFailuresForUser">Min. aufeinanderfolgende Fehler</label>
+    <input id="offlineFailuresForUser" type="number" min="1" max="30" value="3" />
+    <label for="offlineActionForUser">Aktion bei dauerhaftem 404</label>
+    <select id="offlineActionForUser">
+      <option value="archive">archive</option>
+      <option value="delete">delete</option>
+      <option value="none">none</option>
+    </select>
+    <label for="offlineArchiveCollectionIdForUser">Archive Collection ID (nur bei archive)</label>
+    <input id="offlineArchiveCollectionIdForUser" type="number" min="1" />
+    <button onclick="setUserOfflinePolicy()">404-Policy pro User setzen</button>
   </div>
 
   <div class="card">
@@ -583,8 +616,39 @@ function updateUserSelect(selectId) {
 function refreshAdminUserSelects() {
   updateUserSelect('toggleUserSelect');
   updateUserSelect('writeModeUserSelect');
+  updateUserSelect('offlinePolicyUserSelect');
   updateUserSelect('apiKeyUserSelect');
   updateUserSelect('linkwardenTokenUserSelect');
+  syncOfflinePolicyFromSelectedUser();
+}
+
+// This helper maps one selected user id back to cached user objects for policy prefilling.
+function getSelectedUser(selectId) {
+  const select = document.getElementById(selectId);
+  if (!select) {
+    return null;
+  }
+
+  const selectedId = Number(select.value);
+  if (!Number.isFinite(selectedId)) {
+    return null;
+  }
+
+  return usersCache.find((user) => Number(user.id) === selectedId) || null;
+}
+
+// This helper prefills offline policy form controls from currently selected user settings.
+function syncOfflinePolicyFromSelectedUser() {
+  const user = getSelectedUser('offlinePolicyUserSelect');
+  if (!user || !user.settings) {
+    return;
+  }
+
+  document.getElementById('offlineDaysForUser').value = String(user.settings.offlineDays ?? 14);
+  document.getElementById('offlineFailuresForUser').value = String(user.settings.offlineMinConsecutiveFailures ?? 3);
+  document.getElementById('offlineActionForUser').value = String(user.settings.offlineAction ?? 'archive');
+  document.getElementById('offlineArchiveCollectionIdForUser').value =
+    user.settings.offlineArchiveCollectionId != null ? String(user.settings.offlineArchiveCollectionId) : '';
 }
 
 async function api(url, options = {}) {
@@ -703,6 +767,24 @@ async function setUserWriteMode() {
   await loadUsers();
 }
 
+async function setUserOfflinePolicy() {
+  const userId = Number(document.getElementById('offlinePolicyUserSelect').value);
+  const action = document.getElementById('offlineActionForUser').value;
+  const archiveCollectionIdRaw = document.getElementById('offlineArchiveCollectionIdForUser').value.trim();
+  const archiveCollectionId = archiveCollectionIdRaw.length > 0 ? Number(archiveCollectionIdRaw) : null;
+
+  await api('/admin/ui/admin/users/' + encodeURIComponent(userId) + '/offline-policy', {
+    method: 'POST',
+    body: JSON.stringify({
+      offlineDays: Number(document.getElementById('offlineDaysForUser').value),
+      minConsecutiveFailures: Number(document.getElementById('offlineFailuresForUser').value),
+      action,
+      archiveCollectionId: action === 'archive' ? archiveCollectionId : null
+    })
+  });
+  await loadUsers();
+}
+
 async function loadAdminKeys() {
   const res = await fetch('/admin/ui/admin/api-keys');
   const json = await res.json();
@@ -764,6 +846,10 @@ async function setUserLinkwardenToken() {
 loadMe();
 loadOwnKeys();
 if (isAdmin) {
+  const offlinePolicySelect = document.getElementById('offlinePolicyUserSelect');
+  if (offlinePolicySelect) {
+    offlinePolicySelect.addEventListener('change', syncOfflinePolicyFromSelectedUser);
+  }
   loadUsers();
 }
 </script>
@@ -1099,6 +1185,48 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       ok: true,
       userId: params.data.userId,
       writeModeEnabled: body.data.writeModeEnabled
+    });
+  });
+
+  fastify.post('/admin/ui/admin/users/:userId/offline-policy', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+    requireAdminSession(principal);
+
+    const params = userIdParamSchema.safeParse(request.params);
+    const body = setOfflinePolicySchema.safeParse(request.body);
+
+    if (!params.success || !body.success) {
+      logUiWarn(request, 'ui_admin_set_user_offline_policy_validation_failed', {
+        params: params.success ? undefined : params.error.flatten(),
+        body: body.success ? undefined : body.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid offline policy payload.', {
+        params: params.success ? undefined : params.error.flatten(),
+        body: body.success ? undefined : body.error.flatten()
+      });
+    }
+
+    db.setUserOfflinePolicy(params.data.userId, {
+      offlineDays: body.data.offlineDays,
+      offlineMinConsecutiveFailures: body.data.minConsecutiveFailures,
+      offlineAction: body.data.action,
+      offlineArchiveCollectionId: body.data.archiveCollectionId ?? null
+    });
+
+    logUiInfo(request, 'ui_admin_set_user_offline_policy_success', {
+      actorUserId: principal.userId,
+      targetUserId: params.data.userId,
+      offlineDays: body.data.offlineDays,
+      minConsecutiveFailures: body.data.minConsecutiveFailures,
+      action: body.data.action,
+      archiveCollectionId: body.data.archiveCollectionId ?? null
+    });
+
+    reply.send({
+      ok: true,
+      userId: params.data.userId,
+      settings: db.getUserSettings(params.data.userId)
     });
   });
 

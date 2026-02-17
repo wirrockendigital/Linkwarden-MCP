@@ -9,6 +9,7 @@ export interface LinkCollection {
   id: number;
   name: string;
   parentId?: number | null;
+  ownerId?: number;
 }
 
 export interface LinkItem {
@@ -19,6 +20,7 @@ export interface LinkItem {
   tags: LinkTag[];
   collection?: LinkCollection | null;
   archived?: boolean;
+  pinned?: boolean;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -46,6 +48,7 @@ export interface PlanScope {
   collectionId?: number;
   tagIds?: number[];
   archived?: boolean;
+  pinned?: boolean;
 }
 
 export interface PlanItem {
@@ -169,6 +172,10 @@ export interface SessionPrincipal {
 export interface UserSettings {
   userId: number;
   writeModeEnabled: boolean;
+  offlineDays: number;
+  offlineMinConsecutiveFailures: number;
+  offlineAction: 'archive' | 'delete' | 'none';
+  offlineArchiveCollectionId: number | null;
   updatedAt: string;
 }
 
@@ -176,6 +183,41 @@ export interface LinkwardenTarget {
   id: 1;
   baseUrl: string;
   updatedAt: string;
+}
+
+export interface LinkHealthState {
+  userId: number;
+  linkId: number;
+  url: string;
+  firstFailureAt: string | null;
+  lastFailureAt: string | null;
+  consecutiveFailures: number;
+  lastStatus: 'up' | 'down';
+  lastCheckedAt: string;
+  lastHttpStatus: number | null;
+  lastError: string | null;
+  archivedAt: string | null;
+}
+
+export interface MaintenanceRun {
+  id: number;
+  userId: number;
+  startedAt: string;
+  endedAt: string | null;
+  mode: 'dry_run' | 'apply';
+  reorgPlanId: string | null;
+  status: 'running' | 'success' | 'failed';
+  summary?: Record<string, unknown> | null;
+  error?: Record<string, unknown> | null;
+}
+
+export interface MaintenanceRunItem {
+  runId: number;
+  itemType: 'reorg' | 'offline';
+  linkId?: number | null;
+  action: string;
+  outcome: 'success' | 'failed' | 'skipped';
+  details?: Record<string, unknown>;
 }
 
 export interface AuditEntry {
@@ -192,7 +234,7 @@ export interface AuditEntry {
 export interface BulkUpdateRequest {
   linkIds: number[];
   updates: {
-    collectionId?: number;
+    collectionId?: number | null;
     tagIds?: number[];
   };
   mode: 'replace' | 'add' | 'remove';

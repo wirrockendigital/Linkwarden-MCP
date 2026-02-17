@@ -11,6 +11,7 @@ import { buildToolList } from './tool-schemas.js';
 import { executeTool } from './tools.js';
 import type { AuthenticatedPrincipal } from '../types/domain.js';
 import { errorForLog, sanitizeForLog } from '../utils/logger.js';
+import { MCP_PROTOCOL_VERSION, MCP_SERVER_NAME, MCP_SERVER_VERSION } from '../version.js';
 
 interface McpRouteDeps {
   configStore: ConfigStore;
@@ -101,15 +102,15 @@ async function handleRpcRequest(
           jsonrpc: '2.0',
           id: requestId,
           result: {
-            protocolVersion: '2025-03-26',
+            protocolVersion: MCP_PROTOCOL_VERSION,
             capabilities: {
               tools: {
                 listChanged: false
               }
             },
             serverInfo: {
-              name: 'linkwarden-mcp',
-              version: '0.1.0'
+              name: MCP_SERVER_NAME,
+              version: MCP_SERVER_VERSION
             }
           }
         };

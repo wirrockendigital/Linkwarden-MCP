@@ -26,6 +26,10 @@ describe('mcp write-mode gate', () => {
         getUserSettings: () => ({
           userId: 1,
           writeModeEnabled: false,
+          offlineDays: 14,
+          offlineMinConsecutiveFailures: 3,
+          offlineAction: 'archive',
+          offlineArchiveCollectionId: 5,
           updatedAt: new Date().toISOString()
         })
       },
@@ -45,6 +49,26 @@ describe('mcp write-mode gate', () => {
           updates: {
             title: 'blocked'
           }
+        },
+        context
+      )
+    ).rejects.toBeInstanceOf(AppError);
+
+    await expect(
+      executeTool(
+        'linkwarden_create_tag',
+        {
+          name: 'Security'
+        },
+        context
+      )
+    ).rejects.toBeInstanceOf(AppError);
+
+    await expect(
+      executeTool(
+        'linkwarden_create_collection',
+        {
+          name: 'Service'
         },
         context
       )

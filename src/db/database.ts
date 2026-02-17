@@ -8,6 +8,8 @@ import type {
   AuditEntry,
   AuthenticatedPrincipal,
   EncryptedSecret,
+  LinkHealthState,
+  MaintenanceRunItem,
   LinkwardenTarget,
   OAuthAuthorizationCodeRecord,
   OAuthClientRecord,
@@ -124,6 +126,26 @@ interface OAuthRefreshRow {
   revoked: number;
 }
 
+interface LinkHealthStateRow {
+  user_id: number;
+  link_id: number;
+  url: string;
+  first_failure_at: string | null;
+  last_failure_at: string | null;
+  consecutive_failures: number;
+  last_status: string;
+  last_checked_at: string;
+  last_http_status: number | null;
+  last_error: string | null;
+  archived_at: string | null;
+}
+
+interface MaintenanceLockRow {
+  user_id: number;
+  lock_token: string;
+  expires_at: string;
+}
+
 export interface StoredUser {
   id: number;
   username: string;
@@ -191,6 +213,10 @@ export class SqliteStore {
       CREATE TABLE IF NOT EXISTS user_settings (
         user_id INTEGER PRIMARY KEY,
         write_mode_enabled INTEGER NOT NULL DEFAULT 0,
+        offline_days INTEGER NOT NULL DEFAULT 14,
+        offline_min_consecutive_failures INTEGER NOT NULL DEFAULT 3,
+        offline_action TEXT NOT NULL DEFAULT 'archive' CHECK (offline_action IN ('archive', 'delete', 'none')),
+        offline_archive_collection_id INTEGER,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
       );
@@ -346,9 +372,68 @@ export class SqliteStore {
         outcome TEXT NOT NULL,
         details_json TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS link_health_state (
+        user_id INTEGER NOT NULL,
+        link_id INTEGER NOT NULL,
+        url TEXT NOT NULL,
+        first_failure_at TEXT,
+        last_failure_at TEXT,
+        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        last_status TEXT NOT NULL CHECK (last_status IN ('up', 'down')),
+        last_checked_at TEXT NOT NULL,
+        last_http_status INTEGER,
+        last_error TEXT,
+        archived_at TEXT,
+        PRIMARY KEY (user_id, link_id),
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_link_health_state_user_status
+      ON link_health_state(user_id, last_status, last_checked_at);
+
+      CREATE TABLE IF NOT EXISTS maintenance_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        mode TEXT NOT NULL CHECK (mode IN ('dry_run', 'apply')),
+        reorg_plan_id TEXT,
+        status TEXT NOT NULL CHECK (status IN ('running', 'success', 'failed')),
+        summary_json TEXT,
+        error_json TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_maintenance_runs_user_started
+      ON maintenance_runs(user_id, started_at DESC);
+
+      CREATE TABLE IF NOT EXISTS maintenance_run_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        item_type TEXT NOT NULL CHECK (item_type IN ('reorg', 'offline')),
+        link_id INTEGER,
+        action TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failed', 'skipped')),
+        details_json TEXT,
+        FOREIGN KEY(run_id) REFERENCES maintenance_runs(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_maintenance_run_items_run_id
+      ON maintenance_run_items(run_id);
+
+      CREATE TABLE IF NOT EXISTS maintenance_locks (
+        user_id INTEGER PRIMARY KEY,
+        lock_token TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
     `);
 
     this.migrateUsersTableIfNeeded();
+    this.migrateUserSettingsTableIfNeeded();
   }
 
   // This migration upgrades older role/password schemas to the strict admin|user model.
@@ -438,6 +523,39 @@ export class SqliteStore {
     });
 
     tx();
+  }
+
+  // This migration upgrades older user_settings schemas to include per-user offline maintenance policy fields.
+  private migrateUserSettingsTableIfNeeded(): void {
+    const columns = this.db
+      .prepare('PRAGMA table_info(user_settings)')
+      .all() as Array<{ name: string }>;
+
+    if (columns.length === 0) {
+      return;
+    }
+
+    const hasColumn = (name: string): boolean => columns.some((column) => column.name === name);
+
+    if (!hasColumn('offline_days')) {
+      this.db.exec('ALTER TABLE user_settings ADD COLUMN offline_days INTEGER NOT NULL DEFAULT 14;');
+    }
+
+    if (!hasColumn('offline_min_consecutive_failures')) {
+      this.db.exec(
+        'ALTER TABLE user_settings ADD COLUMN offline_min_consecutive_failures INTEGER NOT NULL DEFAULT 3;'
+      );
+    }
+
+    if (!hasColumn('offline_action')) {
+      this.db.exec(
+        "ALTER TABLE user_settings ADD COLUMN offline_action TEXT NOT NULL DEFAULT 'archive' CHECK (offline_action IN ('archive', 'delete', 'none'));"
+      );
+    }
+
+    if (!hasColumn('offline_archive_collection_id')) {
+      this.db.exec('ALTER TABLE user_settings ADD COLUMN offline_archive_collection_id INTEGER;');
+    }
   }
 
   // This method reads a state value from the app_state table.
@@ -661,8 +779,31 @@ export class SqliteStore {
   // This method returns per-user write-mode settings.
   public getUserSettings(userId: number): UserSettings {
     const row = this.db
-      .prepare('SELECT user_id, write_mode_enabled, updated_at FROM user_settings WHERE user_id = ?')
-      .get(userId) as { user_id: number; write_mode_enabled: number; updated_at: string } | undefined;
+      .prepare(
+        `
+        SELECT
+          user_id,
+          write_mode_enabled,
+          offline_days,
+          offline_min_consecutive_failures,
+          offline_action,
+          offline_archive_collection_id,
+          updated_at
+        FROM user_settings
+        WHERE user_id = ?
+      `
+      )
+      .get(userId) as
+      | {
+          user_id: number;
+          write_mode_enabled: number;
+          offline_days: number;
+          offline_min_consecutive_failures: number;
+          offline_action: 'archive' | 'delete' | 'none';
+          offline_archive_collection_id: number | null;
+          updated_at: string;
+        }
+      | undefined;
 
     if (!row) {
       throw new AppError(404, 'user_settings_not_found', `No settings found for user ${userId}.`);
@@ -671,6 +812,10 @@ export class SqliteStore {
     return {
       userId: row.user_id,
       writeModeEnabled: row.write_mode_enabled === 1,
+      offlineDays: row.offline_days,
+      offlineMinConsecutiveFailures: row.offline_min_consecutive_failures,
+      offlineAction: row.offline_action,
+      offlineArchiveCollectionId: row.offline_archive_collection_id,
       updatedAt: row.updated_at
     };
   }
@@ -691,6 +836,55 @@ export class SqliteStore {
       `
       )
       .run(userId, enabled ? 1 : 0, now);
+  }
+
+  // This method updates per-user offline maintenance policy settings used by monitor and maintenance tools.
+  public setUserOfflinePolicy(
+    userId: number,
+    policy: {
+      offlineDays: number;
+      offlineMinConsecutiveFailures: number;
+      offlineAction: 'archive' | 'delete' | 'none';
+      offlineArchiveCollectionId: number | null;
+    }
+  ): void {
+    const now = new Date().toISOString();
+    this.getUserById(userId);
+    const existing = this.db
+      .prepare('SELECT write_mode_enabled FROM user_settings WHERE user_id = ?')
+      .get(userId) as { write_mode_enabled: number } | undefined;
+    const writeModeEnabled = existing?.write_mode_enabled === 1 ? 1 : 0;
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO user_settings (
+          user_id,
+          write_mode_enabled,
+          offline_days,
+          offline_min_consecutive_failures,
+          offline_action,
+          offline_archive_collection_id,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          offline_days = excluded.offline_days,
+          offline_min_consecutive_failures = excluded.offline_min_consecutive_failures,
+          offline_action = excluded.offline_action,
+          offline_archive_collection_id = excluded.offline_archive_collection_id,
+          updated_at = excluded.updated_at
+      `
+      )
+      .run(
+        userId,
+        writeModeEnabled,
+        policy.offlineDays,
+        policy.offlineMinConsecutiveFailures,
+        policy.offlineAction,
+        policy.offlineArchiveCollectionId,
+        now
+      );
   }
 
   // This method stores the encrypted Linkwarden API token for a specific user.
@@ -1134,8 +1328,59 @@ export class SqliteStore {
     };
   }
 
+  // This helper maps one OAuth refresh-token row into the shared token record domain shape.
+  private mapOAuthRefreshRowToTokenRecord(row: OAuthRefreshRow): OAuthTokenRecord {
+    return {
+      tokenId: row.token_id,
+      userId: row.user_id,
+      username: row.username,
+      role: row.role as UserRole,
+      clientId: row.client_id,
+      scope: row.scope,
+      resource: row.resource,
+      accessExpiresAt: row.access_expires_at,
+      refreshExpiresAt: row.refresh_expires_at
+    } satisfies OAuthTokenRecord;
+  }
+
+  // This method reads one refresh token without revoking it so callers can validate client/resource first.
+  public getOAuthRefreshToken(refreshTokenHash: string): OAuthTokenRecord | null {
+    const row = this.db
+      .prepare(
+        `
+          SELECT
+            t.token_id,
+            t.user_id,
+            u.username,
+            u.role,
+            t.client_id,
+            t.scope,
+            t.resource,
+            t.access_expires_at,
+            t.refresh_expires_at,
+            t.revoked
+          FROM oauth_tokens t
+          JOIN users u ON u.id = t.user_id
+          WHERE t.refresh_token_hash = ?
+            AND u.is_active = 1
+          LIMIT 1
+        `
+      )
+      .get(refreshTokenHash) as OAuthRefreshRow | undefined;
+
+    if (!row || row.revoked === 1) {
+      return null;
+    }
+
+    if (new Date(row.refresh_expires_at).getTime() <= Date.now()) {
+      return null;
+    }
+
+    return this.mapOAuthRefreshRowToTokenRecord(row);
+  }
+
   // This method consumes a refresh token and revokes it to enforce refresh rotation.
-  public consumeOAuthRefreshToken(refreshTokenHash: string): OAuthTokenRecord | null {
+  public consumeOAuthRefreshToken(refreshTokenHash: string, expectedClientId?: string): OAuthTokenRecord | null {
     const nowIso = new Date().toISOString();
 
     const tx = this.db.transaction(() => {
@@ -1170,6 +1415,11 @@ export class SqliteStore {
         return null;
       }
 
+      // This client binding guard prevents revocation when the caller presents a mismatched client id.
+      if (expectedClientId && row.client_id !== expectedClientId) {
+        return null;
+      }
+
       const result = this.db
         .prepare('UPDATE oauth_tokens SET revoked = 1, updated_at = ? WHERE token_id = ? AND revoked = 0')
         .run(nowIso, row.token_id);
@@ -1177,17 +1427,7 @@ export class SqliteStore {
         return null;
       }
 
-      return {
-        tokenId: row.token_id,
-        userId: row.user_id,
-        username: row.username,
-        role: row.role as UserRole,
-        clientId: row.client_id,
-        scope: row.scope,
-        resource: row.resource,
-        accessExpiresAt: row.access_expires_at,
-        refreshExpiresAt: row.refresh_expires_at
-      } satisfies OAuthTokenRecord;
+      return this.mapOAuthRefreshRowToTokenRecord(row);
     });
 
     return tx();
@@ -1464,6 +1704,138 @@ export class SqliteStore {
       .run(new Date().toISOString(), status, JSON.stringify(result), runId);
   }
 
+  // This method creates one daily-maintenance run entry before workflow execution starts.
+  public createMaintenanceRun(input: { userId: number; mode: 'dry_run' | 'apply' }): number {
+    this.getUserById(input.userId);
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `
+        INSERT INTO maintenance_runs (user_id, started_at, mode, status)
+        VALUES (?, ?, ?, 'running')
+      `
+      )
+      .run(input.userId, now, input.mode);
+
+    return Number(result.lastInsertRowid);
+  }
+
+  // This method attaches a generated reorg plan id to one maintenance run.
+  public setMaintenanceRunReorgPlanId(runId: number, planId: string): void {
+    this.db.prepare('UPDATE maintenance_runs SET reorg_plan_id = ? WHERE id = ?').run(planId, runId);
+  }
+
+  // This method stores step-level or link-level maintenance run item records.
+  public insertMaintenanceRunItems(
+    runId: number,
+    items: Array<{
+      itemType: MaintenanceRunItem['itemType'];
+      linkId?: number | null;
+      action: string;
+      outcome: MaintenanceRunItem['outcome'];
+      details?: Record<string, unknown>;
+    }>
+  ): void {
+    if (items.length === 0) {
+      return;
+    }
+
+    const insert = this.db.prepare(
+      `
+      INSERT INTO maintenance_run_items (run_id, item_type, link_id, action, outcome, details_json)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `
+    );
+
+    const tx = this.db.transaction(() => {
+      for (const item of items) {
+        insert.run(runId, item.itemType, item.linkId ?? null, item.action, item.outcome, JSON.stringify(item.details ?? {}));
+      }
+    });
+
+    tx();
+  }
+
+  // This method finalizes a maintenance run with summary payload and optional error details.
+  public finishMaintenanceRun(input: {
+    runId: number;
+    status: 'success' | 'failed';
+    summary: Record<string, unknown>;
+    error?: Record<string, unknown>;
+  }): void {
+    this.db
+      .prepare(
+        `
+        UPDATE maintenance_runs
+        SET ended_at = ?, status = ?, summary_json = ?, error_json = ?
+        WHERE id = ?
+      `
+      )
+      .run(
+        new Date().toISOString(),
+        input.status,
+        JSON.stringify(input.summary),
+        input.error ? JSON.stringify(input.error) : null,
+        input.runId
+      );
+  }
+
+  // This method acquires a per-user maintenance lock and returns false when another active lock exists.
+  public acquireMaintenanceLock(userId: number, lockToken: string, ttlSeconds = 1800): boolean {
+    this.getUserById(userId);
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+    const result = this.db
+      .prepare(
+        `
+        INSERT INTO maintenance_locks (user_id, lock_token, acquired_at, expires_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          lock_token = excluded.lock_token,
+          acquired_at = excluded.acquired_at,
+          expires_at = excluded.expires_at,
+          updated_at = excluded.updated_at
+        WHERE maintenance_locks.expires_at <= excluded.acquired_at
+      `
+      )
+      .run(userId, lockToken, now, expiresAt, now);
+
+    return result.changes > 0;
+  }
+
+  // This method releases a per-user maintenance lock only when the lock token matches.
+  public releaseMaintenanceLock(userId: number, lockToken: string): void {
+    this.db.prepare('DELETE FROM maintenance_locks WHERE user_id = ? AND lock_token = ?').run(userId, lockToken);
+  }
+
+  // This method returns active lock metadata for diagnostics or conflict messages.
+  public getActiveMaintenanceLock(userId: number): { lockToken: string; expiresAt: string } | null {
+    const row = this.db
+      .prepare(
+        `
+        SELECT user_id, lock_token, expires_at
+        FROM maintenance_locks
+        WHERE user_id = ?
+        LIMIT 1
+      `
+      )
+      .get(userId) as MaintenanceLockRow | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    if (new Date(row.expires_at).getTime() <= Date.now()) {
+      this.db.prepare('DELETE FROM maintenance_locks WHERE user_id = ?').run(userId);
+      return null;
+    }
+
+    return {
+      lockToken: row.lock_token,
+      expiresAt: row.expires_at
+    };
+  }
+
   // This method persists one audit entry for each write operation.
   public insertAudit(entry: AuditEntry): void {
     this.db
@@ -1493,6 +1865,102 @@ export class SqliteStore {
         entry.outcome,
         entry.details ? JSON.stringify(entry.details) : null
       );
+  }
+
+  // This method returns stored health-state snapshots for selected links of one user.
+  public listLinkHealthStates(userId: number, linkIds: number[]): LinkHealthState[] {
+    if (linkIds.length === 0) {
+      return [];
+    }
+
+    const placeholders = linkIds.map(() => '?').join(', ');
+    const rows = this.db
+      .prepare(
+        `
+        SELECT
+          user_id,
+          link_id,
+          url,
+          first_failure_at,
+          last_failure_at,
+          consecutive_failures,
+          last_status,
+          last_checked_at,
+          last_http_status,
+          last_error,
+          archived_at
+        FROM link_health_state
+        WHERE user_id = ?
+          AND link_id IN (${placeholders})
+      `
+      )
+      .all(userId, ...linkIds) as LinkHealthStateRow[];
+
+    return rows.map((row) => ({
+      userId: row.user_id,
+      linkId: row.link_id,
+      url: row.url,
+      firstFailureAt: row.first_failure_at,
+      lastFailureAt: row.last_failure_at,
+      consecutiveFailures: row.consecutive_failures,
+      lastStatus: row.last_status as LinkHealthState['lastStatus'],
+      lastCheckedAt: row.last_checked_at,
+      lastHttpStatus: row.last_http_status,
+      lastError: row.last_error,
+      archivedAt: row.archived_at
+    }));
+  }
+
+  // This method upserts one link health-state snapshot after each monitor run.
+  public upsertLinkHealthState(state: LinkHealthState): void {
+    this.db
+      .prepare(
+        `
+        INSERT INTO link_health_state (
+          user_id,
+          link_id,
+          url,
+          first_failure_at,
+          last_failure_at,
+          consecutive_failures,
+          last_status,
+          last_checked_at,
+          last_http_status,
+          last_error,
+          archived_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, link_id) DO UPDATE SET
+          url = excluded.url,
+          first_failure_at = excluded.first_failure_at,
+          last_failure_at = excluded.last_failure_at,
+          consecutive_failures = excluded.consecutive_failures,
+          last_status = excluded.last_status,
+          last_checked_at = excluded.last_checked_at,
+          last_http_status = excluded.last_http_status,
+          last_error = excluded.last_error,
+          archived_at = excluded.archived_at
+      `
+      )
+      .run(
+        state.userId,
+        state.linkId,
+        state.url,
+        state.firstFailureAt,
+        state.lastFailureAt,
+        state.consecutiveFailures,
+        state.lastStatus,
+        state.lastCheckedAt,
+        state.lastHttpStatus,
+        state.lastError,
+        state.archivedAt
+      );
+  }
+
+  // This method marks a link as archived in health-state tracking after successful archival move.
+  public markLinkHealthArchived(userId: number, linkId: number): void {
+    this.db
+      .prepare('UPDATE link_health_state SET archived_at = ? WHERE user_id = ? AND link_id = ?')
+      .run(new Date().toISOString(), userId, linkId);
   }
 
   // This method allows a clean shutdown of SQLite resources.

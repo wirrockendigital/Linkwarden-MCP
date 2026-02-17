@@ -142,8 +142,10 @@ export function assertValidRedirectUri(value: string): void {
 
 // This function validates one resource value against this MCP server resource set.
 export function assertAcceptedResource(resource: string | undefined, request: FastifyRequest): string {
+  // This default keeps OAuth compatibility with clients that do not send `resource` during authorize.
+  const defaultResource = getMcpResourceUrl(request);
   if (!resource || resource.trim().length === 0) {
-    throw new AppError(400, 'invalid_resource', 'resource parameter is required.');
+    return defaultResource;
   }
 
   const accepted = getAcceptedResources(request);
@@ -152,7 +154,7 @@ export function assertAcceptedResource(resource: string | undefined, request: Fa
     throw new AppError(400, 'invalid_resource', 'Requested resource is not served by this MCP server.');
   }
 
-  return accepted.find((value) => normalizeUrl(value) === normalized) ?? accepted[0];
+  return accepted.find((value) => normalizeUrl(value) === normalized) ?? defaultResource;
 }
 
 // This function creates one RFC 6750 WWW-Authenticate header with resource metadata hint.
@@ -170,11 +172,14 @@ export function buildBearerChallenge(request: FastifyRequest, error?: string, de
 
 // This helper reads one header value and converts arrays to the first string.
 function headerAsString(value: string | string[] | undefined): string | undefined {
-  if (Array.isArray(value)) {
-    return value[0];
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (!raw) {
+    return undefined;
   }
 
-  return value;
+  // This split handles proxy chains where forwarded headers contain comma-separated hop values.
+  const normalized = raw.split(',')[0]?.trim();
+  return normalized && normalized.length > 0 ? normalized : undefined;
 }
 
 // This helper strips one optional trailing slash for canonical URL comparisons.

@@ -463,11 +463,14 @@ export function registerOAuthRoutes(fastify: FastifyInstance, deps: OAuthRouteDe
     }
 
     try {
-      if (!parsed.data.client_id) {
-        throw new AppError(401, 'invalid_client', 'client_id is required.');
-      }
+      // This normalization keeps grant-specific client handling deterministic for optional refresh client_id.
+      const requestedClientId = parsed.data.client_id?.trim() ? parsed.data.client_id.trim() : undefined;
 
       if (parsed.data.grant_type === 'authorization_code') {
+        if (!requestedClientId) {
+          throw new AppError(401, 'invalid_client', 'client_id is required.');
+        }
+
         if (!parsed.data.code || !parsed.data.redirect_uri || !parsed.data.code_verifier) {
           throw new AppError(400, 'invalid_request', 'Missing code, redirect_uri, or code_verifier.');
         }
@@ -476,7 +479,7 @@ export function registerOAuthRoutes(fastify: FastifyInstance, deps: OAuthRouteDe
         assertValidCodeVerifier(parsed.data.code_verifier);
 
         const policy = resolveClientPolicy(deps.configStore, deps.db, {
-          clientId: parsed.data.client_id,
+          clientId: requestedClientId,
           redirectUri: parsed.data.redirect_uri,
           allowDynamicRegistration: false
         });
@@ -527,32 +530,42 @@ export function registerOAuthRoutes(fastify: FastifyInstance, deps: OAuthRouteDe
         throw new AppError(400, 'invalid_request', 'Missing refresh_token.');
       }
 
-      const consumedRefresh = deps.db.consumeOAuthRefreshToken(hashApiToken(parsed.data.refresh_token));
-      if (!consumedRefresh) {
+      const refreshTokenHash = hashApiToken(parsed.data.refresh_token);
+      const refreshRecord = deps.db.getOAuthRefreshToken(refreshTokenHash);
+      if (!refreshRecord) {
         throw new AppError(400, 'invalid_grant', 'Refresh token is invalid or expired.');
       }
 
+      // This fallback allows standards-compliant refresh requests that omit client_id and use token-bound client identity.
+      const effectiveClientId = requestedClientId ?? refreshRecord.clientId;
       const policy = resolveClientPolicy(deps.configStore, deps.db, {
-        clientId: parsed.data.client_id,
+        clientId: effectiveClientId,
         allowDynamicRegistration: false
       });
       assertClientAuthentication(policy, parsed.data.client_secret);
 
-      if (consumedRefresh.clientId !== parsed.data.client_id) {
+      if (refreshRecord.clientId !== policy.clientId) {
         throw new AppError(400, 'invalid_grant', 'Refresh token does not belong to this client.');
       }
 
       if (parsed.data.resource && parsed.data.resource.trim().length > 0) {
         const requestedResource = assertAcceptedResource(parsed.data.resource, request);
-        if (requestedResource !== consumedRefresh.resource) {
+        if (requestedResource !== refreshRecord.resource) {
           throw new AppError(400, 'invalid_target', 'Resource mismatch for refresh token.');
         }
       }
 
-      const scope = parsed.data.scope?.trim() ? normalizeScope(parsed.data.scope) : consumedRefresh.scope;
-      if (!isScopeSubset(scope, consumedRefresh.scope)) {
+      const scope = parsed.data.scope?.trim() ? normalizeScope(parsed.data.scope) : refreshRecord.scope;
+      if (!isScopeSubset(scope, refreshRecord.scope)) {
         throw new AppError(400, 'invalid_scope', 'Requested scope exceeds originally granted scope.');
       }
+
+      // This final consume step enforces rotation only after all client/resource/scope checks pass.
+      const consumedRefresh = deps.db.consumeOAuthRefreshToken(refreshTokenHash, policy.clientId);
+      if (!consumedRefresh) {
+        throw new AppError(400, 'invalid_grant', 'Refresh token is invalid or expired.');
+      }
+
       const issued = issueTokenPair(deps.db, {
         userId: consumedRefresh.userId,
         clientId: consumedRefresh.clientId,

@@ -162,9 +162,68 @@ Hinweis:
 
 Beispielprompts:
 
-- `Nutze linkwarden_search_links mit query "mail security" limit 20`
+- `Nutze linkwarden_search_links mit query "mail security"`
 - `Erstelle mit linkwarden_plan_reorg eine tag-by-keywords Planung für "spf dkim dmarc mta-sts dane" und zeige Preview`
 - `Wende plan_id XYZ mit linkwarden_apply_plan confirm APPLY an`
+
+## Agent-Workflows für deinen Alltag
+
+Der MCP ist jetzt auf deinen gewünschten Arbeitsmodus ausgelegt:
+
+- Links finden (nativ über Linkwarden API):
+  - `linkwarden_search_links` nutzt die nativen Linkwarden-Endpunkte.
+  - Wenn `limit` weggelassen wird, verarbeitet der MCP alle Treffer (keine harte Obergrenze).
+- Collections nativ verwalten:
+  - `linkwarden_create_collection`, `linkwarden_update_collection`, `linkwarden_delete_collection`
+- Links nativ organisieren:
+  - `linkwarden_set_links_collection` für Collection-Zuweisung/Entfernung
+  - `linkwarden_set_links_pinned` für Pin/Unpin
+  - `linkwarden_clean_link_urls` zum Entfernen von Tracking-Parametern
+- Server-Metadaten ausgeben:
+  - `linkwarden_get_server_info`
+  - liefert Name, Server-Version und MCP-Protokollversion.
+- Chat-Links direkt ablegen:
+  - `linkwarden_capture_chat_links`
+  - extrahiert URLs aus Freitext und legt sie in `ChatGPT Chats > <Chat Name>` ab.
+- Nicht funktionale Links beobachten und archivieren:
+- Nicht funktionale Links beobachten und per User-Policy verarbeiten:
+  - `linkwarden_monitor_offline_links`
+  - trackt Reachability-Failures pro Link in SQLite
+  - Dry-run zeigt Kandidaten
+  - mit `dryRun=false` greift die konfigurierte Policy pro User (`archive`, `delete` oder `none`).
+- Alles in einem Lauf:
+  - `linkwarden_run_daily_maintenance`
+  - kombiniert Reorg-Plan(+optional Apply) und Offline-Monitoring(+optional Archivierung)
+  - Standard ist sicher: `apply=false` (nur Vorschau).
+  - persistiert Laufstatus in `maintenance_runs` und Step-Details in `maintenance_run_items`.
+  - nutzt einen per-User Run-Lock, damit keine parallelen Maintenance-Läufe kollidieren.
+
+Beispiel für Chat-Import:
+
+- `Nutze linkwarden_capture_chat_links mit chatName "SEO Sprint 2026" und text "<hier kompletter Chat-Auszug>"`.
+
+Beispiel für Offline-Monitoring:
+
+- `Nutze linkwarden_monitor_offline_links mit dryRun=true`.
+- Danach:
+- `Nutze linkwarden_monitor_offline_links mit dryRun=false action="archive" archiveCollectionId=123`.
+
+Beispiel für Versionsabfrage:
+
+- `Nutze linkwarden_get_server_info`.
+
+Beispiel für kompletten Daily-Flow:
+
+- Dry-run:
+- `Nutze linkwarden_run_daily_maintenance mit reorg {strategy:"tag-by-keywords", parameters:{rules:[...]}} und offline {offlineDays:14, minConsecutiveFailures:3, archiveCollectionId:123} apply=false`.
+- Anwenden:
+- `Nutze linkwarden_run_daily_maintenance mit reorg {strategy:"tag-by-keywords", parameters:{rules:[...]}} und offline {offlineDays:14, minConsecutiveFailures:3, archiveCollectionId:123} apply=true confirm="APPLY"`.
+
+Hinweis zu „proaktiv“:
+
+- Der MCP stellt die Tools bereit; die automatische Ausführung passiert über den aufrufenden Agenten/Connector.
+- Praktisch: In ChatGPT einen wiederkehrenden Task auf `linkwarden_monitor_offline_links` setzen.
+- Für One-shot-Orchestrierung bevorzugt `linkwarden_run_daily_maintenance` und einen separaten Review-Task für Apply.
 
 ## Versionierung und automatische Docker-Releases
 

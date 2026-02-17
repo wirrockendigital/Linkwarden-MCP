@@ -10,6 +10,7 @@ import { registerSetupRoutes } from './http/setup.js';
 import { registerUiRoutes } from './http/ui.js';
 import { createValidatedLinkwardenClientWithToken } from './linkwarden/runtime.js';
 import { registerMcpRoutes } from './mcp/protocol.js';
+import { MCP_SERVER_NAME, MCP_SERVER_VERSION, formatProtocolVersionWithTimestamp } from './version.js';
 import { AppError, normalizeError } from './utils/errors.js';
 import { buildLoggerOptions, errorForLog, sanitizeForLog } from './utils/logger.js';
 
@@ -287,6 +288,16 @@ export function createServer(): ServerResources {
       hasUsers,
       linkwardenTargetConfigured: Boolean(target),
       upstreamReachable
+    };
+  });
+
+  // This endpoint exposes canonical server and protocol version metadata for external monitoring and debugging.
+  app.get('/version', async () => {
+    return {
+      ok: true,
+      name: MCP_SERVER_NAME,
+      version: MCP_SERVER_VERSION,
+      protocolVersion: formatProtocolVersionWithTimestamp()
     };
   });
 
