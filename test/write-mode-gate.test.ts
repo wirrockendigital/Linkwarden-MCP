@@ -1,18 +1,20 @@
-// This test suite verifies that MCP write tools are blocked when user write mode is disabled.
+// This test suite verifies that alpha write tools are blocked when per-user write mode is disabled.
 
 import { describe, expect, it } from 'vitest';
 import { executeTool } from '../src/mcp/tools.js';
 import { AppError } from '../src/utils/errors.js';
 
-describe('mcp write-mode gate', () => {
-  it('blocks write tool execution when per-user write mode is disabled', async () => {
+describe('mcp write-mode gate (alpha)', () => {
+  it('blocks mutating tool execution when write mode is disabled', async () => {
     const context = {
       actor: 'alice#key1',
       principal: {
         userId: 1,
         username: 'alice',
         role: 'user',
-        apiKeyId: 'key1'
+        apiKeyId: 'key1',
+        toolScopes: ['*'],
+        collectionScopes: []
       },
       configStore: {
         getRuntimeConfig: () => ({
@@ -26,6 +28,9 @@ describe('mcp write-mode gate', () => {
         getUserSettings: () => ({
           userId: 1,
           writeModeEnabled: false,
+          taggingStrictness: 'very_strict',
+          fetchMode: 'optional',
+          queryTimeZone: null,
           offlineDays: 14,
           offlineMinConsecutiveFailures: 3,
           offlineAction: 'archive',
@@ -43,12 +48,35 @@ describe('mcp write-mode gate', () => {
 
     await expect(
       executeTool(
-        'linkwarden_update_link',
+        'linkwarden_mutate_links',
         {
-          id: 123,
+          ids: [123],
           updates: {
             title: 'blocked'
-          }
+          },
+          dryRun: false
+        },
+        context
+      )
+    ).rejects.toBeInstanceOf(AppError);
+
+    await expect(
+      executeTool(
+        'linkwarden_delete_links',
+        {
+          ids: [123],
+          dryRun: false
+        },
+        context
+      )
+    ).rejects.toBeInstanceOf(AppError);
+
+    await expect(
+      executeTool(
+        'linkwarden_governed_tag_links',
+        {
+          linkIds: [123],
+          dryRun: false
         },
         context
       )
@@ -66,9 +94,38 @@ describe('mcp write-mode gate', () => {
 
     await expect(
       executeTool(
-        'linkwarden_create_collection',
+        'linkwarden_create_rule',
         {
-          name: 'Service'
+          name: 'Rule',
+          selector: {
+            query: 'security'
+          },
+          action: {
+            type: 'pin',
+            pinned: true
+          }
+        },
+        context
+      )
+    ).rejects.toBeInstanceOf(AppError);
+
+    await expect(
+      executeTool(
+        'linkwarden_create_saved_query',
+        {
+          name: 'Saved',
+          selector: {},
+          fields: []
+        },
+        context
+      )
+    ).rejects.toBeInstanceOf(AppError);
+
+    await expect(
+      executeTool(
+        'linkwarden_delete_rule',
+        {
+          id: '11111111-1111-1111-1111-111111111111'
         },
         context
       )

@@ -12,8 +12,9 @@
 ### MCP
 
 - OAuth 2.0 Bearer Token auf `/mcp` (Standard für ChatGPT Connector)
-- MCP API-Key als Legacy-Fallback bleibt möglich
+- MCP API-Key ist nativ gleichwertig zu OAuth angebunden
 - Token ist immer einem Benutzerkonto zugeordnet
+- Tool-Scopes und Collection-Scopes werden für API-Key und OAuth ausgewertet
 - Bei fehlendem/ungültigem Token liefert `/mcp` einen OAuth-kompatiblen `WWW-Authenticate`-Challenge
 
 ### Browser-UI
@@ -32,9 +33,9 @@ Write-Tools sind nur erlaubt wenn:
 
 ## Dry-run + Apply
 
-- Reorg immer über `linkwarden_plan_reorg` (dry-run)
-- Ausführung nur über `linkwarden_apply_plan` mit `confirm="APPLY"`
-- Plan muss gültig sein (nicht expired, nicht bereits applied)
+- Bulk-Tools bieten standardmäßig `dryRun=true` (`mutate`, `delete`, `normalize`, `governed_tag_links`)
+- Idempotente Writes nutzen optional `idempotencyKey`
+- Persistente Regeln werden über `linkwarden_create_rule`, `linkwarden_test_rule`, `linkwarden_apply_rule`, `linkwarden_run_rules_now` gesteuert
 
 ## Whitelist-Enforcement
 

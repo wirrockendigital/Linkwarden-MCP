@@ -1,9 +1,14 @@
-# MCP Tools
+# MCP Tools (Alpha 0.2.x)
 
 ## Verfügbare Tools
 
-- `linkwarden_search_links`
 - `linkwarden_get_server_info`
+- `linkwarden_get_stats`
+- `linkwarden_query_links`
+- `linkwarden_aggregate_links`
+- `linkwarden_get_link`
+- `linkwarden_mutate_links`
+- `linkwarden_delete_links`
 - `linkwarden_list_collections`
 - `linkwarden_create_collection`
 - `linkwarden_update_collection`
@@ -12,86 +17,146 @@
 - `linkwarden_create_tag`
 - `linkwarden_delete_tag`
 - `linkwarden_assign_tags`
-- `linkwarden_get_link`
-- `linkwarden_plan_reorg`
-- `linkwarden_apply_plan`
-- `linkwarden_update_link`
-- `linkwarden_set_links_collection`
-- `linkwarden_set_links_pinned`
-- `linkwarden_bulk_update_links`
-- `linkwarden_clean_link_urls`
-- `linkwarden_monitor_offline_links`
-- `linkwarden_run_daily_maintenance`
-- `linkwarden_suggest_taxonomy` (optional)
+- `linkwarden_governed_tag_links`
+- `linkwarden_normalize_urls`
+- `linkwarden_find_duplicates`
+- `linkwarden_merge_duplicates`
+- `linkwarden_create_rule`
+- `linkwarden_test_rule`
+- `linkwarden_apply_rule`
+- `linkwarden_run_rules_now`
+- `linkwarden_get_new_links_routine_status`
+- `linkwarden_run_new_links_routine_now`
+- `linkwarden_list_rules`
+- `linkwarden_delete_rule`
+- `linkwarden_create_saved_query`
+- `linkwarden_list_saved_queries`
+- `linkwarden_run_saved_query`
+- `linkwarden_get_audit`
+- `linkwarden_undo_operation`
 
-## Safety by Design
+## Standardisierte Responses
 
-- Listen/Suche sind paginiert und limitiert
-- Schreibvorgänge benötigen aktivierten **benutzerspezifischen** Write-Mode
-- Jeder Benutzer benötigt einen eigenen `Linkwarden API Key -> MCP`
-- Reorganisation ist immer zweistufig:
-  1. `linkwarden_plan_reorg` (Dry-run)
-  2. `linkwarden_apply_plan` mit `confirm="APPLY"`
+Alle Tool-Responses nutzen dasselbe Envelope:
+
+- `ok`
+- `data`
+- `summary`
+- `paging`
+- `warnings`
+- `error`
+- `failures`
 
 ## Beispiele
 
-Suche:
-
-```text
-Nutze linkwarden_search_links mit query "mail security" limit 20
-```
-
-Server-Version abfragen:
+Server-Version:
 
 ```text
 Nutze linkwarden_get_server_info
 ```
 
-Plan erzeugen:
+Harte Zähler:
 
 ```text
-Erstelle mit linkwarden_plan_reorg eine tag-by-keywords Planung für "spf dkim dmarc mta-sts dane" und zeige Preview
+Nutze linkwarden_get_stats
 ```
 
-Plan anwenden:
+Deterministische Query mit Cursor:
 
 ```text
-Wende plan_id XYZ mit linkwarden_apply_plan confirm APPLY an
+Nutze linkwarden_query_links mit selector {query:"security", includeDescendants:true} limit 50 fields ["id","title","url"] verbosity "minimal"
 ```
 
-Tag erstellen:
+Natürliche Datumsfilter (angelegt-Zeit via `createdAt`):
 
 ```text
-Nutze linkwarden_create_tag mit name "Security"
+Nutze linkwarden_query_links mit selector {createdAtRelative:{amount:1,unit:"month",mode:"previous_calendar"}, timeZone:"Europe/Berlin"} limit 200
 ```
 
-Tags per Name zuweisen (inkl. Auto-Create fehlender Tags):
+Absolute Datumsrange:
 
 ```text
-Nutze linkwarden_assign_tags mit linkIds [123,456] tagNames ["Security","DNS"] mode "add" createMissingTags true
+Nutze linkwarden_query_links mit selector {createdAtFrom:"2026-01-01", createdAtTo:"2026-01-31", timeZone:"Europe/Berlin"} limit 200
 ```
 
-Collection erstellen:
+Tag-Namen + Alias/Fuzzy + Datumsfilter:
 
 ```text
-Nutze linkwarden_create_collection mit name "Service" parentId null
+Nutze linkwarden_query_links mit selector {tagNamesAny:["Wohnmobil","WoMo"], createdAtRelative:{amount:1,unit:"month",mode:"previous_calendar"}} limit 200
 ```
 
-Links Collection zuweisen/entfernen:
+Collection-Namen + Datumsfilter:
 
 ```text
-Nutze linkwarden_set_links_collection mit linkIds [1,2,3] collectionId 77 dryRun true
-Nutze linkwarden_set_links_collection mit linkIds [1,2,3] collectionId null dryRun false
+Nutze linkwarden_query_links mit selector {collectionNamesAny:["Wohnmobil"], includeDescendants:true, createdAtRelative:{amount:1,unit:"month",mode:"previous_calendar"}} limit 200
 ```
 
-Links pinnen/entpinnen:
+Hinweise:
+
+- `createdAtRelative` kann nicht mit `createdAtFrom/createdAtTo` kombiniert werden.
+- Für Tag/Collection-Achsen gilt jeweils Name- oder ID-Filter, nicht beides gleichzeitig.
+- Nicht auflösbare Namen und fuzzy-Auflösungen stehen im Response-Feld `warnings`.
+
+Bulk-Mutation (Dry-Run):
 
 ```text
-Nutze linkwarden_set_links_pinned mit linkIds [1,2,3] pinned true dryRun true
+Nutze linkwarden_mutate_links mit selector {collectionId:123, includeDescendants:true} updates {tagMode:"add", tagNames:["security"]} dryRun true
 ```
 
-Tracking-Parameter entfernen:
+Soft-Delete:
 
 ```text
-Nutze linkwarden_clean_link_urls mit linkIds [1,2,3] dryRun true removeUtm true removeKnownTracking true
+Nutze linkwarden_delete_links mit selector {tagIdsAny:[9]} mode "soft" dryRun false
+```
+
+URL-Normalisierung:
+
+```text
+Nutze linkwarden_normalize_urls mit selector {query:"utm_"} dryRun true
+```
+
+Governed Tagging (One-Call):
+
+```text
+Nutze linkwarden_governed_tag_links mit selector {collectionId:123, includeDescendants:true} dryRun true
+```
+
+Hinweis zu AI-Providern für Governed Tagging:
+
+- Provider-Auswahl erfolgt global über die Admin-Tagging-Policy (`inferenceProvider`).
+- Unterstützt werden `builtin`, `perplexity`, `mistral`, `huggingface`.
+- Für `huggingface` kann ein beliebiges gehostetes Modell über `inferenceModel` gesetzt werden.
+- Für externe Provider müssen die passenden Env-Keys gesetzt sein:
+  - `MCP_PERPLEXITY_API_KEY`
+  - `MCP_MISTRAL_API_KEY`
+  - `MCP_HUGGINGFACE_API_KEY`
+
+Regel testen:
+
+```text
+Nutze linkwarden_test_rule mit id "rule-id"
+```
+
+New-Links-Routine Status:
+
+```text
+Nutze linkwarden_get_new_links_routine_status
+```
+
+New-Links-Routine sofort ausführen:
+
+```text
+Nutze linkwarden_run_new_links_routine_now
+```
+
+Gespeicherte Query ausführen:
+
+```text
+Nutze linkwarden_run_saved_query mit id "saved-query-id" limit 100
+```
+
+Undo:
+
+```text
+Nutze linkwarden_undo_operation mit operationId "operation-id"
 ```

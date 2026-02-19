@@ -19,8 +19,14 @@ export function extractBearerToken(authHeader: string | undefined): string | nul
     return null;
   }
 
-  const [scheme, token] = authHeader.split(' ', 2);
-  if (!scheme || !token || scheme.toLowerCase() !== 'bearer') {
+  const normalized = authHeader.trim();
+  const match = normalized.match(/^bearer\s+(.+)$/i);
+  if (!match) {
+    return null;
+  }
+
+  const token = match[1]?.trim() ?? '';
+  if (token.length === 0 || /\s/.test(token)) {
     return null;
   }
 

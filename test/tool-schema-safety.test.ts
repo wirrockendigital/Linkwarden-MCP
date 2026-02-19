@@ -1,228 +1,180 @@
-// This test suite verifies strict safety contracts for confirm-gated and bounded tools.
+// This test suite verifies core alpha schema defaults and tool discovery contracts.
 
 import { describe, expect, it } from 'vitest';
 import {
+  aggregateLinksSchema,
   assignTagsSchema,
-  applyPlanSchema,
   buildToolList,
-  bulkUpdateSchema,
-  captureChatLinksSchema,
-  cleanLinkUrlsSchema,
-  connectorFetchSchema,
-  connectorSearchSchema,
-  createCollectionSchema,
-  createTagSchema,
-  deleteCollectionSchema,
-  deleteTagSchema,
-  listCollectionsSchema,
-  monitorOfflineLinksSchema,
-  runDailyMaintenanceSchema,
-  setLinksCollectionSchema,
-  setLinksPinnedSchema,
-  serverInfoSchema,
-  searchLinksSchema
+  createRuleSchema,
+  createSavedQuerySchema,
+  deleteLinksSchema,
+  getNewLinksRoutineStatusSchema,
+  governedTagLinksSchema,
+  mutateLinksSchema,
+  normalizeUrlsSchema,
+  queryLinksSchema,
+  runNewLinksRoutineNowSchema,
+  runRulesNowSchema,
+  selectorSchema,
+  serverInfoSchema
 } from '../src/mcp/tool-schemas.js';
 
-describe('tool schema safety', () => {
-  it('requires exact APPLY confirmation', () => {
-    expect(() =>
-      applyPlanSchema.parse({
-        plan_id: '12345678',
-        confirm: 'apply'
-      })
-    ).toThrow();
-
-    expect(
-      applyPlanSchema.parse({
-        plan_id: '12345678',
-        confirm: 'APPLY'
-      })
-    ).toMatchObject({ confirm: 'APPLY' });
-  });
-
-  it('defaults bulk updates to dry-run mode', () => {
-    const parsed = bulkUpdateSchema.parse({
-      linkIds: [1, 2],
-      updates: {
-        tagIds: [8, 9]
-      }
-    });
-
-    expect(parsed.dryRun).toBe(true);
-    expect(parsed.mode).toBe('replace');
-  });
-
-  it('validates connector-compatible search and fetch inputs', () => {
-    expect(() =>
-      connectorSearchSchema.parse({
-        query: ''
-      })
-    ).toThrow();
-
-    expect(() =>
-      connectorFetchSchema.parse({
-        id: ''
-      })
-    ).toThrow();
-
-    expect(
-      connectorSearchSchema.parse({
-        query: 'mail security'
-      })
-    ).toMatchObject({
-      query: 'mail security'
-    });
-
-    expect(
-      connectorFetchSchema.parse({
-        id: '42'
-      })
-    ).toMatchObject({
-      id: '42'
-    });
-  });
-
-  it('lists connector-compatible search/fetch tools for ChatGPT connectors', () => {
-    const toolNames = buildToolList().map((tool) => tool.name);
-
-    expect(toolNames).toContain('search');
-    expect(toolNames).toContain('fetch');
-    expect(toolNames).toContain('linkwarden_get_server_info');
-    expect(toolNames).toContain('linkwarden_capture_chat_links');
-    expect(toolNames).toContain('linkwarden_monitor_offline_links');
-    expect(toolNames).toContain('linkwarden_run_daily_maintenance');
-    expect(toolNames).toContain('linkwarden_create_tag');
-    expect(toolNames).toContain('linkwarden_delete_tag');
-    expect(toolNames).toContain('linkwarden_assign_tags');
-    expect(toolNames).toContain('linkwarden_create_collection');
-    expect(toolNames).toContain('linkwarden_update_collection');
-    expect(toolNames).toContain('linkwarden_delete_collection');
-    expect(toolNames).toContain('linkwarden_set_links_collection');
-    expect(toolNames).toContain('linkwarden_set_links_pinned');
-    expect(toolNames).toContain('linkwarden_clean_link_urls');
-  });
-
+describe('tool schema safety (alpha)', () => {
   it('validates server info tool input as empty object', () => {
     expect(serverInfoSchema.parse({})).toMatchObject({});
   });
 
-  it('defaults chat capture and offline monitor tools to safe modes', () => {
-    const captureParsed = captureChatLinksSchema.parse({
-      chatName: 'SEO Ideen',
-      text: 'https://example.com/a https://example.com/b'
-    });
+  it('applies deterministic defaults for selector and query schemas', () => {
+    const selector = selectorSchema.parse({});
+    expect(selector.includeDescendants).toBe(false);
 
-    expect(captureParsed.dryRun).toBe(false);
-    expect(captureParsed.parentCollectionName).toBe('ChatGPT Chats');
-
-    const monitorParsed = monitorOfflineLinksSchema.parse({});
-    expect(monitorParsed.dryRun).toBe(true);
-    expect(monitorParsed.offlineDays).toBeUndefined();
-    expect(monitorParsed.minConsecutiveFailures).toBeUndefined();
-    expect(monitorParsed.action).toBeUndefined();
-    expect(monitorParsed.offset).toBe(0);
-    expect(monitorParsed.limit).toBeUndefined();
+    const query = queryLinksSchema.parse({});
+    expect(query.limit).toBe(50);
+    expect(query.fields).toEqual([]);
+    expect(query.verbosity).toBe('minimal');
   });
 
-  it('keeps daily maintenance in dry-run mode by default', () => {
-    const parsed = runDailyMaintenanceSchema.parse({
-      reorg: {
-        strategy: 'dedupe-tags',
-        parameters: {}
+  it('rejects conflicting selector date and name/id axis filters', () => {
+    expect(() =>
+      selectorSchema.parse({
+        createdAtFrom: '2026-01-01',
+        createdAtRelative: {
+          amount: 1,
+          unit: 'month',
+          mode: 'previous_calendar'
+        }
+      })
+    ).toThrow();
+
+    expect(() =>
+      selectorSchema.parse({
+        tagIdsAny: [1],
+        tagNamesAny: ['wohnmobil']
+      })
+    ).toThrow();
+
+    expect(() =>
+      selectorSchema.parse({
+        collectionId: 4,
+        collectionNamesAny: ['Wohnmobil']
+      })
+    ).toThrow();
+  });
+
+  it('rejects invalid selector time zones', () => {
+    expect(() =>
+      selectorSchema.parse({
+        timeZone: 'Invalid/Timezone'
+      })
+    ).toThrow();
+  });
+
+  it('keeps mutate and delete tools in dry-run mode by default', () => {
+    const mutate = mutateLinksSchema.parse({
+      ids: [1, 2],
+      updates: {
+        tagNames: ['alpha']
+      }
+    });
+    expect(mutate.dryRun).toBe(true);
+    expect(mutate.updates.tagMode).toBe('add');
+    expect(mutate.updates.createMissingTags).toBe(true);
+
+    const remove = deleteLinksSchema.parse({
+      ids: [1, 2]
+    });
+    expect(remove.mode).toBe('soft');
+    expect(remove.dryRun).toBe(true);
+    expect(remove.markTagName).toBe('to-delete');
+  });
+
+  it('enforces selector-or-ids guardrails for write tools', () => {
+    expect(() =>
+      mutateLinksSchema.parse({
+        updates: {
+          title: 'x'
+        }
+      })
+    ).toThrow();
+
+    expect(() =>
+      assignTagsSchema.parse({
+        tagNames: ['x']
+      })
+    ).toThrow();
+  });
+
+  it('keeps governed-tagging, normalization and rule-run tools safe by default', () => {
+    const governed = governedTagLinksSchema.parse({
+      linkIds: [1]
+    });
+    expect(governed.dryRun).toBe(true);
+    expect(governed.previewLimit).toBe(50);
+
+    const normalize = normalizeUrlsSchema.parse({
+      linkIds: [1]
+    });
+    expect(normalize.dryRun).toBe(true);
+    expect(normalize.removeUtm).toBe(true);
+    expect(normalize.removeKnownTracking).toBe(true);
+
+    const runRules = runRulesNowSchema.parse({});
+    expect(runRules.dryRun).toBe(true);
+
+    expect(getNewLinksRoutineStatusSchema.parse({})).toEqual({});
+    expect(runNewLinksRoutineNowSchema.parse({})).toEqual({});
+  });
+
+  it('validates aggregate and saved-query schemas with stable defaults', () => {
+    const aggregate = aggregateLinksSchema.parse({});
+    expect(aggregate.groupBy).toBe('collection');
+    expect(aggregate.topN).toBe(50);
+
+    const saved = createSavedQuerySchema.parse({
+      name: 'Important',
+      selector: {},
+      fields: []
+    });
+    expect(saved.verbosity).toBe('minimal');
+  });
+
+  it('lists only alpha tool names (no legacy search/fetch/reorg names)', () => {
+    const names = buildToolList().map((tool) => tool.name);
+    expect(names).toHaveLength(32);
+    expect(names).toContain('linkwarden_query_links');
+    expect(names).toContain('linkwarden_governed_tag_links');
+    expect(names).toContain('linkwarden_mutate_links');
+    expect(names).toContain('linkwarden_delete_links');
+    expect(names).toContain('linkwarden_create_rule');
+    expect(names).toContain('linkwarden_run_rules_now');
+    expect(names).toContain('linkwarden_get_new_links_routine_status');
+    expect(names).toContain('linkwarden_run_new_links_routine_now');
+    expect(names).toContain('linkwarden_create_saved_query');
+    expect(names).toContain('linkwarden_get_audit');
+    expect(names).toContain('linkwarden_undo_operation');
+
+    expect(names).not.toContain('search');
+    expect(names).not.toContain('fetch');
+    expect(names).not.toContain('linkwarden_suggest_tags');
+    expect(names).not.toContain('linkwarden_classify_links');
+    expect(names).not.toContain('linkwarden_plan_reorg');
+    expect(names).not.toContain('linkwarden_apply_plan');
+    expect(names).not.toContain('linkwarden_run_daily_maintenance');
+  });
+
+  it('requires rule creation payload with deterministic shape', () => {
+    const parsed = createRuleSchema.parse({
+      name: 'Archive 404',
+      selector: {
+        tagIdsAny: [9]
+      },
+      action: {
+        type: 'move-to-collection',
+        collectionId: 778
       }
     });
 
-    expect(parsed.apply).toBe(false);
-    expect(parsed.confirm).toBeUndefined();
-
-    // This assertion ensures offline paging defaults remain deterministic when the section is present.
-    const parsedWithOffline = runDailyMaintenanceSchema.parse({
-      offline: {}
-    });
-    expect(parsedWithOffline.offline?.offset).toBe(0);
-  });
-
-  it('supports unlimited mode when limit is omitted', () => {
-    const searchParsed = searchLinksSchema.parse({
-      query: 'hotel'
-    });
-    expect(searchParsed.limit).toBeUndefined();
-    expect(searchParsed.offset).toBe(0);
-    expect(searchParsed.pinned).toBeUndefined();
-
-    const pinnedSearchParsed = searchLinksSchema.parse({
-      query: '*',
-      pinned: true
-    });
-    expect(pinnedSearchParsed.pinned).toBe(true);
-
-    const collectionsParsed = listCollectionsSchema.parse({});
-    expect(collectionsParsed.limit).toBeUndefined();
-    expect(collectionsParsed.offset).toBe(0);
-  });
-
-  it('validates tag create/delete and name-based assignment schemas', () => {
-    expect(
-      createTagSchema.parse({
-        name: '  Security  '
-      })
-    ).toMatchObject({
-      name: 'Security'
-    });
-
-    expect(
-      deleteTagSchema.parse({
-        id: 42
-      })
-    ).toMatchObject({
-      id: 42
-    });
-
-    const assignParsed = assignTagsSchema.parse({
-      linkIds: [1, 2, 3],
-      tagNames: ['Security', 'DNS']
-    });
-    expect(assignParsed.mode).toBe('add');
-    expect(assignParsed.createMissingTags).toBe(true);
-    expect(assignParsed.dryRun).toBe(true);
-  });
-
-  it('validates collection and link utility schemas with safe dry-run defaults', () => {
-    expect(
-      createCollectionSchema.parse({
-        name: '  Service  ',
-        parentId: null
-      })
-    ).toMatchObject({
-      name: 'Service',
-      parentId: null
-    });
-
-    expect(
-      deleteCollectionSchema.parse({
-        id: 77
-      })
-    ).toMatchObject({
-      id: 77
-    });
-
-    const setCollectionParsed = setLinksCollectionSchema.parse({
-      linkIds: [1, 2],
-      collectionId: null
-    });
-    expect(setCollectionParsed.dryRun).toBe(true);
-
-    const setPinnedParsed = setLinksPinnedSchema.parse({
-      linkIds: [1],
-      pinned: true
-    });
-    expect(setPinnedParsed.dryRun).toBe(true);
-
-    const cleanParsed = cleanLinkUrlsSchema.parse({
-      linkIds: [1, 2, 3]
-    });
-    expect(cleanParsed.dryRun).toBe(true);
-    expect(cleanParsed.removeUtm).toBe(true);
-    expect(cleanParsed.removeKnownTracking).toBe(true);
+    expect(parsed.enabled).toBe(true);
+    expect(parsed.schedule).toEqual({});
   });
 });

@@ -65,6 +65,10 @@ Wichtige Env-Werte in `linkwarden-mcp.env`:
 - `MCP_PUBLIC_BASE_URL=https://mcp.deine-domain.tld`
 - `MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=1800`
 - `MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS=2592000`
+- `MCP_DEFAULT_QUERY_TIMEZONE=Europe/Berlin`
+- `MCP_PERPLEXITY_API_KEY=` (optional; für `inferenceProvider=perplexity`)
+- `MCP_MISTRAL_API_KEY=` (optional; für `inferenceProvider=mistral`)
+- `MCP_HUGGINGFACE_API_KEY=` (optional; für `inferenceProvider=huggingface`)
 - `MCP_HOST_BIND_IP=127.0.0.1`
 - `MCP_HOST_PORT=39227`
 
@@ -162,68 +166,63 @@ Hinweis:
 
 Beispielprompts:
 
-- `Nutze linkwarden_search_links mit query "mail security"`
-- `Erstelle mit linkwarden_plan_reorg eine tag-by-keywords Planung für "spf dkim dmarc mta-sts dane" und zeige Preview`
-- `Wende plan_id XYZ mit linkwarden_apply_plan confirm APPLY an`
+- `Nutze linkwarden_query_links mit selector {query:"mail security"} limit 50 fields ["id","title","url"] verbosity "minimal"`
+- `Nutze linkwarden_query_links mit selector {createdAtRelative:{amount:1,unit:"month",mode:"previous_calendar"}, timeZone:"Europe/Berlin"} limit 200`
+- `Nutze linkwarden_query_links mit selector {tagNamesAny:["Wohnmobil","WoMo"], createdAtRelative:{amount:1,unit:"month",mode:"previous_calendar"}} limit 200`
+- `Nutze linkwarden_mutate_links mit selector {collectionId:123, includeDescendants:true} updates {tagMode:"add", tagNames:["security"]} dryRun true`
+- `Nutze linkwarden_delete_links mit selector {tagIdsAny:[9]} mode "soft" dryRun false`
 
 ## Agent-Workflows für deinen Alltag
 
 Der MCP ist jetzt auf deinen gewünschten Arbeitsmodus ausgelegt:
 
-- Links finden (nativ über Linkwarden API):
-  - `linkwarden_search_links` nutzt die nativen Linkwarden-Endpunkte.
-  - Wenn `limit` weggelassen wird, verarbeitet der MCP alle Treffer (keine harte Obergrenze).
+- Links finden (deterministisch, cursor-basiert):
+  - `linkwarden_query_links` mit `selector`, `fields`, `verbosity`, `cursor`.
+  - unterstützt `createdAtFrom`, `createdAtTo`, `createdAtRelative`, `timeZone`, `tagNamesAny/tagNamesAll`, `collectionNamesAny`.
+  - Namensauflösung für Tags/Collections läuft über exact + Alias (Tags) + striktes Fuzzy-Matching; Details stehen in `warnings`.
+- Harte Kennzahlen:
+  - `linkwarden_get_stats`, `linkwarden_aggregate_links`.
 - Collections nativ verwalten:
   - `linkwarden_create_collection`, `linkwarden_update_collection`, `linkwarden_delete_collection`
 - Links nativ organisieren:
-  - `linkwarden_set_links_collection` für Collection-Zuweisung/Entfernung
-  - `linkwarden_set_links_pinned` für Pin/Unpin
-  - `linkwarden_clean_link_urls` zum Entfernen von Tracking-Parametern
+  - `linkwarden_mutate_links` für Collection/Tags/Pin/Archive/Rename in einem Tool
+  - `linkwarden_assign_tags` für reines Tagging
+  - `linkwarden_governed_tag_links` für One-Call Taxonomie-Tagging mit Wildwuchs-Guardrails
+  - Governed-Tagging unterstützt nativ `inferenceProvider=builtin|perplexity|mistral|huggingface` (global über Admin-Tagging-Policy)
+  - Bei `huggingface` kann ein beliebiges gehostetes Modell über `inferenceModel` gesetzt werden (z. B. `meta-llama/Llama-3.1-8B-Instruct`)
+  - `linkwarden_normalize_urls` zum Entfernen von Tracking-Parametern
+- Duplikate nativ auflösen:
+  - `linkwarden_find_duplicates`, `linkwarden_merge_duplicates`
 - Server-Metadaten ausgeben:
   - `linkwarden_get_server_info`
-  - liefert Name, Server-Version und MCP-Protokollversion.
-- Chat-Links direkt ablegen:
-  - `linkwarden_capture_chat_links`
-  - extrahiert URLs aus Freitext und legt sie in `ChatGPT Chats > <Chat Name>` ab.
-- Nicht funktionale Links beobachten und archivieren:
-- Nicht funktionale Links beobachten und per User-Policy verarbeiten:
-  - `linkwarden_monitor_offline_links`
-  - trackt Reachability-Failures pro Link in SQLite
-  - Dry-run zeigt Kandidaten
-  - mit `dryRun=false` greift die konfigurierte Policy pro User (`archive`, `delete` oder `none`).
-- Alles in einem Lauf:
-  - `linkwarden_run_daily_maintenance`
-  - kombiniert Reorg-Plan(+optional Apply) und Offline-Monitoring(+optional Archivierung)
-  - Standard ist sicher: `apply=false` (nur Vorschau).
-  - persistiert Laufstatus in `maintenance_runs` und Step-Details in `maintenance_run_items`.
-  - nutzt einen per-User Run-Lock, damit keine parallelen Maintenance-Läufe kollidieren.
-
-Beispiel für Chat-Import:
-
-- `Nutze linkwarden_capture_chat_links mit chatName "SEO Sprint 2026" und text "<hier kompletter Chat-Auszug>"`.
-
-Beispiel für Offline-Monitoring:
-
-- `Nutze linkwarden_monitor_offline_links mit dryRun=true`.
-- Danach:
-- `Nutze linkwarden_monitor_offline_links mit dryRun=false action="archive" archiveCollectionId=123`.
+  - liefert Name, Server-Version, MCP-Protokollversion und unterstützte Tag-Inference-Provider.
+- Regel-Engine:
+  - `linkwarden_create_rule`, `linkwarden_test_rule`, `linkwarden_apply_rule`, `linkwarden_run_rules_now`
+  - `linkwarden_list_rules`, `linkwarden_delete_rule`
+- Native Auto-Routine für neue Links:
+  - `linkwarden_get_new_links_routine_status`
+  - `linkwarden_run_new_links_routine_now`
+  - User-Backend unter `/admin/ui/user/new-links-routine` für `enabled`, `intervalMinutes`, `modules`, `batchSize`, Backfill-Anfrage/-Bestätigung
+- Gespeicherte Queries:
+  - `linkwarden_create_saved_query`, `linkwarden_list_saved_queries`, `linkwarden_run_saved_query`
+- Audit und Undo:
+  - `linkwarden_get_audit`, `linkwarden_undo_operation`
 
 Beispiel für Versionsabfrage:
 
 - `Nutze linkwarden_get_server_info`.
 
-Beispiel für kompletten Daily-Flow:
+Beispiel für Rule-Flow:
 
-- Dry-run:
-- `Nutze linkwarden_run_daily_maintenance mit reorg {strategy:"tag-by-keywords", parameters:{rules:[...]}} und offline {offlineDays:14, minConsecutiveFailures:3, archiveCollectionId:123} apply=false`.
-- Anwenden:
-- `Nutze linkwarden_run_daily_maintenance mit reorg {strategy:"tag-by-keywords", parameters:{rules:[...]}} und offline {offlineDays:14, minConsecutiveFailures:3, archiveCollectionId:123} apply=true confirm="APPLY"`.
+- `Nutze linkwarden_create_rule mit name "Archive 404" selector {...} action {type:"move-to-collection", collectionId:778}`.
+- `Nutze linkwarden_test_rule mit id "<rule-id>"`.
+- `Nutze linkwarden_apply_rule mit id "<rule-id>" dryRun false`.
 
 Hinweis zu „proaktiv“:
 
 - Der MCP stellt die Tools bereit; die automatische Ausführung passiert über den aufrufenden Agenten/Connector.
-- Praktisch: In ChatGPT einen wiederkehrenden Task auf `linkwarden_monitor_offline_links` setzen.
-- Für One-shot-Orchestrierung bevorzugt `linkwarden_run_daily_maintenance` und einen separaten Review-Task für Apply.
+- Praktisch: In ChatGPT einen wiederkehrenden Task auf `linkwarden_run_rules_now` setzen.
+- Für One-shot-Orchestrierung `linkwarden_apply_rule` (einzelne Regel) oder `linkwarden_run_rules_now` (mehrere Regeln) nutzen.
 
 ## Versionierung und automatische Docker-Releases
 
@@ -242,14 +241,14 @@ Ab jetzt gilt:
 Beispiel für neues Release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.9
+git push origin v0.2.9
 ```
 
 ## Sicherheitsmodell
 
 - `/mcp` akzeptiert OAuth-Bearer-Tokens (ChatGPT Connector Standard)
-- MCP API Keys bleiben als Legacy-Fallback für manuelle Integrationen verfügbar
+- OAuth und MCP API Keys werden nativ parallel unterstützt (ohne Fallback-Pfad)
 - API-Keys werden gehasht gespeichert
 - Runtime-Config (inkl. optionaler OAuth Client-Daten) liegt verschlüsselt in `/data/config.enc`
 - Pro-User Linkwarden API Keys liegen verschlüsselt in `/data/state.db`

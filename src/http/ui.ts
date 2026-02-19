@@ -5,7 +5,8 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { ConfigStore } from '../config/config-store.js';
 import { SqliteStore } from '../db/database.js';
-import type { SessionPrincipal, UserRole } from '../types/domain.js';
+import { getNewLinksRoutineStatus } from '../services/new-links-routine.js';
+import type { AuthenticatedPrincipal, SessionPrincipal, UserRole } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
 import { sanitizeForLog } from '../utils/logger.js';
 import {
@@ -69,6 +70,64 @@ const setOfflinePolicySchema = z
         message: 'archiveCollectionId is required when action=archive.'
       });
     }
+  });
+
+const setTaggingPolicySchema = z
+  .object({
+    fetchMode: z.enum(['never', 'optional', 'always']).optional(),
+    allowUserFetchModeOverride: z.boolean().optional(),
+    inferenceProvider: z.enum(['builtin', 'perplexity', 'mistral', 'huggingface']).optional(),
+    inferenceModel: z.string().trim().max(200).nullable().optional(),
+    blockedTagNames: z.array(z.string().trim().min(1).max(80)).max(400).optional(),
+    similarityThreshold: z.number().min(0).max(1).optional(),
+    fetchTimeoutMs: z.number().int().min(500).max(20000).optional(),
+    fetchMaxBytes: z.number().int().min(8192).max(1048576).optional()
+  })
+  .refine((payload) => Object.keys(payload).length > 0, {
+    message: 'At least one tagging policy field must be updated.'
+  });
+
+// This helper validates IANA timezone inputs for admin/user preference payloads.
+function isValidIanaTimeZone(value: string): boolean {
+  try {
+    Intl.DateTimeFormat('en-US', { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const setTaggingPreferencesSchema = z
+  .object({
+    taggingStrictness: z.enum(['very_strict', 'medium', 'relaxed']).optional(),
+    fetchMode: z.enum(['never', 'optional', 'always']).optional(),
+    queryTimeZone: z.string().trim().min(1).max(100).nullable().optional()
+  })
+  .superRefine((payload, ctx) => {
+    // This validation keeps timezone preference values strict and deterministic.
+    if (payload.queryTimeZone && !isValidIanaTimeZone(payload.queryTimeZone)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['queryTimeZone'],
+        message: 'queryTimeZone must be a valid IANA timezone.'
+      });
+    }
+  })
+  .refine((payload) => Object.keys(payload).length > 0, {
+    message: 'At least one tagging preference field must be updated.'
+  });
+
+const setNewLinksRoutineSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    intervalMinutes: z.number().int().min(1).max(1440).optional(),
+    modules: z.array(z.enum(['governed_tagging', 'normalize_urls', 'dedupe'])).min(1).max(3).optional(),
+    batchSize: z.number().int().min(1).max(1000).optional(),
+    requestBackfill: z.boolean().optional(),
+    confirmBackfill: z.boolean().optional()
+  })
+  .refine((payload) => Object.keys(payload).length > 0, {
+    message: 'At least one new-links routine field must be updated.'
   });
 
 const createApiKeySchema = z.object({
@@ -502,6 +561,54 @@ function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): st
   </div>
 
   <div class="card">
+    <h2>Admin: Governed Tagging Policy</h2>
+    <button onclick="loadTaggingPolicy()">Tagging-Policy laden</button>
+    <pre id="taggingPolicyResult">Noch nicht geladen</pre>
+    <label for="policyFetchMode">Globaler Fetch-Mode</label>
+    <select id="policyFetchMode">
+      <option value="never">never</option>
+      <option value="optional">optional</option>
+      <option value="always">always</option>
+    </select>
+    <label><input id="policyAllowUserFetchOverride" type="checkbox" /> User dürfen eigenen Fetch-Mode setzen</label>
+    <label for="policyInferenceProvider">AI Provider für Tag-Kontext</label>
+    <select id="policyInferenceProvider">
+      <option value="builtin">builtin (lokal, ohne externes LLM)</option>
+      <option value="perplexity">perplexity</option>
+      <option value="mistral">mistral</option>
+      <option value="huggingface">huggingface</option>
+    </select>
+    <label for="policyInferenceModel">AI Modell (optional; bei huggingface empfohlen/üblich erforderlich)</label>
+    <input id="policyInferenceModel" placeholder="z. B. sonar, mistral-small-latest, meta-llama/Llama-3.1-8B-Instruct" />
+    <label for="policyBlockedTags">Blockierte Tags (Komma-separiert)</label>
+    <input id="policyBlockedTags" placeholder="spam, tracking, misc" />
+    <label for="policySimilarityThreshold">Similarity Threshold (0-1)</label>
+    <input id="policySimilarityThreshold" type="number" min="0" max="1" step="0.01" value="0.88" />
+    <label for="policyFetchTimeoutMs">Fetch Timeout (ms)</label>
+    <input id="policyFetchTimeoutMs" type="number" min="500" max="20000" value="3000" />
+    <label for="policyFetchMaxBytes">Fetch Max Bytes</label>
+    <input id="policyFetchMaxBytes" type="number" min="8192" max="1048576" value="131072" />
+    <button onclick="setTaggingPolicy()">Tagging-Policy speichern</button>
+    <label for="taggingPreferenceUserSelect">Benutzer für Tagging-Preferences</label>
+    <select id="taggingPreferenceUserSelect"></select>
+    <label for="taggingStrictnessForUser">Strenge pro User</label>
+    <select id="taggingStrictnessForUser">
+      <option value="very_strict">very_strict</option>
+      <option value="medium">medium</option>
+      <option value="relaxed">relaxed</option>
+    </select>
+    <label for="fetchModeForUser">Fetch-Mode pro User</label>
+    <select id="fetchModeForUser">
+      <option value="never">never</option>
+      <option value="optional">optional</option>
+      <option value="always">always</option>
+    </select>
+    <label for="queryTimeZoneForUser">Query-Zeitzone pro User (IANA)</label>
+    <input id="queryTimeZoneForUser" placeholder="Europe/Berlin" />
+    <button onclick="setUserTaggingPreferences()">Tagging-Preferences pro User speichern</button>
+  </div>
+
+  <div class="card">
     <h2>Admin: MCP API Keys -> AI</h2>
     <button onclick="loadAdminKeys()">Alle MCP API Keys laden</button>
     <pre id="adminKeysResult">Noch nicht geladen</pre>
@@ -567,6 +674,44 @@ function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): st
   </div>
 
   <div class="card">
+    <h2>Mein Tagging</h2>
+    <button onclick="loadOwnTaggingPreferences()">Tagging-Einstellungen laden</button>
+    <pre id="ownTaggingPreferencesResult">Noch nicht geladen</pre>
+    <label for="selfTaggingStrictness">Tagging-Strenge</label>
+    <select id="selfTaggingStrictness">
+      <option value="very_strict">very_strict</option>
+      <option value="medium">medium</option>
+      <option value="relaxed">relaxed</option>
+    </select>
+    <label for="selfFetchMode">Fetch-Mode</label>
+    <select id="selfFetchMode">
+      <option value="never">never</option>
+      <option value="optional">optional</option>
+      <option value="always">always</option>
+    </select>
+    <label for="selfQueryTimeZone">Query-Zeitzone (IANA)</label>
+    <input id="selfQueryTimeZone" placeholder="Europe/Berlin" />
+    <button onclick="setOwnTaggingPreferences()">Meine Tagging-Einstellungen speichern</button>
+  </div>
+
+  <div class="card">
+    <h2>Meine New-Links-Routine</h2>
+    <button onclick="loadOwnNewLinksRoutine()">Routine-Status laden</button>
+    <pre id="ownNewLinksRoutineResult">Noch nicht geladen</pre>
+    <label><input id="selfRoutineEnabled" type="checkbox" /> Routine aktiviert</label>
+    <label for="selfRoutineInterval">Intervall (Minuten)</label>
+    <input id="selfRoutineInterval" type="number" min="1" max="1440" value="15" />
+    <label for="selfRoutineBatchSize">Batch-Größe</label>
+    <input id="selfRoutineBatchSize" type="number" min="1" max="1000" value="200" />
+    <label><input id="selfRoutineModuleTagging" type="checkbox" checked /> Modul: governed_tagging</label>
+    <label><input id="selfRoutineModuleNormalize" type="checkbox" checked /> Modul: normalize_urls</label>
+    <label><input id="selfRoutineModuleDedupe" type="checkbox" checked /> Modul: dedupe</label>
+    <label><input id="selfRoutineRequestBackfill" type="checkbox" /> Backfill für Altbestand anfordern</label>
+    <label><input id="selfRoutineConfirmBackfill" type="checkbox" /> Backfill ausdrücklich bestätigen</label>
+    <button onclick="setOwnNewLinksRoutine()">Routine-Einstellungen speichern</button>
+  </div>
+
+  <div class="card">
     <h2>Mein Linkwarden API Key -> MCP</h2>
     <p id="selfLinkwardenStatus">Status: unbekannt</p>
     <label for="selfLinkwardenToken">Linkwarden API Key</label>
@@ -617,9 +762,11 @@ function refreshAdminUserSelects() {
   updateUserSelect('toggleUserSelect');
   updateUserSelect('writeModeUserSelect');
   updateUserSelect('offlinePolicyUserSelect');
+  updateUserSelect('taggingPreferenceUserSelect');
   updateUserSelect('apiKeyUserSelect');
   updateUserSelect('linkwardenTokenUserSelect');
   syncOfflinePolicyFromSelectedUser();
+  syncTaggingPreferencesFromSelectedUser();
 }
 
 // This helper maps one selected user id back to cached user objects for policy prefilling.
@@ -649,6 +796,56 @@ function syncOfflinePolicyFromSelectedUser() {
   document.getElementById('offlineActionForUser').value = String(user.settings.offlineAction ?? 'archive');
   document.getElementById('offlineArchiveCollectionIdForUser').value =
     user.settings.offlineArchiveCollectionId != null ? String(user.settings.offlineArchiveCollectionId) : '';
+}
+
+// This helper prefills governed-tagging preference controls from currently selected user settings.
+function syncTaggingPreferencesFromSelectedUser() {
+  const user = getSelectedUser('taggingPreferenceUserSelect');
+  if (!user || !user.settings) {
+    return;
+  }
+
+  document.getElementById('taggingStrictnessForUser').value = String(user.settings.taggingStrictness ?? 'very_strict');
+  document.getElementById('fetchModeForUser').value = String(user.settings.fetchMode ?? 'optional');
+  document.getElementById('queryTimeZoneForUser').value = String(user.settings.queryTimeZone ?? '');
+}
+
+// This helper converts empty timezone inputs into null so the backend can clear per-user overrides deterministically.
+function readOptionalTimeZoneInput(inputId) {
+  const raw = document.getElementById(inputId).value.trim();
+  return raw.length > 0 ? raw : null;
+}
+
+// This helper converts empty text inputs into null for optional backend string fields.
+function readOptionalTextInput(inputId) {
+  const raw = document.getElementById(inputId).value.trim();
+  return raw.length > 0 ? raw : null;
+}
+
+// This helper reads module toggles and returns the deterministic module list used by the new-links routine API.
+function readRoutineModules() {
+  const modules = [];
+  if (document.getElementById('selfRoutineModuleTagging').checked) {
+    modules.push('governed_tagging');
+  }
+  if (document.getElementById('selfRoutineModuleNormalize').checked) {
+    modules.push('normalize_urls');
+  }
+  if (document.getElementById('selfRoutineModuleDedupe').checked) {
+    modules.push('dedupe');
+  }
+  return modules;
+}
+
+// This helper applies routine settings payload values to dashboard controls after API reads.
+function applyRoutineSettingsToForm(settings) {
+  document.getElementById('selfRoutineEnabled').checked = Boolean(settings?.enabled);
+  document.getElementById('selfRoutineInterval').value = String(settings?.intervalMinutes ?? 15);
+  document.getElementById('selfRoutineBatchSize').value = String(settings?.batchSize ?? 200);
+  const modules = new Set(Array.isArray(settings?.modules) ? settings.modules : []);
+  document.getElementById('selfRoutineModuleTagging').checked = modules.has('governed_tagging');
+  document.getElementById('selfRoutineModuleNormalize').checked = modules.has('normalize_urls');
+  document.getElementById('selfRoutineModuleDedupe').checked = modules.has('dedupe');
 }
 
 async function api(url, options = {}) {
@@ -681,6 +878,21 @@ async function loadMe() {
   document.getElementById('meResult').textContent = JSON.stringify(json, null, 2);
   if (res.ok) {
     document.getElementById('selfWriteMode').checked = Boolean(json?.me?.settings?.writeModeEnabled);
+    document.getElementById('selfTaggingStrictness').value = String(json?.me?.settings?.taggingStrictness ?? 'very_strict');
+    document.getElementById('selfFetchMode').value = String(json?.me?.settings?.fetchMode ?? 'optional');
+    document.getElementById('selfQueryTimeZone').value = String(json?.me?.settings?.queryTimeZone ?? '');
+    document.getElementById('ownTaggingPreferencesResult').textContent = JSON.stringify(
+      {
+        ok: true,
+        preferences: {
+          taggingStrictness: json?.me?.settings?.taggingStrictness ?? 'very_strict',
+          fetchMode: json?.me?.settings?.fetchMode ?? 'optional',
+          queryTimeZone: json?.me?.settings?.queryTimeZone ?? null
+        }
+      },
+      null,
+      2
+    );
     const status = json?.me?.linkwardenTokenConfigured ? 'Status: konfiguriert' : 'Status: fehlt';
     document.getElementById('selfLinkwardenStatus').textContent = status;
   }
@@ -692,6 +904,72 @@ async function setOwnWriteMode() {
     body: JSON.stringify({ writeModeEnabled: document.getElementById('selfWriteMode').checked })
   });
   await loadMe();
+}
+
+async function loadOwnTaggingPreferences() {
+  const res = await fetch('/admin/ui/user/tagging-preferences');
+  const json = await res.json();
+  document.getElementById('ownTaggingPreferencesResult').textContent = JSON.stringify(json, null, 2);
+  if (res.ok) {
+    document.getElementById('selfTaggingStrictness').value = String(json?.preferences?.taggingStrictness ?? 'very_strict');
+    document.getElementById('selfFetchMode').value = String(json?.preferences?.fetchMode ?? 'optional');
+    document.getElementById('selfQueryTimeZone').value = String(json?.preferences?.queryTimeZone ?? '');
+  }
+}
+
+async function setOwnTaggingPreferences() {
+  await api('/admin/ui/user/tagging-preferences', {
+    method: 'POST',
+    body: JSON.stringify({
+      taggingStrictness: document.getElementById('selfTaggingStrictness').value,
+      fetchMode: document.getElementById('selfFetchMode').value,
+      queryTimeZone: readOptionalTimeZoneInput('selfQueryTimeZone')
+    })
+  });
+  await loadOwnTaggingPreferences();
+}
+
+async function loadOwnNewLinksRoutine() {
+  const res = await fetch('/admin/ui/user/new-links-routine');
+  const json = await res.json();
+  document.getElementById('ownNewLinksRoutineResult').textContent = JSON.stringify(json, null, 2);
+  if (res.ok) {
+    applyRoutineSettingsToForm(json?.status?.settings ?? {});
+  }
+}
+
+async function setOwnNewLinksRoutine() {
+  const modules = readRoutineModules();
+  if (modules.length === 0) {
+    // This guard surfaces validation feedback in the shared action panel without throwing an uncaught browser error.
+    document.getElementById('actionResult').textContent = JSON.stringify(
+      {
+        ok: false,
+        error: {
+          message: 'Mindestens ein Routine-Modul muss aktiviert sein.'
+        }
+      },
+      null,
+      2
+    );
+    return;
+  }
+
+  await api('/admin/ui/user/new-links-routine', {
+    method: 'POST',
+    body: JSON.stringify({
+      enabled: document.getElementById('selfRoutineEnabled').checked,
+      intervalMinutes: Number(document.getElementById('selfRoutineInterval').value),
+      batchSize: Number(document.getElementById('selfRoutineBatchSize').value),
+      modules,
+      requestBackfill: document.getElementById('selfRoutineRequestBackfill').checked,
+      confirmBackfill: document.getElementById('selfRoutineConfirmBackfill').checked
+    })
+  });
+
+  document.getElementById('selfRoutineRequestBackfill').checked = false;
+  document.getElementById('selfRoutineConfirmBackfill').checked = false;
+  await loadOwnNewLinksRoutine();
 }
 
 async function setOwnLinkwardenToken() {
@@ -785,6 +1063,61 @@ async function setUserOfflinePolicy() {
   await loadUsers();
 }
 
+async function loadTaggingPolicy() {
+  const res = await fetch('/admin/ui/admin/tagging-policy');
+  const json = await res.json();
+  document.getElementById('taggingPolicyResult').textContent = JSON.stringify(json, null, 2);
+  if (res.ok) {
+    const policy = json?.policy ?? {};
+    document.getElementById('policyFetchMode').value = String(policy.fetchMode ?? 'optional');
+    document.getElementById('policyAllowUserFetchOverride').checked = Boolean(policy.allowUserFetchModeOverride);
+    document.getElementById('policyInferenceProvider').value = String(policy.inferenceProvider ?? 'builtin');
+    document.getElementById('policyInferenceModel').value = String(policy.inferenceModel ?? '');
+    document.getElementById('policyBlockedTags').value = Array.isArray(policy.blockedTagNames)
+      ? policy.blockedTagNames.join(', ')
+      : '';
+    document.getElementById('policySimilarityThreshold').value = String(policy.similarityThreshold ?? 0.88);
+    document.getElementById('policyFetchTimeoutMs').value = String(policy.fetchTimeoutMs ?? 3000);
+    document.getElementById('policyFetchMaxBytes').value = String(policy.fetchMaxBytes ?? 131072);
+  }
+}
+
+async function setTaggingPolicy() {
+  const blockedRaw = document.getElementById('policyBlockedTags').value.trim();
+  const blockedTagNames = blockedRaw.length === 0
+    ? []
+    : blockedRaw.split(',').map((item) => item.trim()).filter((item) => item.length > 0);
+
+  await api('/admin/ui/admin/tagging-policy', {
+    method: 'POST',
+    body: JSON.stringify({
+      fetchMode: document.getElementById('policyFetchMode').value,
+      allowUserFetchModeOverride: document.getElementById('policyAllowUserFetchOverride').checked,
+      inferenceProvider: document.getElementById('policyInferenceProvider').value,
+      inferenceModel: readOptionalTextInput('policyInferenceModel'),
+      blockedTagNames,
+      similarityThreshold: Number(document.getElementById('policySimilarityThreshold').value),
+      fetchTimeoutMs: Number(document.getElementById('policyFetchTimeoutMs').value),
+      fetchMaxBytes: Number(document.getElementById('policyFetchMaxBytes').value)
+    })
+  });
+  await loadTaggingPolicy();
+  await loadUsers();
+}
+
+async function setUserTaggingPreferences() {
+  const userId = Number(document.getElementById('taggingPreferenceUserSelect').value);
+  await api('/admin/ui/admin/users/' + encodeURIComponent(userId) + '/tagging-preferences', {
+    method: 'POST',
+    body: JSON.stringify({
+      taggingStrictness: document.getElementById('taggingStrictnessForUser').value,
+      fetchMode: document.getElementById('fetchModeForUser').value,
+      queryTimeZone: readOptionalTimeZoneInput('queryTimeZoneForUser')
+    })
+  });
+  await loadUsers();
+}
+
 async function loadAdminKeys() {
   const res = await fetch('/admin/ui/admin/api-keys');
   const json = await res.json();
@@ -844,17 +1177,36 @@ async function setUserLinkwardenToken() {
 }
 
 loadMe();
+loadOwnTaggingPreferences();
+loadOwnNewLinksRoutine();
 loadOwnKeys();
 if (isAdmin) {
   const offlinePolicySelect = document.getElementById('offlinePolicyUserSelect');
   if (offlinePolicySelect) {
     offlinePolicySelect.addEventListener('change', syncOfflinePolicyFromSelectedUser);
   }
+  const taggingPreferenceSelect = document.getElementById('taggingPreferenceUserSelect');
+  if (taggingPreferenceSelect) {
+    taggingPreferenceSelect.addEventListener('change', syncTaggingPreferencesFromSelectedUser);
+  }
+  loadTaggingPolicy();
   loadUsers();
 }
 </script>
 </body>
 </html>`;
+}
+
+// This helper adapts one browser session principal to the internal authenticated-principal shape used by MCP services.
+function toInternalPrincipal(principal: SessionPrincipal): AuthenticatedPrincipal {
+  return {
+    userId: principal.userId,
+    username: principal.username,
+    role: principal.role,
+    apiKeyId: `session-${principal.sessionId}`,
+    toolScopes: ['*'],
+    collectionScopes: []
+  };
 }
 
 // This helper returns view data for one authenticated user including per-user settings.
@@ -1230,6 +1582,87 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
+  fastify.get('/admin/ui/admin/users/:userId/tagging-preferences', async (request, reply) => {
+    const principal = requireSession(request, db);
+    requireAdminSession(principal);
+
+    const params = userIdParamSchema.safeParse(request.params);
+    if (!params.success) {
+      logUiWarn(request, 'ui_admin_get_user_tagging_preferences_validation_failed', {
+        params: params.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid user identifier.', params.error.flatten());
+    }
+
+    const policy = db.getGlobalTaggingPolicy();
+    const settings = db.getUserSettings(params.data.userId);
+    const effectiveFetchMode = policy.allowUserFetchModeOverride ? settings.fetchMode : policy.fetchMode;
+    const effectiveInferenceProvider = policy.inferenceProvider;
+    const effectiveInferenceModel = policy.inferenceModel;
+
+    reply.send({
+      ok: true,
+      userId: params.data.userId,
+      preferences: {
+        taggingStrictness: settings.taggingStrictness,
+        fetchMode: settings.fetchMode,
+        queryTimeZone: settings.queryTimeZone,
+        effectiveFetchMode,
+        effectiveInferenceProvider,
+        effectiveInferenceModel
+      },
+      policy: {
+        allowUserFetchModeOverride: policy.allowUserFetchModeOverride,
+        inferenceProvider: policy.inferenceProvider,
+        inferenceModel: policy.inferenceModel
+      }
+    });
+  });
+
+  fastify.post('/admin/ui/admin/users/:userId/tagging-preferences', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+    requireAdminSession(principal);
+
+    const params = userIdParamSchema.safeParse(request.params);
+    const body = setTaggingPreferencesSchema.safeParse(request.body);
+    if (!params.success || !body.success) {
+      logUiWarn(request, 'ui_admin_set_user_tagging_preferences_validation_failed', {
+        params: params.success ? undefined : params.error.flatten(),
+        body: body.success ? undefined : body.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid tagging preferences payload.', {
+        params: params.success ? undefined : params.error.flatten(),
+        body: body.success ? undefined : body.error.flatten()
+      });
+    }
+
+    db.setUserTaggingPreferences(params.data.userId, {
+      taggingStrictness: body.data.taggingStrictness,
+      fetchMode: body.data.fetchMode,
+      queryTimeZone: body.data.queryTimeZone
+    });
+
+    const policy = db.getGlobalTaggingPolicy();
+    const settings = db.getUserSettings(params.data.userId);
+    const effectiveFetchMode = policy.allowUserFetchModeOverride ? settings.fetchMode : policy.fetchMode;
+    const effectiveInferenceProvider = policy.inferenceProvider;
+    const effectiveInferenceModel = policy.inferenceModel;
+
+    reply.send({
+      ok: true,
+      userId: params.data.userId,
+      preferences: {
+        taggingStrictness: settings.taggingStrictness,
+        fetchMode: settings.fetchMode,
+        queryTimeZone: settings.queryTimeZone,
+        effectiveFetchMode,
+        effectiveInferenceProvider,
+        effectiveInferenceModel
+      }
+    });
+  });
+
   fastify.post('/admin/ui/admin/users/:userId/linkwarden-token', async (request, reply) => {
     requireCsrf(request);
     const principal = requireSession(request, db);
@@ -1385,6 +1818,74 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     });
   });
 
+  fastify.get('/admin/ui/admin/tagging-policy', async (request, reply) => {
+    const principal = requireSession(request, db);
+    requireAdminSession(principal);
+
+    reply.send({
+      ok: true,
+      policy: db.getGlobalTaggingPolicy()
+    });
+  });
+
+  fastify.post('/admin/ui/admin/tagging-policy', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+    requireAdminSession(principal);
+
+    const parsed = setTaggingPolicySchema.safeParse(request.body);
+    if (!parsed.success) {
+      logUiWarn(request, 'ui_admin_set_tagging_policy_validation_failed', {
+        details: parsed.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid tagging-policy payload.', parsed.error.flatten());
+    }
+
+    const current = db.getGlobalTaggingPolicy();
+    const next = {
+      ...current,
+      ...parsed.data,
+      inferenceModel:
+        parsed.data.inferenceModel === undefined
+          ? current.inferenceModel
+          : parsed.data.inferenceModel === null
+            ? null
+            : parsed.data.inferenceModel.trim() || null,
+      blockedTagNames:
+        parsed.data.blockedTagNames?.map((name) => name.trim().toLocaleLowerCase()).filter((name) => name.length > 0) ??
+        current.blockedTagNames
+    };
+    // This guard requires an explicit model id when Hugging Face router mode is enabled.
+    if (next.inferenceProvider === 'huggingface' && !next.inferenceModel) {
+      throw new AppError(
+        400,
+        'validation_error',
+        'inferenceModel is required when inferenceProvider=huggingface.'
+      );
+    }
+    db.setGlobalTaggingPolicy(next);
+
+    let resetCount = 0;
+    if (!next.allowUserFetchModeOverride) {
+      resetCount = db.resetAllUserFetchModes(next.fetchMode);
+    }
+
+    logUiInfo(request, 'ui_admin_set_tagging_policy_success', {
+      actorUserId: principal.userId,
+      allowUserFetchModeOverride: next.allowUserFetchModeOverride,
+      fetchMode: next.fetchMode,
+      inferenceProvider: next.inferenceProvider,
+      inferenceModel: next.inferenceModel,
+      resetCount
+    });
+
+    reply.send({
+      ok: true,
+      policy: next,
+      resetCount
+    });
+  });
+
   fastify.get('/admin/ui/user/me', async (request, reply) => {
     const principal = requireSession(request, db);
     logUiDebug(request, 'ui_user_me', {
@@ -1421,6 +1922,151 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       ok: true,
       userId: principal.userId,
       writeModeEnabled: parsed.data.writeModeEnabled
+    });
+  });
+
+  fastify.get('/admin/ui/user/tagging-preferences', async (request, reply) => {
+    const principal = requireSession(request, db);
+    const policy = db.getGlobalTaggingPolicy();
+    const settings = db.getUserSettings(principal.userId);
+    const effectiveFetchMode = policy.allowUserFetchModeOverride ? settings.fetchMode : policy.fetchMode;
+    const effectiveInferenceProvider = policy.inferenceProvider;
+    const effectiveInferenceModel = policy.inferenceModel;
+
+    reply.send({
+      ok: true,
+      preferences: {
+        taggingStrictness: settings.taggingStrictness,
+        fetchMode: settings.fetchMode,
+        queryTimeZone: settings.queryTimeZone,
+        effectiveFetchMode,
+        effectiveInferenceProvider,
+        effectiveInferenceModel
+      },
+      policy: {
+        allowUserFetchModeOverride: policy.allowUserFetchModeOverride,
+        inferenceProvider: policy.inferenceProvider,
+        inferenceModel: policy.inferenceModel
+      }
+    });
+  });
+
+  fastify.post('/admin/ui/user/tagging-preferences', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+
+    const parsed = setTaggingPreferencesSchema.safeParse(request.body);
+    if (!parsed.success) {
+      logUiWarn(request, 'ui_user_set_tagging_preferences_validation_failed', {
+        details: parsed.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid tagging-preferences payload.', parsed.error.flatten());
+    }
+
+    const policy = db.getGlobalTaggingPolicy();
+    if (!policy.allowUserFetchModeOverride && parsed.data.fetchMode !== undefined) {
+      throw new AppError(
+        403,
+        'forbidden',
+        'User fetch-mode override is disabled by admin policy.'
+      );
+    }
+
+    db.setUserTaggingPreferences(principal.userId, {
+      taggingStrictness: parsed.data.taggingStrictness,
+      fetchMode: parsed.data.fetchMode,
+      queryTimeZone: parsed.data.queryTimeZone
+    });
+
+    const settings = db.getUserSettings(principal.userId);
+    const effectiveFetchMode = policy.allowUserFetchModeOverride ? settings.fetchMode : policy.fetchMode;
+    const effectiveInferenceProvider = policy.inferenceProvider;
+    const effectiveInferenceModel = policy.inferenceModel;
+
+    reply.send({
+      ok: true,
+      preferences: {
+        taggingStrictness: settings.taggingStrictness,
+        fetchMode: settings.fetchMode,
+        queryTimeZone: settings.queryTimeZone,
+        effectiveFetchMode,
+        effectiveInferenceProvider,
+        effectiveInferenceModel
+      }
+    });
+  });
+
+  fastify.get('/admin/ui/user/new-links-routine', async (request, reply) => {
+    const principal = requireSession(request, db);
+    const status = await getNewLinksRoutineStatus(
+      {
+        actor: `${principal.username}#${principal.sessionId}`,
+        principal: toInternalPrincipal(principal),
+        configStore,
+        db,
+        logger: request.log
+      },
+      {
+        includeBacklogEstimate: true
+      }
+    );
+
+    logUiInfo(request, 'ui_user_get_new_links_routine', {
+      userId: principal.userId,
+      enabled: status.settings.enabled,
+      due: status.due
+    });
+
+    reply.send({
+      ok: true,
+      status
+    });
+  });
+
+  fastify.post('/admin/ui/user/new-links-routine', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+
+    const parsed = setNewLinksRoutineSchema.safeParse(request.body);
+    if (!parsed.success) {
+      logUiWarn(request, 'ui_user_set_new_links_routine_validation_failed', {
+        details: parsed.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid new-links routine payload.', parsed.error.flatten());
+    }
+
+    const settings = db.setUserNewLinksRoutineSettings(principal.userId, {
+      enabled: parsed.data.enabled,
+      intervalMinutes: parsed.data.intervalMinutes,
+      modules: parsed.data.modules,
+      batchSize: parsed.data.batchSize,
+      requestBackfill: parsed.data.requestBackfill,
+      confirmBackfill: parsed.data.confirmBackfill
+    });
+    const status = await getNewLinksRoutineStatus(
+      {
+        actor: `${principal.username}#${principal.sessionId}`,
+        principal: toInternalPrincipal(principal),
+        configStore,
+        db,
+        logger: request.log
+      },
+      {
+        includeBacklogEstimate: true
+      }
+    );
+
+    logUiInfo(request, 'ui_user_set_new_links_routine_success', {
+      userId: principal.userId,
+      enabled: settings.enabled,
+      intervalMinutes: settings.intervalMinutes,
+      modules: settings.modules
+    });
+
+    reply.send({
+      ok: true,
+      settings,
+      status
     });
   });
 

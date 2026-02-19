@@ -1,52 +1,68 @@
-// This module implements all MCP tool handlers with validation, safety guards, and audit logging.
+// This module implements the alpha MCP tool surface with deterministic selectors, compact envelopes, and native-only behavior.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { FastifyBaseLogger } from 'fastify';
 import { z } from 'zod';
 import { ConfigStore } from '../config/config-store.js';
 import { SqliteStore } from '../db/database.js';
 import { LinkwardenClient } from '../linkwarden/client.js';
 import { createUserLinkwardenClient } from '../linkwarden/runtime.js';
-import { computeReorgPlan } from '../planning/reorg.js';
+import {
+  getNewLinksRoutineStatus,
+  runNewLinksRoutineNow
+} from '../services/new-links-routine.js';
 import type {
   AuthenticatedPrincipal,
-  BulkUpdateRequest,
+  FetchMode,
+  GlobalTaggingPolicy,
   LinkCollection,
-  LinkHealthState,
   LinkItem,
+  LinkSelector,
   LinkTag,
-  MaintenanceRunItem,
-  PlanItem,
-  PlanScope
+  TagAliasRecord,
+  TaggingStrictness,
+  OperationItemRecord,
+  RuleRecord
 } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
-import { errorForLog, sanitizeForLog } from '../utils/logger.js';
 import { cleanTrackedUrl } from '../utils/url-cleaner.js';
+import { fetchLinkContext } from '../utils/link-context-fetch.js';
+import { inferTagTokensViaProvider } from '../utils/tag-inference-provider.js';
+import { compileCreatedWindow } from '../utils/created-window.js';
+import { errorForLog, sanitizeForLog } from '../utils/logger.js';
 import {
+  aggregateLinksSchema,
+  applyRuleSchema,
   assignTagsSchema,
-  bulkUpdateSchema,
-  captureChatLinksSchema,
-  cleanLinkUrlsSchema,
   createCollectionSchema,
+  createRuleSchema,
+  createSavedQuerySchema,
   createTagSchema,
   deleteCollectionSchema,
+  deleteLinksSchema,
+  deleteRuleSchema,
   deleteTagSchema,
-  applyPlanSchema,
-  connectorFetchSchema,
-  connectorSearchSchema,
+  findDuplicatesSchema,
+  getAuditSchema,
   getLinkSchema,
+  getNewLinksRoutineStatusSchema,
+  getStatsSchema,
+  governedTagLinksSchema,
   listCollectionsSchema,
+  listRulesSchema,
+  listSavedQueriesSchema,
   listTagsSchema,
-  monitorOfflineLinksSchema,
-  planReorgSchema,
-  runDailyMaintenanceSchema,
+  mergeDuplicatesSchema,
+  mutateLinksSchema,
+  normalizeUrlsSchema,
+  queryLinksSchema,
+  runRulesNowSchema,
+  runNewLinksRoutineNowSchema,
+  runSavedQuerySchema,
   serverInfoSchema,
-  setLinksCollectionSchema,
-  setLinksPinnedSchema,
-  searchLinksSchema,
-  suggestTaxonomySchema,
-  updateCollectionSchema,
-  updateLinkSchema
+  testRuleSchema,
+  undoOperationSchema,
+  updateCollectionSchema
 } from './tool-schemas.js';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION, formatProtocolVersionWithTimestamp } from '../version.js';
 
@@ -58,13 +74,62 @@ export interface ToolRuntimeContext {
   logger: FastifyBaseLogger;
 }
 
-// This type captures the normalized MCP tool output format returned to the connector.
+// This type captures the normalized MCP tool output format returned to connectors.
 export interface ToolCallResult {
   content: Array<{ type: 'text'; text: string }>;
   structuredContent: Record<string, unknown>;
 }
 
-// This helper wraps structured objects in both text and structured fields for connector compatibility.
+interface ResolvedScope {
+  links: LinkItem[];
+  selectedCollectionIds: number[];
+  warnings: string[];
+}
+
+interface QuerySlice {
+  items: Array<Record<string, unknown>>;
+  paging: {
+    limit: number;
+    returned: number;
+    total: number;
+    hasMore: boolean;
+    nextCursor: string | null;
+  };
+}
+
+interface CanonicalDuplicateGroup {
+  canonicalUrl: string;
+  links: LinkItem[];
+}
+
+// This type carries resolved ids and user-facing warnings for name-based selector filters.
+interface ResolvedNameFilters {
+  ids: number[];
+  warnings: string[];
+}
+
+// This type captures resolved selector state so local filtering can run deterministically.
+interface SelectorFilterRuntime {
+  collectionScopeSet: Set<number> | null;
+  tagIdsAny: number[] | null;
+  tagIdsAll: number[] | null;
+  createdWindow: {
+    fromMs?: number;
+    toMs?: number;
+  } | null;
+}
+
+// This type captures fuzzy matching outcomes including explicit ambiguity handling.
+type FuzzyNameMatchResult =
+  | { kind: 'matched'; candidate: { id: number; name: string }; score: number }
+  | { kind: 'ambiguous'; bestScore: number; secondScore: number }
+  | { kind: 'none' };
+
+// These constants bound fuzzy selector name resolution to high-confidence, low-ambiguity matches.
+const FUZZY_NAME_MATCH_THRESHOLD = 0.88;
+const FUZZY_NAME_MIN_GAP = 0.05;
+
+// This helper wraps structured payloads in text plus structured fields for MCP connector compatibility.
 function mcpResult(payload: Record<string, unknown>): ToolCallResult {
   return {
     content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
@@ -72,2123 +137,3227 @@ function mcpResult(payload: Record<string, unknown>): ToolCallResult {
   };
 }
 
-// This helper removes duplicate tag ids and keeps deterministic order.
-function normalizeTagIds(tagIds: number[]): number[] {
-  return [...new Set(tagIds)].sort((a, b) => a - b);
-}
-
-// This helper normalizes tag names for deterministic comparisons across case and whitespace variations.
-function normalizeTagName(name: string): string {
-  return name.trim().toLocaleLowerCase();
-}
-
-// This helper de-duplicates tag names by normalized representation while preserving first-seen order.
-function dedupeTagNames(tagNames: string[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-
-  for (const rawName of tagNames) {
-    const trimmed = rawName.trim();
-    const normalized = normalizeTagName(trimmed);
-    if (trimmed.length === 0 || seen.has(normalized)) {
-      continue;
-    }
-    seen.add(normalized);
-    result.push(trimmed);
+// This helper wraps successful payloads with the standardized alpha result envelope.
+function ok(
+  data: Record<string, unknown>,
+  extras?: {
+    summary?: Record<string, unknown>;
+    paging?: Record<string, unknown>;
+    warnings?: string[];
+    failures?: Array<Record<string, unknown>>;
   }
-
-  return result;
+): ToolCallResult {
+  return mcpResult(normalizeEnvelope({
+    ok: true,
+    data,
+    summary: extras?.summary ?? {},
+    paging: extras?.paging ?? null,
+    warnings: extras?.warnings ?? [],
+    failures: extras?.failures ?? [],
+    error: null
+  }));
 }
 
-// This helper resolves tag ids back to human-readable names for deterministic dry-run previews.
-function mapTagIdsToNames(tagIds: number[], tagById: Map<number, string>): string[] {
-  return tagIds.map((tagId) => tagById.get(tagId) ?? `tag:${tagId}`);
-}
+// This helper guarantees one complete response envelope shape for all tools and cached idempotent payloads.
+function normalizeEnvelope(payload: Record<string, unknown>): Record<string, unknown> {
+  const safeData =
+    payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
+      ? (payload.data as Record<string, unknown>)
+      : {};
+  const safeSummary =
+    payload.summary && typeof payload.summary === 'object' && !Array.isArray(payload.summary)
+      ? (payload.summary as Record<string, unknown>)
+      : {};
+  const safeFailures = Array.isArray(payload.failures)
+    ? (payload.failures as Array<Record<string, unknown>>)
+    : [];
+  const safeWarnings = Array.isArray(payload.warnings) ? (payload.warnings as string[]) : [];
+  const safePaging =
+    payload.paging && typeof payload.paging === 'object' && !Array.isArray(payload.paging)
+      ? (payload.paging as Record<string, unknown>)
+      : null;
 
-// This helper enforces role and write-mode policy before mutating operations.
-function assertWriteAccess(context: ToolRuntimeContext): void {
-  if (context.principal.role !== 'admin' && context.principal.role !== 'user') {
-    context.logger.warn(
-      {
-        event: 'tool_write_access_denied_role',
-        userId: context.principal.userId,
-        username: context.principal.username,
-        role: context.principal.role
-      },
-      'tool_write_access_denied_role'
-    );
-    throw new AppError(403, 'forbidden', 'Role is not allowed to execute write operations.');
-  }
-
-  const settings = context.db.getUserSettings(context.principal.userId);
-  if (!settings.writeModeEnabled) {
-    context.logger.warn(
-      {
-        event: 'tool_write_access_denied_write_mode_disabled',
-        userId: context.principal.userId,
-        username: context.principal.username
-      },
-      'tool_write_access_denied_write_mode_disabled'
-    );
-    throw new AppError(
-      403,
-      'write_mode_disabled',
-      'Write mode is disabled for this user. Enable it in the web UI first.'
-    );
-  }
-}
-
-// This helper adds actor metadata that must always be present in write audit records.
-function withActorDetails(
-  context: ToolRuntimeContext,
-  details?: Record<string, unknown>
-): Record<string, unknown> {
   return {
-    userId: context.principal.userId,
-    username: context.principal.username,
-    role: context.principal.role,
-    apiKeyId: context.principal.apiKeyId,
-    ...(details ?? {})
+    ok: typeof payload.ok === 'boolean' ? payload.ok : true,
+    data: safeData,
+    summary: safeSummary,
+    paging: safePaging,
+    warnings: safeWarnings,
+    error: (payload.error as Record<string, unknown> | null | undefined) ?? null,
+    failures: safeFailures
   };
 }
 
-// This helper extracts integer arrays from plan item snapshots used during apply.
-function readAfterState(item: PlanItem): { tagIds?: number[]; collectionId?: number | null } {
-  const after = item.after as { tagIds?: unknown; collectionId?: unknown };
-  const tagIds = Array.isArray(after.tagIds)
-    ? normalizeTagIds(after.tagIds.filter((id): id is number => Number.isFinite(id as number)))
-    : undefined;
-
-  const collectionId =
-    after.collectionId === null || Number.isFinite(after.collectionId as number)
-      ? (after.collectionId as number | null)
-      : undefined;
-
-  return { tagIds, collectionId };
+// This helper normalizes tag names for deterministic matching across case and spacing variants.
+function normalizeTagName(value: string): string {
+  return value.trim().toLocaleLowerCase();
 }
 
-// This helper computes next tag ids for add/remove/replace bulk modes.
-function computeBulkTagResult(current: number[], updates: number[] | undefined, mode: BulkUpdateRequest['mode']): number[] {
-  if (!updates || updates.length === 0) {
-    return normalizeTagIds(current);
-  }
+// This helper keeps tag id lists deterministic and duplicate-free for stable write payloads.
+function normalizeTagIds(ids: number[]): number[] {
+  return [...new Set(ids.filter((value) => Number.isInteger(value) && value > 0))].sort((a, b) => a - b);
+}
 
-  if (mode === 'replace') {
-    return normalizeTagIds(updates);
-  }
+// This helper computes one deterministic hash for idempotency request matching.
+function stableHash(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
 
-  const currentSet = new Set(current);
-  if (mode === 'add') {
-    for (const tagId of updates) {
-      currentSet.add(tagId);
+// This helper creates one cursor token for deterministic query pagination resume.
+function encodeCursor(snapshotId: string, offset: number): string {
+  return Buffer.from(JSON.stringify({ snapshotId, offset }), 'utf8').toString('base64url');
+}
+
+// This helper decodes one cursor token and validates its structural integrity.
+function decodeCursor(cursor: string): { snapshotId: string; offset: number } {
+  try {
+    const raw = Buffer.from(cursor, 'base64url').toString('utf8');
+    const parsed = JSON.parse(raw) as { snapshotId?: string; offset?: number };
+    const offset = parsed.offset;
+    if (!parsed.snapshotId || typeof offset !== 'number' || !Number.isInteger(offset) || offset < 0) {
+      throw new Error('invalid cursor shape');
     }
-    return normalizeTagIds([...currentSet]);
+    return {
+      snapshotId: parsed.snapshotId,
+      offset
+    };
+  } catch {
+    throw new AppError(400, 'validation_error', 'Invalid cursor format.');
   }
-
-  for (const tagId of updates) {
-    currentSet.delete(tagId);
-  }
-
-  return normalizeTagIds([...currentSet]);
 }
 
-// This helper creates a Linkwarden client from currently unlocked runtime secrets.
+// This helper converts one arbitrary string into an URL-normalized canonical form for duplicate detection.
+function canonicalizeUrl(url: string): string {
+  try {
+    const cleaned = cleanTrackedUrl(url, {
+      removeUtm: true,
+      removeKnownTracking: true,
+      keepParams: [],
+      extraTrackingParams: []
+    });
+    const parsed = new URL(cleaned.cleanedUrl);
+    if ((parsed.protocol === 'http:' && parsed.port === '80') || (parsed.protocol === 'https:' && parsed.port === '443')) {
+      parsed.port = '';
+    }
+    parsed.hash = '';
+    if (parsed.pathname !== '/' && parsed.pathname.endsWith('/')) {
+      parsed.pathname = parsed.pathname.slice(0, -1);
+    }
+    return parsed.toString();
+  } catch {
+    return url.trim();
+  }
+}
+
+// This helper extracts one lowercase domain candidate from a link URL for classification and aggregation.
+function extractDomain(url: string): string {
+  try {
+    return new URL(url).hostname.toLocaleLowerCase();
+  } catch {
+    return 'invalid-url';
+  }
+}
+
+// This helper checks whether the principal can execute one specific tool based on configured tool scopes.
+function assertToolScopeAccess(context: ToolRuntimeContext, toolName: string): void {
+  const toolScopes = context.principal.toolScopes ?? ['*'];
+  if (toolScopes.includes('*')) {
+    return;
+  }
+  if (!toolScopes.includes(toolName)) {
+    throw new AppError(403, 'forbidden', `Tool ${toolName} is not allowed by token scope.`);
+  }
+}
+
+// This helper checks write-mode state and role before mutating Linkwarden data.
+function assertWriteAccess(context: ToolRuntimeContext): void {
+  if (context.principal.role !== 'admin' && context.principal.role !== 'user') {
+    throw new AppError(403, 'forbidden', 'Role is not allowed to execute write operations.');
+  }
+  const settings = context.db.getUserSettings(context.principal.userId);
+  if (!settings.writeModeEnabled) {
+    throw new AppError(403, 'write_mode_disabled', 'Write mode is disabled for this user.');
+  }
+}
+
+// This helper enforces optional collection scope restrictions on explicit collection targets.
+function assertCollectionScopeAccess(context: ToolRuntimeContext, collectionId: number | null | undefined): void {
+  if (collectionId === null || collectionId === undefined) {
+    return;
+  }
+  const scoped = context.principal.collectionScopes ?? [];
+  if (scoped.length === 0) {
+    return;
+  }
+  if (!scoped.includes(collectionId)) {
+    throw new AppError(403, 'forbidden', `Collection ${collectionId} is outside token scope.`);
+  }
+}
+
+// This helper returns one user-bound Linkwarden API client instance from runtime secrets.
 function getClient(context: ToolRuntimeContext): LinkwardenClient {
   return createUserLinkwardenClient(context.configStore, context.db, context.principal.userId, context.logger);
 }
 
-// This helper returns compact result metadata to keep tool completion logs concise.
-function summarizeToolOutput(output: ToolCallResult): Record<string, unknown> {
-  const payload = output.structuredContent;
+// This helper keeps link projection deterministic and token-efficient based on requested fields and verbosity mode.
+function projectLink(
+  link: LinkItem,
+  requestedFields: string[],
+  verbosity: 'minimal' | 'normal' | 'debug'
+): Record<string, unknown> {
+  const minimalProjection: Record<string, unknown> = {
+    id: link.id,
+    title: link.title,
+    url: link.url,
+    collectionId: link.collection?.id ?? null,
+    tagIds: link.tags.map((tag) => tag.id),
+    pinned: Boolean(link.pinned),
+    archived: Boolean(link.archived),
+    updatedAt: link.updatedAt ?? null
+  };
 
-  if ('paging' in payload) {
-    return sanitizeForLog({
-      paging: payload.paging
-    }) as Record<string, unknown>;
+  const normalProjection: Record<string, unknown> = {
+    ...minimalProjection,
+    description: link.description ?? null,
+    tags: link.tags,
+    collection: link.collection ?? null,
+    createdAt: link.createdAt ?? null
+  };
+
+  const debugProjection: Record<string, unknown> = {
+    ...normalProjection,
+    domain: extractDomain(link.url)
+  };
+
+  const base = verbosity === 'minimal' ? minimalProjection : verbosity === 'normal' ? normalProjection : debugProjection;
+  if (requestedFields.length === 0) {
+    return base;
   }
 
-  if ('plan_id' in payload || 'applied' in payload) {
-    return sanitizeForLog({
-      plan_id: payload.plan_id,
-      applied: payload.applied,
-      failures: Array.isArray(payload.failures) ? payload.failures.length : undefined,
-      warnings: Array.isArray(payload.warnings) ? payload.warnings.length : undefined
-    }) as Record<string, unknown>;
+  const projected: Record<string, unknown> = {};
+  for (const field of requestedFields) {
+    if (Object.prototype.hasOwnProperty.call(base, field)) {
+      projected[field] = base[field];
+    }
   }
 
-  return sanitizeForLog({
-    keys: Object.keys(payload)
-  }) as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(projected, 'id')) {
+    projected.id = link.id;
+  }
+  return projected;
 }
 
-// This helper normalizes URLs for stable deduping independent of trailing slashes.
-function normalizeUrl(input: string): string {
-  try {
-    const url = new URL(input.trim());
-    if ((url.protocol === 'http:' && url.port === '80') || (url.protocol === 'https:' && url.port === '443')) {
-      url.port = '';
-    }
-    if (url.pathname !== '/' && url.pathname.endsWith('/')) {
-      url.pathname = url.pathname.slice(0, -1);
-    }
-    url.hash = '';
-    return url.toString();
-  } catch {
-    return input.trim();
+// This helper resolves selector collections with optional descendant expansion for deterministic subtree targeting.
+function resolveCollectionScope(collections: LinkCollection[], collectionId: number, includeDescendants: boolean): Set<number> {
+  const selected = new Set<number>([collectionId]);
+  if (!includeDescendants) {
+    return selected;
   }
-}
 
-// This helper extracts unique HTTP(S) URLs from free-form chat text while preserving input order.
-function extractUrlsFromText(text: string, maxLinks: number): string[] {
-  const matches = text.match(/https?:\/\/[^\s<>"'`]+/gi) ?? [];
-  const cleaned = matches
-    .map((raw) => raw.replace(/[),.;!?]+$/g, ''))
-    .filter((value) => value.length > 0);
-  const seen = new Set<string>();
-  const result: string[] = [];
-
-  for (const url of cleaned) {
-    const key = normalizeUrl(url);
-    if (seen.has(key)) {
+  const byParent = new Map<number, number[]>();
+  for (const collection of collections) {
+    if (typeof collection.parentId !== 'number') {
       continue;
     }
-    seen.add(key);
-    result.push(url);
-    if (result.length >= maxLinks) {
-      break;
-    }
+    const children = byParent.get(collection.parentId) ?? [];
+    children.push(collection.id);
+    byParent.set(collection.parentId, children);
   }
 
-  return result;
-}
-
-// This helper resolves one direct child collection by name and parent relation.
-function findCollectionByNameAndParent(
-  collections: LinkCollection[],
-  name: string,
-  parentId: number | null
-): LinkCollection | undefined {
-  return collections.find((collection) => collection.name === name && (collection.parentId ?? null) === parentId);
-}
-
-// This helper ensures one parent->child collection path exists and creates missing segments on demand.
-async function ensureCollectionPath(
-  client: LinkwardenClient,
-  parentName: string,
-  childName: string
-): Promise<{ parent: LinkCollection; child: LinkCollection; created: LinkCollection[] }> {
-  const created: LinkCollection[] = [];
-  const collections = await client.listAllCollections();
-
-  let parent = findCollectionByNameAndParent(collections, parentName, null);
-  if (!parent) {
-    parent = await client.createCollection({ name: parentName, parentId: null });
-    created.push(parent);
-    collections.push(parent);
-  }
-
-  let child = findCollectionByNameAndParent(collections, childName, parent.id);
-  if (!child) {
-    child = await client.createCollection({ name: childName, parentId: parent.id });
-    created.push(child);
-  }
-
-  return { parent, child, created };
-}
-
-interface LinkAvailabilityResult {
-  ok: boolean;
-  httpStatus: number | null;
-  error: string | null;
-}
-
-// This helper classifies statuses that still indicate a reachable destination for link-health monitoring.
-function isHealthyAvailabilityStatus(status: number): boolean {
-  if (status === 404 || status === 410) {
-    return false;
-  }
-
-  // This keeps protected URLs (for example login-protected pages) from being treated as offline.
-  if (status === 401 || status === 403) {
-    return true;
-  }
-
-  return status >= 200 && status < 400;
-}
-
-// This helper checks whether one URL is reachable enough for archival decisions.
-async function checkLinkAvailability(url: string, timeoutMs: number): Promise<LinkAvailabilityResult> {
-  const probe = async (method: 'HEAD' | 'GET'): Promise<Response> => {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      return await fetch(url, {
-        method,
-        redirect: 'follow',
-        signal: controller.signal
-      });
-    } finally {
-      clearTimeout(timeout);
-    }
-  };
-
-  try {
-    const headResponse = await probe('HEAD');
-    if (isHealthyAvailabilityStatus(headResponse.status)) {
-      return { ok: true, httpStatus: headResponse.status, error: null };
-    }
-    return { ok: false, httpStatus: headResponse.status, error: `http_${headResponse.status}` };
-  } catch (headError) {
-    try {
-      const getResponse = await probe('GET');
-      if (isHealthyAvailabilityStatus(getResponse.status)) {
-        return { ok: true, httpStatus: getResponse.status, error: null };
+  const queue = [collectionId];
+  while (queue.length > 0) {
+    const current = queue.shift() as number;
+    const children = byParent.get(current) ?? [];
+    for (const childId of children) {
+      if (selected.has(childId)) {
+        continue;
       }
-      return { ok: false, httpStatus: getResponse.status, error: `http_${getResponse.status}` };
-    } catch (getError) {
-      const reason = getError instanceof Error ? getError.message : String(getError);
-      const fallback = headError instanceof Error ? headError.message : reason;
-      return { ok: false, httpStatus: null, error: reason || fallback || 'unreachable' };
+      selected.add(childId);
+      queue.push(childId);
     }
   }
+  return selected;
 }
 
-// This helper computes the next persisted health-state snapshot from the latest probe result.
-function computeNextHealthState(
-  userId: number,
-  link: LinkItem,
-  previous: LinkHealthState | undefined,
-  probe: LinkAvailabilityResult,
-  checkedAtIso: string
-): LinkHealthState {
-  if (probe.ok) {
+// This helper computes one deterministic fuzzy match candidate and rejects ambiguous score ties.
+function pickFuzzyMatch(
+  requestedName: string,
+  candidates: Array<{ id: number; name: string }>
+): FuzzyNameMatchResult {
+  const scored = candidates
+    .map((candidate) => ({
+      candidate,
+      score: diceSimilarity(requestedName, candidate.name)
+    }))
+    .sort((left, right) => right.score - left.score || left.candidate.id - right.candidate.id);
+
+  const best = scored[0];
+  if (!best || best.score < FUZZY_NAME_MATCH_THRESHOLD) {
+    return { kind: 'none' };
+  }
+
+  const second = scored[1];
+  if (second && best.score - second.score < FUZZY_NAME_MIN_GAP) {
     return {
-      userId,
-      linkId: link.id,
-      url: link.url,
-      firstFailureAt: null,
-      lastFailureAt: null,
-      consecutiveFailures: 0,
-      lastStatus: 'up',
-      lastCheckedAt: checkedAtIso,
-      lastHttpStatus: probe.httpStatus,
-      lastError: null,
-      archivedAt: previous?.archivedAt ?? null
+      kind: 'ambiguous',
+      bestScore: best.score,
+      secondScore: second.score
     };
   }
-
-  const baseFirstFailure =
-    previous?.lastStatus === 'down' && previous.firstFailureAt ? previous.firstFailureAt : checkedAtIso;
-  const consecutiveFailures =
-    previous?.lastStatus === 'down' ? Math.max(1, previous.consecutiveFailures + 1) : 1;
 
   return {
-    userId,
-    linkId: link.id,
-    url: link.url,
-    firstFailureAt: baseFirstFailure,
-    lastFailureAt: checkedAtIso,
-    consecutiveFailures,
-    lastStatus: 'down',
-    lastCheckedAt: checkedAtIso,
-    lastHttpStatus: probe.httpStatus,
-    lastError: probe.error,
-    archivedAt: previous?.archivedAt ?? null
+    kind: 'matched',
+    candidate: best.candidate,
+    score: best.score
   };
 }
 
-// This helper counts standard failure arrays in tool payloads for maintenance status decisions.
-function readFailureCount(payload: Record<string, unknown>): number {
-  const failures = payload.failures;
-  if (!Array.isArray(failures)) {
-    return 0;
+// This helper resolves tag names to ids with exact, alias, and deterministic fuzzy matching.
+function resolveTagNameFilters(
+  names: string[] | undefined,
+  allTags: LinkTag[],
+  aliases: TagAliasRecord[] | undefined,
+  selectorField: 'tagNamesAny' | 'tagNamesAll'
+): ResolvedNameFilters {
+  const warnings: string[] = [];
+  const resolvedIds = new Set<number>();
+  const uniqueNames = [...new Set((names ?? []).map((name) => name.trim()).filter((name) => name.length > 0))];
+  const tagsById = new Map<number, LinkTag>(allTags.map((tag) => [tag.id, tag]));
+  const tagsByNormalized = new Map<string, LinkTag[]>();
+  const aliasByNormalized = new Map<string, TagAliasRecord>();
+
+  for (const tag of allTags) {
+    const normalized = normalizeTagName(tag.name);
+    const existing = tagsByNormalized.get(normalized) ?? [];
+    existing.push(tag);
+    tagsByNormalized.set(normalized, existing);
   }
-  return failures.length;
-}
 
-// This function handles linkwarden_search_links and supports unbounded mode when limit is omitted.
-async function handleSearchLinks(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = searchLinksSchema.parse(args);
-  const client = getClient(context);
-  const collectionId = input.collectionId ?? input.collection_id;
-  const tagIds = input.tagIds ?? input.tag_ids;
-  // This call intentionally performs one deterministic full scope load so totals remain stable on broken upstream offset paging.
-  const loaded = await client.loadLinksForScopeDetailed(
-    {
-      query: input.query,
-      collectionId,
-      tagIds,
-      archived: input.archived,
-      pinned: input.pinned
-    },
-    100
-  );
-  const all = loaded.items;
-  const items =
-    input.limit === undefined ? all.slice(input.offset) : all.slice(input.offset, input.offset + input.limit);
-
-  const payload: Record<string, unknown> = {
-    links: items.map((item) => ({
-      id: item.id,
-      title: item.title,
-      url: item.url,
-      description: item.description,
-      tags: item.tags,
-      collection: item.collection,
-      pinned: item.pinned,
-      createdAt: item.createdAt,
-      updatedAt: item.updatedAt
-    })),
-    paging: {
-      limit: input.limit ?? null,
-      offset: input.offset,
-      returned: items.length,
-      total: all.length
+  for (const alias of aliases ?? []) {
+    if (!aliasByNormalized.has(alias.aliasNormalized)) {
+      aliasByNormalized.set(alias.aliasNormalized, alias);
     }
-  };
-
-  // This optional debug branch exposes scope loading diagnostics for paging investigations.
-  if (input.debug) {
-    payload.debug = {
-      scopeLoad: loaded.diagnostics,
-      scopeWarning: loaded.warning ?? null
-    };
   }
 
-  return mcpResult(payload);
-}
-
-// This function returns MCP server metadata so clients can query the running server version.
-async function handleGetServerInfo(args: unknown): Promise<ToolCallResult> {
-  serverInfoSchema.parse(args);
-  return mcpResult({
-    name: MCP_SERVER_NAME,
-    version: MCP_SERVER_VERSION,
-    protocolVersion: formatProtocolVersionWithTimestamp()
-  });
-}
-
-// This function provides the generic `search` tool contract expected by OpenAI connector examples.
-async function handleConnectorSearch(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = connectorSearchSchema.parse(args);
-  const client = getClient(context);
-  // This connector path intentionally loads all matching links so ChatGPT is not artificially limited.
-  const result = await client.loadLinksForScope({
-    query: input.query
-  });
-
-  return mcpResult({
-    results: result.map((item) => ({
-      id: String(item.id),
-      title: item.title,
-      url: item.url
-    }))
-  });
-}
-
-// This function provides the generic `fetch` tool contract expected by OpenAI connector examples.
-async function handleConnectorFetch(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = connectorFetchSchema.parse(args);
-
-  // This guard keeps the wrapper deterministic by accepting only positive numeric Linkwarden ids.
-  const linkId = Number(input.id);
-  if (!Number.isInteger(linkId) || linkId <= 0) {
-    throw new AppError(400, 'validation_error', 'fetch id must be a positive numeric link id.');
-  }
-
-  const client = getClient(context);
-  const link = await client.getLink(linkId);
-
-  // This fallback text keeps the response useful even when the Linkwarden description is empty.
-  const textLines = [`URL: ${link.url}`];
-  if (link.description) {
-    textLines.push('', link.description);
-  }
-
-  return mcpResult({
-    id: String(link.id),
-    title: link.title,
-    text: textLines.join('\n'),
-    url: link.url,
-    metadata: {
-      source: 'linkwarden',
-      linkId: link.id,
-      archived: link.archived ?? null,
-      collection: link.collection?.name ?? null,
-      tags: link.tags.map((tag) => tag.name),
-      createdAt: link.createdAt ?? null,
-      updatedAt: link.updatedAt ?? null
-    }
-  });
-}
-
-// This function handles linkwarden_list_collections with paging controls.
-async function handleListCollections(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = listCollectionsSchema.parse(args);
-  const client = getClient(context);
-
-  if (input.limit === undefined) {
-    // This branch returns every collection when no explicit limit is provided.
-    const items = await client.listAllCollections();
-    const offsetItems = items.slice(input.offset);
-    return mcpResult({
-      collections: offsetItems,
-      paging: {
-        limit: null,
-        offset: input.offset,
-        returned: offsetItems.length,
-        total: items.length
+  for (const rawName of uniqueNames) {
+    const normalized = normalizeTagName(rawName);
+    const exactMatches = (tagsByNormalized.get(normalized) ?? []).sort((left, right) => left.id - right.id);
+    if (exactMatches.length > 0) {
+      resolvedIds.add(exactMatches[0].id);
+      if (exactMatches.length > 1) {
+        warnings.push(
+          `${selectorField}: multiple exact tag matches for "${rawName}", selected id ${exactMatches[0].id}.`
+        );
       }
+      continue;
+    }
+
+    const alias = aliasByNormalized.get(normalized);
+    if (alias) {
+      const aliasedTag = tagsById.get(alias.canonicalTagId);
+      if (aliasedTag) {
+        resolvedIds.add(aliasedTag.id);
+        continue;
+      }
+    }
+
+    const fuzzyMatch = pickFuzzyMatch(normalized, allTags.map((tag) => ({ id: tag.id, name: tag.name })));
+    if (fuzzyMatch.kind === 'none') {
+      warnings.push(`${selectorField}: unresolved tag name "${rawName}".`);
+      continue;
+    }
+    if (fuzzyMatch.kind === 'ambiguous') {
+      warnings.push(
+        `${selectorField}: ambiguous fuzzy candidates for "${rawName}" (best ${fuzzyMatch.bestScore.toFixed(2)}, second ${fuzzyMatch.secondScore.toFixed(2)}), skipped.`
+      );
+      continue;
+    }
+
+    const matchedTag = tagsById.get(fuzzyMatch.candidate.id);
+    if (!matchedTag) {
+      warnings.push(`${selectorField}: unresolved tag name "${rawName}".`);
+      continue;
+    }
+
+    resolvedIds.add(matchedTag.id);
+    warnings.push(
+      `${selectorField}: fuzzy matched "${rawName}" to tag "${matchedTag.name}" (id ${matchedTag.id}, score ${fuzzyMatch.score.toFixed(2)}).`
+    );
+  }
+
+  return {
+    ids: [...resolvedIds].sort((left, right) => left - right),
+    warnings
+  };
+}
+
+// This helper resolves collection names to ids with exact and deterministic fuzzy matching.
+function resolveCollectionNameFilters(
+  names: string[] | undefined,
+  collections: LinkCollection[],
+  includeDescendants: boolean
+): ResolvedNameFilters {
+  const warnings: string[] = [];
+  const resolvedBaseIds = new Set<number>();
+  const uniqueNames = [...new Set((names ?? []).map((name) => name.trim()).filter((name) => name.length > 0))];
+  const collectionsByNormalized = new Map<string, LinkCollection[]>();
+
+  for (const collection of collections) {
+    const normalized = normalizeTagName(collection.name);
+    const existing = collectionsByNormalized.get(normalized) ?? [];
+    existing.push(collection);
+    collectionsByNormalized.set(normalized, existing);
+  }
+
+  for (const rawName of uniqueNames) {
+    const normalized = normalizeTagName(rawName);
+    const exactMatches = (collectionsByNormalized.get(normalized) ?? []).sort((left, right) => left.id - right.id);
+    if (exactMatches.length > 0) {
+      resolvedBaseIds.add(exactMatches[0].id);
+      if (exactMatches.length > 1) {
+        warnings.push(
+          `collectionNamesAny: multiple exact collection matches for "${rawName}", selected id ${exactMatches[0].id}.`
+        );
+      }
+      continue;
+    }
+
+    const fuzzyMatch = pickFuzzyMatch(
+      normalized,
+      collections.map((collection) => ({ id: collection.id, name: collection.name }))
+    );
+    if (fuzzyMatch.kind === 'none') {
+      warnings.push(`collectionNamesAny: unresolved collection name "${rawName}".`);
+      continue;
+    }
+    if (fuzzyMatch.kind === 'ambiguous') {
+      warnings.push(
+        `collectionNamesAny: ambiguous fuzzy candidates for "${rawName}" (best ${fuzzyMatch.bestScore.toFixed(2)}, second ${fuzzyMatch.secondScore.toFixed(2)}), skipped.`
+      );
+      continue;
+    }
+
+    resolvedBaseIds.add(fuzzyMatch.candidate.id);
+    warnings.push(
+      `collectionNamesAny: fuzzy matched "${rawName}" to collection "${fuzzyMatch.candidate.name}" (id ${fuzzyMatch.candidate.id}, score ${fuzzyMatch.score.toFixed(2)}).`
+    );
+  }
+
+  const resolvedIds = new Set<number>();
+  for (const id of resolvedBaseIds) {
+    if (includeDescendants) {
+      const scoped = resolveCollectionScope(collections, id, true);
+      for (const scopedId of scoped) {
+        resolvedIds.add(scopedId);
+      }
+      continue;
+    }
+    resolvedIds.add(id);
+  }
+
+  return {
+    ids: [...resolvedIds].sort((left, right) => left - right),
+    warnings
+  };
+}
+
+// This helper filters one link list with selector constraints that are not guaranteed by upstream query semantics.
+function applyLocalSelectorFilters(
+  links: LinkItem[],
+  selector: LinkSelector | undefined,
+  runtime: SelectorFilterRuntime
+): LinkItem[] {
+  const idsSet = selector?.ids ? new Set(selector.ids) : null;
+  const tagAnySet = runtime.tagIdsAny ? new Set(runtime.tagIdsAny) : null;
+  const tagAllSet = runtime.tagIdsAll ? new Set(runtime.tagIdsAll) : null;
+  const changedSinceMs = selector?.changedSince ? new Date(selector.changedSince).getTime() : null;
+
+  return links.filter((link) => {
+    if (idsSet && !idsSet.has(link.id)) {
+      return false;
+    }
+
+    if (runtime.collectionScopeSet) {
+      const collectionId = link.collection?.id;
+      if (typeof collectionId !== 'number' || !runtime.collectionScopeSet.has(collectionId)) {
+        return false;
+      }
+    }
+
+    if (typeof selector?.archived === 'boolean' && Boolean(link.archived) !== selector.archived) {
+      return false;
+    }
+
+    if (typeof selector?.pinned === 'boolean' && Boolean(link.pinned) !== selector.pinned) {
+      return false;
+    }
+
+    if (tagAnySet) {
+      const hasAny = link.tags.some((tag) => tagAnySet.has(tag.id));
+      if (!hasAny) {
+        return false;
+      }
+    }
+
+    if (tagAllSet) {
+      if (tagAllSet.size === 0) {
+        return false;
+      }
+      const linkTagIds = new Set(link.tags.map((tag) => tag.id));
+      for (const requiredTagId of tagAllSet) {
+        if (!linkTagIds.has(requiredTagId)) {
+          return false;
+        }
+      }
+    }
+
+    if (typeof changedSinceMs === 'number' && Number.isFinite(changedSinceMs)) {
+      const sourceDate = link.updatedAt ?? link.createdAt;
+      if (!sourceDate) {
+        return false;
+      }
+      if (new Date(sourceDate).getTime() < changedSinceMs) {
+        return false;
+      }
+    }
+
+    if (runtime.createdWindow) {
+      const createdAt = link.createdAt;
+      if (!createdAt) {
+        return false;
+      }
+      const createdAtMs = new Date(createdAt).getTime();
+      if (!Number.isFinite(createdAtMs)) {
+        return false;
+      }
+      if (typeof runtime.createdWindow.fromMs === 'number' && createdAtMs < runtime.createdWindow.fromMs) {
+        return false;
+      }
+      if (typeof runtime.createdWindow.toMs === 'number' && createdAtMs > runtime.createdWindow.toMs) {
+        return false;
+      }
+    }
+
+    return true;
+  });
+}
+
+// This helper applies principal collection scope restrictions to one candidate link set.
+function applyPrincipalCollectionScope(links: LinkItem[], principal: AuthenticatedPrincipal): LinkItem[] {
+  const scopedCollections = principal.collectionScopes ?? [];
+  if (scopedCollections.length === 0) {
+    return links;
+  }
+  const allowed = new Set(scopedCollections);
+  return links.filter((link) => typeof link.collection?.id === 'number' && allowed.has(link.collection.id));
+}
+
+// This helper resolves links for selector/ids requests while keeping result order deterministic.
+async function resolveLinks(
+  context: ToolRuntimeContext,
+  selector: LinkSelector | undefined,
+  ids: number[] | undefined
+): Promise<ResolvedScope> {
+  const client = getClient(context);
+  let links: LinkItem[] = [];
+  let selectedCollectionIds: number[] = [];
+  const warnings: string[] = [];
+
+  if (Array.isArray(ids) && ids.length > 0) {
+    const loaded = await Promise.all(ids.map(async (id) => client.getLink(id)));
+    links = loaded;
+    selectedCollectionIds = loaded
+      .map((link) => link.collection?.id)
+      .filter((value): value is number => typeof value === 'number');
+  } else {
+    const userSettings = context.db.getUserSettings(context.principal.userId);
+    const compiledWindow = compileCreatedWindow({
+      selector,
+      userTimeZone: userSettings.queryTimeZone,
+      serverDefaultTimeZone: process.env.MCP_DEFAULT_QUERY_TIMEZONE ?? null
+    });
+    warnings.push(...compiledWindow.warnings);
+
+    let allCollections: LinkCollection[] = [];
+    let scopeSet: Set<number> | null = null;
+    const selectorCollectionId = selector?.collectionId;
+    const hasCollectionNameFilter = Array.isArray(selector?.collectionNamesAny) && selector.collectionNamesAny.length > 0;
+    const shouldLoadCollections = typeof selectorCollectionId === 'number' || hasCollectionNameFilter;
+
+    if (shouldLoadCollections) {
+      allCollections = await client.listAllCollections();
+    }
+
+    if (typeof selectorCollectionId === 'number') {
+      scopeSet = resolveCollectionScope(allCollections, selectorCollectionId, Boolean(selector?.includeDescendants));
+      selectedCollectionIds = [...scopeSet].sort((left, right) => left - right);
+    } else if (hasCollectionNameFilter) {
+      const collectionResolution = resolveCollectionNameFilters(
+        selector?.collectionNamesAny,
+        allCollections,
+        Boolean(selector?.includeDescendants)
+      );
+      warnings.push(...collectionResolution.warnings);
+      scopeSet = new Set(collectionResolution.ids);
+      selectedCollectionIds = collectionResolution.ids;
+    }
+
+    for (const selectedCollectionId of selectedCollectionIds) {
+      assertCollectionScopeAccess(context, selectedCollectionId);
+    }
+
+    // This short-circuit avoids full scans when collection names resolve to zero accessible scopes.
+    if (scopeSet && scopeSet.size === 0) {
+      return {
+        links: [],
+        selectedCollectionIds,
+        warnings
+      };
+    }
+
+    let resolvedTagIdsAny: number[] | null = selector?.tagIdsAny ? [...selector.tagIdsAny] : null;
+    let resolvedTagIdsAll: number[] | null = selector?.tagIdsAll ? [...selector.tagIdsAll] : null;
+    const hasTagNameFilter =
+      (Array.isArray(selector?.tagNamesAny) && selector.tagNamesAny.length > 0) ||
+      (Array.isArray(selector?.tagNamesAll) && selector.tagNamesAll.length > 0);
+
+    if (hasTagNameFilter) {
+      const allTags = await client.listAllTags();
+      const aliases = context.db.listTagAliases(context.principal.userId);
+      if (Array.isArray(selector?.tagNamesAny) && selector.tagNamesAny.length > 0) {
+        const anyResolution = resolveTagNameFilters(selector.tagNamesAny, allTags, aliases, 'tagNamesAny');
+        resolvedTagIdsAny = anyResolution.ids;
+        warnings.push(...anyResolution.warnings);
+      }
+      if (Array.isArray(selector?.tagNamesAll) && selector.tagNamesAll.length > 0) {
+        const allResolution = resolveTagNameFilters(selector.tagNamesAll, allTags, aliases, 'tagNamesAll');
+        resolvedTagIdsAll = allResolution.ids;
+        warnings.push(...allResolution.warnings);
+      }
+    }
+
+    // This branch keeps upstream filtering broad enough for descendant/name scopes while still reducing obvious payload size.
+    const upstreamCollectionId =
+      typeof selectorCollectionId === 'number' && !Boolean(selector?.includeDescendants) ? selectorCollectionId : undefined;
+    const upstreamTagIds = resolvedTagIdsAny ?? resolvedTagIdsAll ?? undefined;
+    const loaded = await client.loadLinksForScope({
+      query: selector?.query,
+      collectionId: upstreamCollectionId,
+      tagIds: upstreamTagIds ?? undefined,
+      archived: selector?.archived,
+      pinned: selector?.pinned
+    });
+    links = applyLocalSelectorFilters(loaded, selector, {
+      collectionScopeSet: scopeSet,
+      tagIdsAny: resolvedTagIdsAny,
+      tagIdsAll: resolvedTagIdsAll,
+      createdWindow:
+        typeof compiledWindow.fromMs === 'number' || typeof compiledWindow.toMs === 'number'
+          ? {
+              fromMs: compiledWindow.fromMs,
+              toMs: compiledWindow.toMs
+            }
+          : null
     });
   }
 
-  // This branch keeps explicit paging behavior when the caller provides a concrete limit.
-  const result = await client.listCollections({
-    limit: input.limit,
-    offset: input.offset
-  });
+  const scoped = applyPrincipalCollectionScope(links, context.principal);
+  const deduped = new Map<number, LinkItem>();
+  for (const link of scoped) {
+    deduped.set(link.id, link);
+  }
+  const sorted = [...deduped.values()].sort((left, right) => left.id - right.id);
+  return {
+    links: sorted,
+    selectedCollectionIds,
+    warnings
+  };
+}
 
-  return mcpResult({
-    collections: result.items,
-    paging: {
-      limit: input.limit,
-      offset: input.offset,
-      returned: result.items.length,
-      total: result.total
+// This helper creates or resolves tag ids by name with deterministic normalized matching rules.
+async function resolveTagIdsByName(
+  client: LinkwardenClient,
+  names: string[],
+  createMissing: boolean,
+  dryRun: boolean
+): Promise<{ tagIds: number[]; created: LinkTag[]; missing: string[] }> {
+  const normalizedNames = [...new Set(names.map((name) => name.trim()).filter((name) => name.length > 0))];
+  const allTags = await client.listAllTags();
+  const byNormalized = new Map<string, LinkTag>(allTags.map((tag) => [normalizeTagName(tag.name), tag]));
+  const created: LinkTag[] = [];
+  const missing: string[] = [];
+
+  for (const name of normalizedNames) {
+    const normalized = normalizeTagName(name);
+    if (byNormalized.has(normalized)) {
+      continue;
     }
+    if (!createMissing || dryRun) {
+      missing.push(name);
+      continue;
+    }
+    const createdTag = await client.createTag(name);
+    byNormalized.set(normalizeTagName(createdTag.name), createdTag);
+    created.push(createdTag);
+  }
+
+  const tagIds = normalizedNames
+    .map((name) => byNormalized.get(normalizeTagName(name)))
+    .filter((tag): tag is LinkTag => Boolean(tag))
+    .map((tag) => tag.id);
+
+  return {
+    tagIds: normalizeTagIds(tagIds),
+    created,
+    missing
+  };
+}
+
+// This helper computes one next tag state based on replace/add/remove semantics.
+function computeNextTagIds(currentTagIds: number[], nextTagIds: number[], mode: 'replace' | 'add' | 'remove'): number[] {
+  const current = new Set(currentTagIds);
+
+  if (mode === 'replace') {
+    return normalizeTagIds(nextTagIds);
+  }
+  if (mode === 'add') {
+    for (const tagId of nextTagIds) {
+      current.add(tagId);
+    }
+    return normalizeTagIds([...current]);
+  }
+  for (const tagId of nextTagIds) {
+    current.delete(tagId);
+  }
+  return normalizeTagIds([...current]);
+}
+
+// This helper executes one mutation callback with optional idempotency replay support.
+async function withIdempotency(
+  context: ToolRuntimeContext,
+  toolName: string,
+  idempotencyKey: string | undefined,
+  requestPayload: Record<string, unknown>,
+  work: () => Promise<Record<string, unknown>>
+): Promise<ToolCallResult> {
+  if (!idempotencyKey) {
+    return mcpResult(normalizeEnvelope(await work()));
+  }
+
+  const hash = stableHash(requestPayload);
+  const cached = context.db.getIdempotencyRecord(context.principal.userId, toolName, idempotencyKey, hash);
+  if (cached) {
+    return mcpResult(normalizeEnvelope(cached));
+  }
+
+  const payload = normalizeEnvelope(await work());
+  context.db.upsertIdempotencyRecord({
+    userId: context.principal.userId,
+    toolName,
+    key: idempotencyKey,
+    requestHash: hash,
+    response: payload,
+    ttlSeconds: 24 * 60 * 60
+  });
+  return mcpResult(payload);
+}
+
+// This helper creates one operation record and returns its identifier for undo/audit tracking.
+function beginOperation(
+  context: ToolRuntimeContext,
+  toolName: string,
+  summary: Record<string, unknown>,
+  undoDays = 7
+): string {
+  const operationId = randomUUID();
+  const undoUntil = new Date(Date.now() + undoDays * 24 * 60 * 60 * 1000).toISOString();
+  context.db.createOperation({
+    id: operationId,
+    userId: context.principal.userId,
+    toolName,
+    summary,
+    undoUntil
+  });
+  return operationId;
+}
+
+// This helper creates one compact model for operation item snapshots used by undo flows.
+function snapshotForUndo(link: LinkItem): Record<string, unknown> {
+  return {
+    title: link.title,
+    url: link.url,
+    description: link.description ?? null,
+    collectionId: link.collection?.id ?? null,
+    tagIds: link.tags.map((tag) => tag.id),
+    pinned: Boolean(link.pinned),
+    archived: Boolean(link.archived)
+  };
+}
+
+// This helper generates one deterministic query page response from a persisted query snapshot.
+function readQuerySlice(
+  snapshotId: string,
+  items: Array<Record<string, unknown>>,
+  limit: number,
+  offset: number
+): QuerySlice {
+  const pageItems = items.slice(offset, offset + limit);
+  const nextOffset = offset + pageItems.length;
+  const hasMore = nextOffset < items.length;
+  return {
+    items: pageItems,
+    paging: {
+      limit,
+      returned: pageItems.length,
+      total: items.length,
+      hasMore,
+      nextCursor: hasMore ? encodeCursor(snapshotId, nextOffset) : null
+    }
+  };
+}
+
+// This helper collects duplicate groups by canonical URL with deterministic output ordering.
+function groupDuplicates(links: LinkItem[]): CanonicalDuplicateGroup[] {
+  const grouped = new Map<string, LinkItem[]>();
+  for (const link of links) {
+    const canonicalUrl = canonicalizeUrl(link.url);
+    const existing = grouped.get(canonicalUrl) ?? [];
+    existing.push(link);
+    grouped.set(canonicalUrl, existing);
+  }
+  return [...grouped.entries()]
+    .map(([canonicalUrl, groupLinks]) => ({
+      canonicalUrl,
+      links: groupLinks.sort((left, right) => left.id - right.id)
+    }))
+    .filter((group) => group.links.length > 1)
+    .sort((left, right) => right.links.length - left.links.length || left.canonicalUrl.localeCompare(right.canonicalUrl));
+}
+
+// This helper formats one compact tool result summary for structured completion logs.
+function summarizeToolOutput(output: ToolCallResult): Record<string, unknown> {
+  const payload = output.structuredContent;
+  return sanitizeForLog({
+    ok: payload.ok,
+    keys: Object.keys(payload),
+    summary: payload.summary,
+    paging: payload.paging
+  }) as Record<string, unknown>;
+}
+
+// This function handles linkwarden_get_server_info and returns alpha protocol metadata.
+async function handleGetServerInfo(args: unknown): Promise<ToolCallResult> {
+  serverInfoSchema.parse(args);
+  return ok({
+    name: MCP_SERVER_NAME,
+    version: MCP_SERVER_VERSION,
+    protocolVersion: formatProtocolVersionWithTimestamp(),
+    supportedTagInferenceProviders: ['builtin', 'perplexity', 'mistral', 'huggingface']
   });
 }
 
-// This function creates one collection and optionally nests it under a parent collection.
+// This function handles linkwarden_get_stats with hard counters for links, collections, tags, pinned, and archived.
+async function handleGetStats(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = getStatsSchema.parse(args);
+  const client = getClient(context);
+  const resolved = await resolveLinks(context, input.selector, undefined);
+  const collections = await client.listAllCollections();
+  const tags = await client.listAllTags();
+  const pinnedCount = resolved.links.filter((link) => Boolean(link.pinned)).length;
+  const archivedCount = resolved.links.filter((link) => Boolean(link.archived)).length;
+
+  return ok(
+    {
+      linksTotal: resolved.links.length,
+      collectionsTotal: collections.length,
+      tagsTotal: tags.length,
+      pinnedTotal: pinnedCount,
+      archivedTotal: archivedCount
+    },
+    {
+      summary: {
+        selectorApplied: Boolean(input.selector)
+      },
+      warnings: resolved.warnings
+    }
+  );
+}
+
+// This function handles linkwarden_query_links using persisted snapshots and deterministic cursor paging.
+async function handleQueryLinks(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = queryLinksSchema.parse(args);
+
+  if (input.cursor) {
+    const decoded = decodeCursor(input.cursor);
+    const snapshot = context.db.getQuerySnapshot(decoded.snapshotId, context.principal.userId);
+    if (!snapshot) {
+      throw new AppError(404, 'cursor_not_found', 'Cursor snapshot missing or expired.');
+    }
+    const slice = readQuerySlice(decoded.snapshotId, snapshot.items, input.limit, decoded.offset);
+    return ok(
+      {
+        links: slice.items
+      },
+      {
+        paging: slice.paging,
+        warnings: []
+      }
+    );
+  }
+
+  const resolved = await resolveLinks(context, input.selector, undefined);
+  const projected = resolved.links.map((link) => projectLink(link, input.fields, input.verbosity));
+  const snapshotId = randomUUID();
+  context.db.createQuerySnapshot({
+    snapshotId,
+    userId: context.principal.userId,
+    selector: input.selector ?? {},
+    fields: input.fields,
+    items: projected,
+    total: projected.length,
+    ttlSeconds: 30 * 60
+  });
+  const slice = readQuerySlice(snapshotId, projected, input.limit, 0);
+  return ok(
+    {
+      links: slice.items
+    },
+    {
+      paging: slice.paging,
+      warnings: resolved.warnings
+    }
+  );
+}
+
+// This function handles linkwarden_aggregate_links with grouped counters over one selector-scoped link set.
+async function handleAggregateLinks(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = aggregateLinksSchema.parse(args);
+  const resolved = await resolveLinks(context, input.selector, undefined);
+  const buckets = new Map<string, number>();
+
+  for (const link of resolved.links) {
+    if (input.groupBy === 'collection') {
+      const key = link.collection ? `${link.collection.id}:${link.collection.name}` : 'null:Unassigned';
+      buckets.set(key, (buckets.get(key) ?? 0) + 1);
+      continue;
+    }
+    if (input.groupBy === 'tag') {
+      if (link.tags.length === 0) {
+        buckets.set('0:untagged', (buckets.get('0:untagged') ?? 0) + 1);
+      } else {
+        for (const tag of link.tags) {
+          const key = `${tag.id}:${tag.name}`;
+          buckets.set(key, (buckets.get(key) ?? 0) + 1);
+        }
+      }
+      continue;
+    }
+    if (input.groupBy === 'domain') {
+      const key = extractDomain(link.url);
+      buckets.set(key, (buckets.get(key) ?? 0) + 1);
+      continue;
+    }
+    if (input.groupBy === 'pinned') {
+      const key = Boolean(link.pinned) ? 'pinned:true' : 'pinned:false';
+      buckets.set(key, (buckets.get(key) ?? 0) + 1);
+      continue;
+    }
+    const key = Boolean(link.archived) ? 'archived:true' : 'archived:false';
+    buckets.set(key, (buckets.get(key) ?? 0) + 1);
+  }
+
+  const aggregates = [...buckets.entries()]
+    .map(([bucket, count]) => ({ bucket, count }))
+    .sort((left, right) => right.count - left.count || left.bucket.localeCompare(right.bucket))
+    .slice(0, input.topN);
+
+  return ok(
+    {
+      aggregates
+    },
+    {
+      summary: {
+        groupBy: input.groupBy,
+        scanned: resolved.links.length
+      },
+      warnings: resolved.warnings
+    }
+  );
+}
+
+// This function handles linkwarden_get_link and applies projection + verbosity for token-efficient responses.
+async function handleGetLink(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = getLinkSchema.parse(args);
+  const client = getClient(context);
+  const link = await client.getLink(input.id);
+  const projected = projectLink(link, input.fields, input.verbosity);
+  return ok({
+    link: projected
+  });
+}
+
+// This helper computes one mutation preview entry with deterministic before/after snapshots.
+function buildMutationPreview(
+  link: LinkItem,
+  updates: {
+    title?: string;
+    url?: string;
+    description?: string;
+    collectionId?: number | null;
+    pinned?: boolean;
+    archived?: boolean;
+    tagMode: 'replace' | 'add' | 'remove';
+    tagIds: number[];
+  }
+): { before: Record<string, unknown>; after: Record<string, unknown> } {
+  const before = snapshotForUndo(link);
+  const currentTagIds = link.tags.map((tag) => tag.id);
+  const afterTagIds = computeNextTagIds(currentTagIds, updates.tagIds, updates.tagMode);
+  const after: Record<string, unknown> = {
+    title: updates.title ?? link.title,
+    url: updates.url ?? link.url,
+    description: updates.description ?? (link.description ?? null),
+    collectionId: updates.collectionId === undefined ? (link.collection?.id ?? null) : updates.collectionId,
+    tagIds: afterTagIds,
+    pinned: updates.pinned === undefined ? Boolean(link.pinned) : updates.pinned,
+    archived: updates.archived === undefined ? Boolean(link.archived) : updates.archived
+  };
+  return { before, after };
+}
+
+// This helper applies one mutation snapshot to one link via native update calls and returns the refreshed entity.
+async function applyMutationSnapshot(
+  client: LinkwardenClient,
+  linkId: number,
+  snapshot: Record<string, unknown>
+): Promise<LinkItem> {
+  return client.updateLink(linkId, {
+    title: snapshot.title,
+    url: snapshot.url,
+    description: snapshot.description,
+    collectionId: snapshot.collectionId,
+    tagIds: snapshot.tagIds,
+    pinned: snapshot.pinned,
+    archived: snapshot.archived
+  });
+}
+
+// This function handles linkwarden_mutate_links with selector-based targeting, dry-run previews, and idempotency.
+async function handleMutateLinks(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = mutateLinksSchema.parse(args);
+  if (!input.dryRun) {
+    assertWriteAccess(context);
+  }
+  const client = getClient(context);
+  const resolved = await resolveLinks(context, input.selector, input.ids);
+
+  if (resolved.links.length === 0) {
+    return ok(
+      {
+        operationId: null,
+        preview: []
+      },
+      {
+        summary: {
+          total: 0,
+          changes: 0,
+          applied: 0
+        }
+      }
+    );
+  }
+
+  if (input.updates.collectionId !== undefined) {
+    assertCollectionScopeAccess(context, input.updates.collectionId);
+  }
+
+  const tagResolution = await resolveTagIdsByName(
+    client,
+    input.updates.tagNames ?? [],
+    input.updates.createMissingTags,
+    input.dryRun
+  );
+
+  const previews = resolved.links.map((link) => {
+    const snapshot = buildMutationPreview(link, {
+      title: input.updates.title,
+      url: input.updates.url,
+      description: input.updates.description,
+      collectionId: input.updates.collectionId,
+      pinned: input.updates.pinned,
+      archived: input.updates.archived,
+      tagMode: input.updates.tagMode,
+      tagIds: tagResolution.tagIds
+    });
+    return {
+      linkId: link.id,
+      before: snapshot.before,
+      after: snapshot.after
+    };
+  });
+
+  const changed = previews.filter((item) => JSON.stringify(item.before) !== JSON.stringify(item.after));
+  if (input.dryRun) {
+    return ok(
+      {
+        operationId: null,
+        createdTags: tagResolution.created,
+        missingTags: tagResolution.missing,
+        preview: changed.slice(0, input.previewLimit)
+      },
+      {
+        summary: {
+          total: previews.length,
+          changes: changed.length,
+          applied: 0
+        }
+      }
+    );
+  }
+
+  return withIdempotency(
+    context,
+    'linkwarden_mutate_links',
+    input.idempotencyKey,
+    {
+      selector: input.selector,
+      ids: input.ids,
+      updates: input.updates
+    },
+    async () => {
+      const operationId = beginOperation(context, 'linkwarden_mutate_links', {
+        requested: previews.length,
+        changed: changed.length
+      });
+      const failures: Array<{ itemId: number; code: string; message: string; retryable: boolean }> = [];
+      const operationItems: Array<{
+        itemType: string;
+        itemId: number;
+        before: Record<string, unknown>;
+        after: Record<string, unknown>;
+      }> = [];
+      let applied = 0;
+
+      for (const item of changed) {
+        try {
+          await applyMutationSnapshot(client, item.linkId, item.after);
+          operationItems.push({
+            itemType: 'link',
+            itemId: item.linkId,
+            before: item.before,
+            after: item.after
+          });
+          applied += 1;
+        } catch (error) {
+          failures.push({
+            itemId: item.linkId,
+            code: 'update_failed',
+            message: error instanceof Error ? error.message : 'update failed',
+            retryable: true
+          });
+        }
+      }
+
+      context.db.insertOperationItems(operationId, operationItems);
+      context.db.insertAudit({
+        actor: context.actor,
+        toolName: 'linkwarden_mutate_links',
+        targetType: 'link',
+        targetIds: changed.map((item) => item.linkId),
+        beforeSummary: 'mutation preview',
+        afterSummary: JSON.stringify(input.updates),
+        outcome: failures.length === 0 ? 'success' : 'failed',
+        details: {
+          userId: context.principal.userId,
+          operationId,
+          applied,
+          failures: failures.length
+        }
+      });
+
+      return {
+        ok: true,
+        data: {
+          operationId,
+          createdTags: tagResolution.created,
+          missingTags: tagResolution.missing,
+          preview: changed.slice(0, input.previewLimit)
+        },
+        summary: {
+          total: previews.length,
+          changes: changed.length,
+          applied
+        },
+        paging: null,
+        warnings: [],
+        failures
+      };
+    }
+  );
+}
+
+// This helper resolves or creates the archive collection used by soft-delete workflows.
+async function resolveArchiveCollection(client: LinkwardenClient, explicitCollectionId?: number): Promise<LinkCollection> {
+  if (typeof explicitCollectionId === 'number') {
+    return client.getCollection(explicitCollectionId);
+  }
+  const collections = await client.listAllCollections();
+  const existing = collections.find((collection) => collection.name.toLocaleLowerCase() === 'archiv');
+  if (existing) {
+    return existing;
+  }
+  return client.createCollection({
+    name: 'Archiv',
+    parentId: null
+  });
+}
+
+// This function handles linkwarden_delete_links with soft/hard mode semantics and deterministic previews.
+async function handleDeleteLinks(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = deleteLinksSchema.parse(args);
+  if (!input.dryRun) {
+    assertWriteAccess(context);
+  }
+  const client = getClient(context);
+  const resolved = await resolveLinks(context, input.selector, input.ids);
+
+  const archiveCollection =
+    input.mode === 'soft' ? await resolveArchiveCollection(client, input.archiveCollectionId) : null;
+  if (archiveCollection) {
+    assertCollectionScopeAccess(context, archiveCollection.id);
+  }
+
+  const tagResolution =
+    input.mode === 'soft'
+      ? await resolveTagIdsByName(client, [input.markTagName], true, input.dryRun)
+      : { tagIds: [], created: [], missing: [] };
+  const softDeleteTagId = input.mode === 'soft' ? tagResolution.tagIds[0] : undefined;
+
+  const preview = resolved.links.map((link) => {
+    const before = snapshotForUndo(link);
+    if (input.mode === 'hard') {
+      return {
+        linkId: link.id,
+        before,
+        after: {
+          deleted: true,
+          mode: 'hard'
+        }
+      };
+    }
+    const currentTagIds = link.tags.map((tag) => tag.id);
+    const nextTagIds =
+      typeof softDeleteTagId === 'number' ? computeNextTagIds(currentTagIds, [softDeleteTagId], 'add') : currentTagIds;
+    return {
+      linkId: link.id,
+      before,
+      after: {
+        ...before,
+        collectionId: archiveCollection?.id ?? before.collectionId,
+        tagIds: nextTagIds,
+        archived: true,
+        deleteMode: 'soft'
+      }
+    };
+  });
+
+  if (input.dryRun) {
+    return ok(
+      {
+        operationId: null,
+        archiveCollection,
+        preview: preview.slice(0, input.previewLimit)
+      },
+      {
+        summary: {
+          total: preview.length,
+          mode: input.mode,
+          applied: 0
+        }
+      }
+    );
+  }
+
+  return withIdempotency(
+    context,
+    'linkwarden_delete_links',
+    input.idempotencyKey,
+    {
+      selector: input.selector,
+      ids: input.ids,
+      mode: input.mode,
+      archiveCollectionId: archiveCollection?.id ?? null
+    },
+    async () => {
+      const operationId = beginOperation(context, 'linkwarden_delete_links', {
+        total: preview.length,
+        mode: input.mode
+      });
+      const operationItems: Array<{ itemType: string; itemId: number; before: Record<string, unknown>; after: Record<string, unknown> }> =
+        [];
+      const failures: Array<{ itemId: number; code: string; message: string; retryable: boolean }> = [];
+      let applied = 0;
+
+      for (const item of preview) {
+        try {
+          if (input.mode === 'hard') {
+            await client.deleteLink(item.linkId);
+          } else {
+            const afterTagIds = Array.isArray((item.after as { tagIds?: unknown }).tagIds)
+              ? ((item.after as { tagIds: number[] }).tagIds)
+              : [];
+            await client.updateLink(item.linkId, {
+              collectionId: archiveCollection?.id,
+              tagIds: afterTagIds,
+              archived: true
+            });
+          }
+          operationItems.push({
+            itemType: 'link',
+            itemId: item.linkId,
+            before: item.before,
+            after: item.after
+          });
+          applied += 1;
+        } catch (error) {
+          failures.push({
+            itemId: item.linkId,
+            code: 'delete_failed',
+            message: error instanceof Error ? error.message : 'delete failed',
+            retryable: true
+          });
+        }
+      }
+
+      context.db.insertOperationItems(operationId, operationItems);
+      context.db.insertAudit({
+        actor: context.actor,
+        toolName: 'linkwarden_delete_links',
+        targetType: 'link',
+        targetIds: preview.map((item) => item.linkId),
+        beforeSummary: 'delete preview',
+        afterSummary: JSON.stringify({
+          mode: input.mode,
+          archiveCollectionId: archiveCollection?.id ?? null
+        }),
+        outcome: failures.length === 0 ? 'success' : 'failed',
+        details: {
+          userId: context.principal.userId,
+          operationId,
+          applied,
+          failures: failures.length
+        }
+      });
+
+      return {
+        ok: true,
+        data: {
+          operationId,
+          archiveCollection,
+          preview: preview.slice(0, input.previewLimit)
+        },
+        summary: {
+          total: preview.length,
+          mode: input.mode,
+          applied
+        },
+        paging: null,
+        warnings: [],
+        failures
+      };
+    }
+  );
+}
+
+// This function handles linkwarden_list_collections with deterministic paging over fully loaded collection data.
+async function handleListCollections(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = listCollectionsSchema.parse(args);
+  const client = getClient(context);
+  const all = await client.listAllCollections();
+  const scoped = context.principal.collectionScopes && context.principal.collectionScopes.length > 0
+    ? all.filter((collection) => context.principal.collectionScopes?.includes(collection.id))
+    : all;
+  const page = scoped.slice(input.offset, input.offset + input.limit);
+  return ok(
+    {
+      collections: page
+    },
+    {
+      paging: {
+        limit: input.limit,
+        offset: input.offset,
+        returned: page.length,
+        total: scoped.length
+      }
+    }
+  );
+}
+
+// This function handles linkwarden_create_collection with write-mode and scope enforcement.
 async function handleCreateCollection(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = createCollectionSchema.parse(args);
   assertWriteAccess(context);
-
-  const client = getClient(context);
   if (typeof input.parentId === 'number') {
-    const collections = await client.listAllCollections();
-    const parentExists = collections.some((collection) => collection.id === input.parentId);
-    if (!parentExists) {
-      throw new AppError(404, 'collection_not_found', `Parent collection ${input.parentId} was not found.`);
-    }
+    assertCollectionScopeAccess(context, input.parentId);
   }
-
+  const client = getClient(context);
   const created = await client.createCollection({
     name: input.name,
     parentId: input.parentId
   });
-
+  assertCollectionScopeAccess(context, created.id);
   context.db.insertAudit({
     actor: context.actor,
     toolName: 'linkwarden_create_collection',
     targetType: 'collection',
     targetIds: [created.id],
     beforeSummary: 'collection missing',
-    afterSummary: JSON.stringify({
-      id: created.id,
-      name: created.name,
-      parentId: created.parentId ?? null
-    }),
+    afterSummary: JSON.stringify(created),
     outcome: 'success',
-    details: withActorDetails(context)
+    details: {
+      userId: context.principal.userId
+    }
   });
-
-  return mcpResult({
-    created: true,
+  return ok({
     collection: created
   });
 }
 
-// This function renames or moves one collection by id.
+// This function handles linkwarden_update_collection with deterministic validation and audit logging.
 async function handleUpdateCollection(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = updateCollectionSchema.parse(args);
   assertWriteAccess(context);
-
-  if (input.updates.parentId === input.id) {
-    throw new AppError(400, 'validation_error', 'A collection cannot be moved under itself.');
-  }
-
-  const client = getClient(context);
-  const allCollections = await client.listAllCollections();
-  const existing = allCollections.find((collection) => collection.id === input.id);
-  if (!existing) {
-    throw new AppError(404, 'collection_not_found', `Collection ${input.id} was not found.`);
-  }
-
+  assertCollectionScopeAccess(context, input.id);
   if (typeof input.updates.parentId === 'number') {
-    const parentExists = allCollections.some((collection) => collection.id === input.updates.parentId);
-    if (!parentExists) {
-      throw new AppError(404, 'collection_not_found', `Parent collection ${input.updates.parentId} was not found.`);
-    }
+    assertCollectionScopeAccess(context, input.updates.parentId);
   }
-
-  const updated = await client.updateCollection(input.id, {
-    name: input.updates.name,
-    parentId: input.updates.parentId
-  });
-
+  const client = getClient(context);
+  const updated = await client.updateCollection(input.id, input.updates);
   context.db.insertAudit({
     actor: context.actor,
     toolName: 'linkwarden_update_collection',
     targetType: 'collection',
     targetIds: [input.id],
-    beforeSummary: JSON.stringify({
-      name: existing.name,
-      parentId: existing.parentId ?? null
-    }),
-    afterSummary: JSON.stringify({
-      name: updated.name,
-      parentId: updated.parentId ?? null
-    }),
+    beforeSummary: 'collection update requested',
+    afterSummary: JSON.stringify(updated),
     outcome: 'success',
-    details: withActorDetails(context)
+    details: {
+      userId: context.principal.userId
+    }
   });
-
-  return mcpResult({
-    updated: true,
+  return ok({
     collection: updated
   });
 }
 
-// This function deletes one collection by id.
+// This function handles linkwarden_delete_collection and records one audit trail entry.
 async function handleDeleteCollection(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = deleteCollectionSchema.parse(args);
   assertWriteAccess(context);
-
+  assertCollectionScopeAccess(context, input.id);
   const client = getClient(context);
-  const allCollections = await client.listAllCollections();
-  const existing = allCollections.find((collection) => collection.id === input.id);
-  if (!existing) {
-    throw new AppError(404, 'collection_not_found', `Collection ${input.id} was not found.`);
-  }
-
   await client.deleteCollection(input.id);
-
   context.db.insertAudit({
     actor: context.actor,
     toolName: 'linkwarden_delete_collection',
     targetType: 'collection',
     targetIds: [input.id],
-    beforeSummary: JSON.stringify({
-      id: existing.id,
-      name: existing.name,
-      parentId: existing.parentId ?? null
-    }),
+    beforeSummary: 'collection delete requested',
     afterSummary: 'collection deleted',
     outcome: 'success',
-    details: withActorDetails(context)
+    details: {
+      userId: context.principal.userId
+    }
   });
-
-  return mcpResult({
+  return ok({
     deleted: true,
-    collection: existing
+    id: input.id
   });
 }
 
-// This function handles linkwarden_list_tags with paging controls.
+// This function handles linkwarden_list_tags with deterministic offset paging.
 async function handleListTags(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = listTagsSchema.parse(args);
   const client = getClient(context);
-
-  if (input.limit === undefined) {
-    // This branch returns every tag when no explicit limit is provided.
-    const items = await client.listAllTags();
-    const offsetItems = items.slice(input.offset);
-    return mcpResult({
-      tags: offsetItems,
+  const all = await client.listAllTags();
+  const page = all.slice(input.offset, input.offset + input.limit);
+  return ok(
+    {
+      tags: page
+    },
+    {
       paging: {
-        limit: null,
+        limit: input.limit,
         offset: input.offset,
-        returned: offsetItems.length,
-        total: items.length
+        returned: page.length,
+        total: all.length
       }
-    });
-  }
-
-  // This branch keeps explicit paging behavior when the caller provides a concrete limit.
-  const result = await client.listTags({
-    limit: input.limit,
-    offset: input.offset
-  });
-
-  return mcpResult({
-    tags: result.items,
-    paging: {
-      limit: input.limit,
-      offset: input.offset,
-      returned: result.items.length,
-      total: result.total
     }
-  });
+  );
 }
 
 // This function handles linkwarden_create_tag with idempotent normalized-name behavior.
 async function handleCreateTag(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = createTagSchema.parse(args);
   assertWriteAccess(context);
-
   const client = getClient(context);
-  const allTags = await client.listAllTags();
-  const normalizedInput = normalizeTagName(input.name);
-  const existing = allTags.find((tag) => normalizeTagName(tag.name) === normalizedInput);
-
+  const tags = await client.listAllTags();
+  const existing = tags.find((tag) => normalizeTagName(tag.name) === normalizeTagName(input.name));
   if (existing) {
-    return mcpResult({
-      created: false,
-      tag: existing
+    return ok({
+      tag: existing,
+      created: false
     });
   }
-
-  const created = await client.createTag(input.name.trim());
+  const created = await client.createTag(input.name);
   context.db.insertAudit({
     actor: context.actor,
     toolName: 'linkwarden_create_tag',
     targetType: 'tag',
     targetIds: [created.id],
     beforeSummary: 'tag missing',
-    afterSummary: JSON.stringify({
-      id: created.id,
-      name: created.name
-    }),
+    afterSummary: JSON.stringify(created),
     outcome: 'success',
-    details: withActorDetails(context)
+    details: {
+      userId: context.principal.userId
+    }
   });
-
-  return mcpResult({
-    created: true,
-    tag: created
+  return ok({
+    tag: created,
+    created: true
   });
 }
 
-// This function handles linkwarden_delete_tag by id with strict existence checks.
+// This function handles linkwarden_delete_tag by id with deterministic error and audit behavior.
 async function handleDeleteTag(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = deleteTagSchema.parse(args);
   assertWriteAccess(context);
-
   const client = getClient(context);
-  const allTags = await client.listAllTags();
-  const existing = allTags.find((tag) => tag.id === input.id);
-  if (!existing) {
-    throw new AppError(404, 'tag_not_found', `Tag ${input.id} was not found.`);
-  }
-
   await client.deleteTag(input.id);
   context.db.insertAudit({
     actor: context.actor,
     toolName: 'linkwarden_delete_tag',
     targetType: 'tag',
     targetIds: [input.id],
-    beforeSummary: JSON.stringify({
-      id: existing.id,
-      name: existing.name
-    }),
+    beforeSummary: 'delete tag requested',
     afterSummary: 'tag deleted',
     outcome: 'success',
-    details: withActorDetails(context)
+    details: {
+      userId: context.principal.userId
+    }
   });
-
-  return mcpResult({
+  return ok({
     deleted: true,
-    tag: existing
+    id: input.id
   });
 }
 
-// This function handles name-based tag assignment with optional auto-creation for missing tags.
+// This function handles linkwarden_assign_tags with selector or explicit link id targeting.
 async function handleAssignTags(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = assignTagsSchema.parse(args);
+  const resolved = await resolveLinks(context, input.selector, input.linkIds);
+  const client = getClient(context);
+  const tagResolution = await resolveTagIdsByName(client, input.tagNames, input.createMissingTags, input.dryRun);
+  const preview = resolved.links.map((link) => {
+    const beforeTagIds = link.tags.map((tag) => tag.id);
+    const afterTagIds = computeNextTagIds(beforeTagIds, tagResolution.tagIds, input.mode);
+    return {
+      linkId: link.id,
+      beforeTagIds,
+      afterTagIds
+    };
+  });
+
+  if (input.dryRun) {
+    return ok(
+      {
+        createdTags: tagResolution.created,
+        missingTags: tagResolution.missing,
+        preview: preview.slice(0, input.previewLimit)
+      },
+      {
+        summary: {
+          total: preview.length,
+          changes: preview.filter((item) => JSON.stringify(item.beforeTagIds) !== JSON.stringify(item.afterTagIds)).length,
+          applied: 0
+        }
+      }
+    );
+  }
+
+  assertWriteAccess(context);
+  return withIdempotency(
+    context,
+    'linkwarden_assign_tags',
+    input.idempotencyKey,
+    {
+      selector: input.selector,
+      linkIds: input.linkIds,
+      tagNames: input.tagNames,
+      mode: input.mode
+    },
+    async () => {
+      const operationId = beginOperation(context, 'linkwarden_assign_tags', {
+        total: preview.length,
+        mode: input.mode
+      });
+      const failures: Array<{ itemId: number; code: string; message: string; retryable: boolean }> = [];
+      const operationItems: Array<{ itemType: string; itemId: number; before: Record<string, unknown>; after: Record<string, unknown> }> =
+        [];
+      let applied = 0;
+      const byLink = new Map<number, LinkItem>(resolved.links.map((link) => [link.id, link]));
+
+      for (const item of preview) {
+        const link = byLink.get(item.linkId);
+        if (!link) {
+          continue;
+        }
+        const before = snapshotForUndo(link);
+        const after = {
+          ...before,
+          tagIds: item.afterTagIds
+        };
+        try {
+          await client.updateLink(item.linkId, { tagIds: item.afterTagIds });
+          operationItems.push({
+            itemType: 'link',
+            itemId: item.linkId,
+            before,
+            after
+          });
+          applied += 1;
+        } catch (error) {
+          failures.push({
+            itemId: item.linkId,
+            code: 'assign_tags_failed',
+            message: error instanceof Error ? error.message : 'assign tags failed',
+            retryable: true
+          });
+        }
+      }
+
+      context.db.insertOperationItems(operationId, operationItems);
+      context.db.insertAudit({
+        actor: context.actor,
+        toolName: 'linkwarden_assign_tags',
+        targetType: 'link',
+        targetIds: preview.map((item) => item.linkId),
+        beforeSummary: 'assign tags preview',
+        afterSummary: JSON.stringify({
+          mode: input.mode,
+          tagIds: tagResolution.tagIds
+        }),
+        outcome: failures.length === 0 ? 'success' : 'failed',
+        details: {
+          userId: context.principal.userId,
+          operationId,
+          applied,
+          failures: failures.length
+        }
+      });
+
+      return {
+        ok: true,
+        data: {
+          operationId,
+          createdTags: tagResolution.created,
+          missingTags: tagResolution.missing,
+          preview: preview.slice(0, input.previewLimit)
+        },
+        summary: {
+          total: preview.length,
+          applied
+        },
+        paging: null,
+        warnings: [],
+        failures
+      };
+    }
+  );
+}
+
+// This constant stores deterministic stopwords used by governed tagging token extraction.
+const TAG_STOPWORDS = new Set([
+  'http',
+  'https',
+  'www',
+  'com',
+  'net',
+  'org',
+  'und',
+  'der',
+  'die',
+  'das',
+  'the',
+  'and',
+  'for',
+  'with',
+  'from',
+  'this',
+  'that',
+  'your',
+  'you'
+]);
+
+interface StrictnessPreset {
+  minConfidence: number;
+  minSupport: number;
+  maxNewTagsPerRun: number;
+  maxTagsPerLink: number;
+}
+
+interface RankedTagCandidate {
+  token: string;
+  confidence: number;
+}
+
+interface CandidateDecision {
+  candidate: string;
+  confidence: number;
+  action: 'reuse_exact' | 'reuse_alias' | 'reuse_similar' | 'create' | 'skip_policy' | 'skip_budget' | 'skip_limit';
+  reason: string;
+  tagId: number | null;
+}
+
+// This constant maps per-user strictness presets to deterministic gating thresholds.
+const STRICTNESS_PRESETS: Record<TaggingStrictness, StrictnessPreset> = {
+  very_strict: {
+    minConfidence: 0.82,
+    minSupport: 5,
+    maxNewTagsPerRun: 3,
+    maxTagsPerLink: 6
+  },
+  medium: {
+    minConfidence: 0.68,
+    minSupport: 3,
+    maxNewTagsPerRun: 10,
+    maxTagsPerLink: 10
+  },
+  relaxed: {
+    minConfidence: 0.52,
+    minSupport: 2,
+    maxNewTagsPerRun: 24,
+    maxTagsPerLink: 16
+  }
+};
+
+// This helper normalizes candidate tokens into one deterministic lowercase slug.
+function normalizeCandidateToken(value: string): string {
+  return value
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+// This helper tokenizes free text and removes stopwords/noise for taxonomy candidate generation.
+function tokenizeForTags(text: string): string[] {
+  return text
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .map((token) => normalizeCandidateToken(token))
+    .filter((token) => token.length >= 3 && token.length <= 40)
+    .filter((token) => !TAG_STOPWORDS.has(token))
+    .filter((token) => !/^\d+$/.test(token));
+}
+
+// This helper adds weighted token scores into one candidate map while preserving deterministic accumulation.
+function addWeightedTokens(
+  target: Map<string, number>,
+  tokens: string[],
+  weight: number
+): void {
+  for (const token of tokens) {
+    target.set(token, (target.get(token) ?? 0) + weight);
+  }
+}
+
+// This helper builds one deterministic candidate ranking from weighted metadata and optional fetched tokens.
+function rankTagCandidates(
+  link: LinkItem,
+  fetchedTokens: string[]
+): RankedTagCandidate[] {
+  const scores = new Map<string, number>();
+  addWeightedTokens(scores, tokenizeForTags(link.title), 1.0);
+  addWeightedTokens(scores, tokenizeForTags(link.description ?? ''), 0.55);
+  addWeightedTokens(scores, tokenizeForTags(extractDomain(link.url).replace(/\./g, ' ')), 0.75);
+  addWeightedTokens(scores, tokenizeForTags(link.collection?.name ?? ''), 0.35);
+  addWeightedTokens(scores, fetchedTokens, 0.2);
+
+  const ranked = [...scores.entries()]
+    .map(([token, score]) => ({
+      token,
+      confidence: Math.min(1, score / 2.4)
+    }))
+    .sort((left, right) => right.confidence - left.confidence || left.token.localeCompare(right.token));
+
+  return ranked.slice(0, 8);
+}
+
+// This helper builds one deterministic bigram set for string similarity checks.
+function buildBigrams(value: string): Set<string> {
+  const normalized = normalizeCandidateToken(value);
+  if (normalized.length < 2) {
+    return new Set([normalized]);
+  }
+  const bigrams = new Set<string>();
+  for (let index = 0; index < normalized.length - 1; index += 1) {
+    bigrams.add(normalized.slice(index, index + 2));
+  }
+  return bigrams;
+}
+
+// This helper computes a Dice coefficient for fuzzy tag-to-candidate matching.
+function diceSimilarity(left: string, right: string): number {
+  const leftSet = buildBigrams(left);
+  const rightSet = buildBigrams(right);
+  if (leftSet.size === 0 || rightSet.size === 0) {
+    return 0;
+  }
+  let overlap = 0;
+  for (const value of leftSet) {
+    if (rightSet.has(value)) {
+      overlap += 1;
+    }
+  }
+  return (2 * overlap) / (leftSet.size + rightSet.size);
+}
+
+// This helper resolves one optional similarity match against existing tags under one threshold.
+function findSimilarTagMatch(
+  candidate: string,
+  tags: LinkTag[],
+  threshold: number
+): { tag: LinkTag; score: number } | null {
+  let best: { tag: LinkTag; score: number } | null = null;
+  for (const tag of tags) {
+    const score = diceSimilarity(candidate, tag.name);
+    if (score < threshold) {
+      continue;
+    }
+    if (!best || score > best.score || (score === best.score && tag.id < best.tag.id)) {
+      best = { tag, score };
+    }
+  }
+  return best;
+}
+
+// This helper resolves one effective fetch mode from global policy and per-user override preferences.
+function resolveEffectiveFetchMode(policy: GlobalTaggingPolicy, userFetchMode: FetchMode): FetchMode {
+  return policy.allowUserFetchModeOverride ? userFetchMode : policy.fetchMode;
+}
+
+// This helper deterministically appends tag ids without exceeding one per-link tag limit.
+function appendTagIdsWithLimit(current: number[], additions: number[], maxTags: number): { after: number[]; skipped: number } {
+  const seen = new Set(current);
+  const merged = [...current];
+  let skipped = 0;
+
+  for (const tagId of additions) {
+    if (seen.has(tagId)) {
+      continue;
+    }
+    if (merged.length >= maxTags) {
+      skipped += 1;
+      continue;
+    }
+    seen.add(tagId);
+    merged.push(tagId);
+  }
+
+  return {
+    after: normalizeTagIds(merged),
+    skipped
+  };
+}
+
+// This helper fetches optional page context with deterministic cache keys and expiration behavior.
+async function loadOptionalContextTokens(
+  context: ToolRuntimeContext,
+  link: LinkItem,
+  fetchMode: FetchMode,
+  threshold: number,
+  topConfidence: number,
+  policy: GlobalTaggingPolicy
+): Promise<{ tokens: string[]; fetched: boolean }> {
+  if (fetchMode === 'never') {
+    return { tokens: [], fetched: false };
+  }
+  if (fetchMode === 'optional' && topConfidence >= threshold) {
+    return { tokens: [], fetched: false };
+  }
+
+  const contextHash = stableHash({
+    url: link.url,
+    updatedAt: link.updatedAt ?? link.createdAt ?? null,
+    fetchMode,
+    fetchMaxBytes: policy.fetchMaxBytes,
+    inferenceProvider: policy.inferenceProvider,
+    inferenceModel: policy.inferenceModel
+  });
+  const cached = context.db.getLinkContextCache(context.principal.userId, link.id, contextHash);
+  if (cached) {
+    return {
+      tokens: cached.extractedTokens,
+      fetched: true
+    };
+  }
+
+  const fetchResult = await fetchLinkContext(link.url, {
+    timeoutMs: policy.fetchTimeoutMs,
+    maxBytes: policy.fetchMaxBytes,
+    logger: context.logger
+  });
+  const fetchedTokens = fetchResult.text.length > 0 ? tokenizeForTags(fetchResult.text).slice(0, 240) : [];
+  const providerTokens =
+    policy.inferenceProvider === 'builtin' || fetchResult.text.length === 0
+      ? []
+      : await inferTagTokensViaProvider({
+          provider: policy.inferenceProvider,
+          model: policy.inferenceModel,
+          link,
+          contextText: fetchResult.text,
+          timeoutMs: policy.fetchTimeoutMs,
+          logger: context.logger
+        });
+  const tokens =
+    policy.inferenceProvider === 'builtin'
+      ? fetchedTokens
+      : [...new Set([...providerTokens, ...fetchedTokens])].slice(0, 240);
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  context.db.upsertLinkContextCache({
+    userId: context.principal.userId,
+    linkId: link.id,
+    contextHash,
+    extractedTokens: tokens,
+    expiresAt
+  });
+  return {
+    tokens,
+    fetched: fetchResult.fetched
+  };
+}
+
+// This function handles linkwarden_governed_tag_links as one native end-to-end taxonomy-first tagging flow.
+async function handleGovernedTagLinks(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = governedTagLinksSchema.parse(args);
   if (!input.dryRun) {
     assertWriteAccess(context);
   }
 
   const client = getClient(context);
-  const requestedTagNames = dedupeTagNames(input.tagNames);
-  const tagsBefore = await client.listAllTags();
-  const tagsByNormalizedName = new Map<string, LinkTag>(
-    tagsBefore.map((tag) => [normalizeTagName(tag.name), tag])
-  );
+  const resolved = await resolveLinks(context, input.selector, input.linkIds);
+  const userSettings = context.db.getUserSettings(context.principal.userId);
+  const globalPolicy = context.db.getGlobalTaggingPolicy();
+  const strictnessPreset = STRICTNESS_PRESETS[userSettings.taggingStrictness];
+  const effectiveFetchMode = resolveEffectiveFetchMode(globalPolicy, userSettings.fetchMode);
 
-  const existingResolvedTags: LinkTag[] = [];
-  const missingTagNames: string[] = [];
-  for (const name of requestedTagNames) {
-    const existing = tagsByNormalizedName.get(normalizeTagName(name));
-    if (existing) {
-      existingResolvedTags.push(existing);
-    } else {
-      missingTagNames.push(name);
-    }
-  }
-
-  // This branch avoids unnecessary tag creation for remove mode because unknown tags cannot be removed.
-  const missingRelevantForWrite = input.mode === 'remove' ? [] : missingTagNames;
-  if (!input.dryRun && missingRelevantForWrite.length > 0 && !input.createMissingTags) {
-    throw new AppError(
-      400,
-      'validation_error',
-      `Missing tags cannot be assigned without createMissingTags=true: ${missingRelevantForWrite.join(', ')}`
+  if (resolved.links.length === 0) {
+    return ok(
+      {
+        operationId: null,
+        policy: {
+          strictness: userSettings.taggingStrictness,
+          fetchMode: effectiveFetchMode,
+          allowUserFetchModeOverride: globalPolicy.allowUserFetchModeOverride,
+          inferenceProvider: globalPolicy.inferenceProvider,
+          inferenceModel: globalPolicy.inferenceModel
+        },
+        preview: [],
+        createdTags: [],
+        reusedTags: []
+      },
+      {
+        summary: {
+          scanned: 0,
+          suggested: 0,
+          assigned: 0,
+          created: 0,
+          skippedByPolicy: 0,
+          skippedByBudget: 0
+        }
+      }
     );
   }
 
+  const allTags = await client.listAllTags();
+  const tagsByNormalized = new Map<string, LinkTag>(allTags.map((tag) => [normalizeCandidateToken(tag.name), tag]));
+  const tagsById = new Map<number, LinkTag>(allTags.map((tag) => [tag.id, tag]));
+  const aliases = context.db.listTagAliases(context.principal.userId);
+  const aliasesByNormalized = new Map<string, TagAliasRecord>(aliases.map((alias) => [alias.aliasNormalized, alias]));
+  const blockedSet = new Set(globalPolicy.blockedTagNames.map((name) => normalizeCandidateToken(name)));
+
+  const perLinkRanked = new Map<number, RankedTagCandidate[]>();
+  const perLinkFetched = new Map<number, boolean>();
+  const supportInRun = new Map<string, number>();
+
+  for (const link of resolved.links) {
+    const baseRanking = rankTagCandidates(link, []);
+    const topConfidence = baseRanking[0]?.confidence ?? 0;
+    const optionalContext = await loadOptionalContextTokens(
+      context,
+      link,
+      effectiveFetchMode,
+      strictnessPreset.minConfidence,
+      topConfidence,
+      globalPolicy
+    );
+    const ranking = rankTagCandidates(link, optionalContext.tokens);
+    perLinkRanked.set(link.id, ranking);
+    perLinkFetched.set(link.id, optionalContext.fetched);
+    for (const candidate of ranking) {
+      supportInRun.set(candidate.token, (supportInRun.get(candidate.token) ?? 0) + 1);
+    }
+  }
+
+  const supportPersisted = new Map<string, number>();
+  for (const token of supportInRun.keys()) {
+    const record = context.db.getTagCandidate(context.principal.userId, token);
+    supportPersisted.set(token, record?.supportCount ?? 0);
+  }
+
+  const preview: Array<{
+    linkId: number;
+    fetchedContext: boolean;
+    beforeTagIds: number[];
+    afterTagIds: number[];
+    decisions: CandidateDecision[];
+  }> = [];
   const createdTags: LinkTag[] = [];
-  if (!input.dryRun && input.createMissingTags) {
-    for (const missingName of missingRelevantForWrite) {
-      const created = await client.createTag(missingName);
-      createdTags.push(created);
-      tagsByNormalizedName.set(normalizeTagName(created.name), created);
-    }
-  }
+  const reusedTagIds = new Set<number>();
+  const aliasUpdates = new Map<string, { canonicalTagId: number; confidence: number }>();
+  const candidateSupportBumps = new Map<string, number>();
+  const failures: Array<{ itemId: number; code: string; message: string; retryable: boolean }> = [];
 
-  const selectedTags = [...existingResolvedTags, ...createdTags];
-  const selectedTagIds = normalizeTagIds(selectedTags.map((tag) => tag.id));
-  const knownTagNamesById = new Map<number, string>();
-  for (const tag of tagsBefore) {
-    knownTagNamesById.set(tag.id, tag.name);
-  }
-  for (const tag of createdTags) {
-    knownTagNamesById.set(tag.id, tag.name);
-  }
+  let skippedByPolicy = 0;
+  let skippedByBudget = 0;
+  let skippedByLimit = 0;
+  let totalSuggested = 0;
+  let createdThisRun = 0;
+  const createdByNormalized = new Map<string, LinkTag>();
 
-  const links = await Promise.all(input.linkIds.map((linkId) => client.getLink(linkId)));
-  const preview = links.map((link) => {
-    const currentTagIds = normalizeTagIds(link.tags.map((tag) => tag.id));
-    const nextTagIds = computeBulkTagResult(currentTagIds, selectedTagIds, input.mode);
+  for (const link of resolved.links) {
+    const ranked = perLinkRanked.get(link.id) ?? [];
+    const decisions: CandidateDecision[] = [];
+    const proposedTagIds: number[] = [];
 
-    return {
-      linkId: link.id,
-      before: {
-        tagIds: currentTagIds,
-        tagNames: mapTagIdsToNames(currentTagIds, knownTagNamesById)
-      },
-      after: {
-        tagIds: nextTagIds,
-        tagNames: mapTagIdsToNames(nextTagIds, knownTagNamesById)
-      }
-    };
-  });
-
-  if (input.dryRun) {
-    return mcpResult({
-      dryRun: true,
-      mode: input.mode,
-      summary: {
-        total: input.linkIds.length,
-        changes: preview.filter((item) => JSON.stringify(item.before.tagIds) !== JSON.stringify(item.after.tagIds)).length,
-        existingResolvedTags: existingResolvedTags.length,
-        missingTags: missingRelevantForWrite.length,
-        wouldCreateTags: input.createMissingTags ? missingRelevantForWrite.length : 0
-      },
-      requestedTagNames,
-      existingTags: existingResolvedTags,
-      missingTags: missingRelevantForWrite,
-      preview: preview.slice(0, input.previewLimit)
-    });
-  }
-
-  const failures: Array<{ linkId: number; message: string }> = [];
-  let applied = 0;
-
-  for (const item of preview) {
-    try {
-      await client.updateLink(item.linkId, { tagIds: item.after.tagIds });
-      applied += 1;
-    } catch (error) {
-      failures.push({
-        linkId: item.linkId,
-        message: error instanceof Error ? error.message : 'tag assignment failed'
-      });
-    }
-  }
-
-  context.db.insertAudit({
-    actor: context.actor,
-    toolName: 'linkwarden_assign_tags',
-    targetType: 'link',
-    targetIds: input.linkIds,
-    beforeSummary: 'tag assignment preview snapshot',
-    afterSummary: JSON.stringify({
-      mode: input.mode,
-      requestedTagNames,
-      selectedTagIds,
-      createdTagIds: createdTags.map((tag) => tag.id)
-    }),
-    outcome: failures.length === 0 ? 'success' : 'failed',
-    details: withActorDetails(context, {
-      applied,
-      failures: failures.length
-    })
-  });
-
-  return mcpResult({
-    dryRun: false,
-    mode: input.mode,
-    requestedTagNames,
-    createdTags,
-    applied,
-    failures,
-    preview: preview.slice(0, input.previewLimit)
-  });
-}
-
-// This function handles linkwarden_get_link and returns bounded details for one link id.
-async function handleGetLink(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = getLinkSchema.parse(args);
-  const client = getClient(context);
-  const link = await client.getLink(input.id);
-
-  return mcpResult({
-    link
-  });
-}
-
-// This helper creates scope-limited link sets for planning operations.
-async function loadScopeLinks(context: ToolRuntimeContext, scope: PlanScope | undefined): Promise<LinkItem[]> {
-  const client = getClient(context);
-  return client.loadLinksForScope(scope);
-}
-
-// This function handles linkwarden_plan_reorg by persisting a dry-run plan with preview and warnings.
-async function handlePlanReorg(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = planReorgSchema.parse(args);
-  context.logger.info(
-    {
-      event: 'tool_plan_reorg_started',
-      strategy: input.strategy,
-      previewLimit: input.previewLimit,
-      scope: sanitizeForLog(input.scope)
-    },
-    'tool_plan_reorg_started'
-  );
-
-  const links = await loadScopeLinks(context, input.scope);
-  const computation = computeReorgPlan(input.strategy, input.parameters, links);
-  const ttlHours = context.configStore.getRuntimeConfig().planTtlHours;
-  const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000).toISOString();
-  const planId = randomUUID();
-
-  context.db.createPlan({
-    planId,
-    strategy: input.strategy,
-    parameters: input.parameters,
-    scope: input.scope,
-    summary: computation.summary,
-    warnings: computation.warnings,
-    items: computation.items,
-    createdBy: context.actor,
-    expiresAt
-  });
-
-  context.logger.info(
-    {
-      event: 'tool_plan_reorg_created',
-      planId,
-      expiresAt,
-      scanned: computation.summary.scanned,
-      changes: computation.summary.changes,
-      warnings: computation.warnings.length
-    },
-    'tool_plan_reorg_created'
-  );
-
-  return mcpResult({
-    plan_id: planId,
-    expires_at: expiresAt,
-    summary: computation.summary,
-    warnings: computation.warnings,
-    preview: computation.items.slice(0, input.previewLimit)
-  });
-}
-
-// This function handles linkwarden_apply_plan with confirm gate, expiry checks, and write auditing.
-async function handleApplyPlan(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = applyPlanSchema.parse(args);
-  assertWriteAccess(context);
-  context.logger.info(
-    {
-      event: 'tool_apply_plan_started',
-      planId: input.plan_id,
-      actor: context.actor
-    },
-    'tool_apply_plan_started'
-  );
-
-  const planData = context.db.getPlanWithItems(input.plan_id);
-  if (!planData) {
-    context.logger.warn(
-      {
-        event: 'tool_apply_plan_not_found',
-        planId: input.plan_id
-      },
-      'tool_apply_plan_not_found'
-    );
-    throw new AppError(404, 'plan_not_found', `Plan ${input.plan_id} not found.`);
-  }
-
-  if (planData.plan.status !== 'draft') {
-    context.logger.warn(
-      {
-        event: 'tool_apply_plan_invalid_status',
-        planId: input.plan_id,
-        status: planData.plan.status
-      },
-      'tool_apply_plan_invalid_status'
-    );
-    throw new AppError(409, 'plan_not_applicable', `Plan status is ${planData.plan.status}, expected draft.`);
-  }
-
-  if (new Date(planData.plan.expiresAt).getTime() < Date.now()) {
-    context.db.updatePlanStatus(input.plan_id, 'expired');
-    context.logger.warn(
-      {
-        event: 'tool_apply_plan_expired',
-        planId: input.plan_id,
-        expiresAt: planData.plan.expiresAt
-      },
-      'tool_apply_plan_expired'
-    );
-    throw new AppError(409, 'plan_expired', 'Plan is expired and can no longer be applied.');
-  }
-
-  const client = getClient(context);
-  const runId = context.db.createPlanRun(input.plan_id);
-  const failures: Array<{ linkId: number; message: string }> = [];
-  let applied = 0;
-
-  try {
-    const grouped = new Map<string, { linkIds: number[]; tagIds?: number[]; collectionId?: number | null }>();
-
-    for (const item of planData.items) {
-      const after = readAfterState(item);
-      const key = JSON.stringify(after);
-      const group = grouped.get(key) ?? {
-        linkIds: [],
-        tagIds: after.tagIds,
-        collectionId: after.collectionId
-      };
-      group.linkIds.push(item.linkId);
-      grouped.set(key, group);
-    }
-
-    for (const [, group] of grouped) {
-      const updates: Record<string, unknown> = {};
-      if (group.tagIds) {
-        updates.tagIds = group.tagIds;
-      }
-      if (group.collectionId !== undefined) {
-        updates.collectionId = group.collectionId;
-      }
-
-      // This guard ensures native update calls are only sent for groups with real write fields.
-      if (Object.keys(updates).length === 0) {
+    for (const candidate of ranked) {
+      totalSuggested += 1;
+      const token = candidate.token;
+      if (blockedSet.has(token)) {
+        skippedByPolicy += 1;
+        decisions.push({
+          candidate: token,
+          confidence: candidate.confidence,
+          action: 'skip_policy',
+          reason: 'blocked_by_policy',
+          tagId: null
+        });
+        candidateSupportBumps.set(token, (candidateSupportBumps.get(token) ?? 0) + 1);
         continue;
       }
 
-      for (const linkId of group.linkIds) {
-        try {
-          await client.updateLink(linkId, updates);
-          applied += 1;
+      const exactTag = tagsByNormalized.get(token);
+      if (exactTag) {
+        reusedTagIds.add(exactTag.id);
+        proposedTagIds.push(exactTag.id);
+        decisions.push({
+          candidate: token,
+          confidence: candidate.confidence,
+          action: 'reuse_exact',
+          reason: 'matched_existing_tag',
+          tagId: exactTag.id
+        });
+        continue;
+      }
 
-          context.db.insertAudit({
-            actor: context.actor,
-            toolName: 'linkwarden_apply_plan',
-            targetType: 'link',
-            targetIds: [linkId],
-            beforeSummary: 'plan-item-snapshot',
-            afterSummary: JSON.stringify(updates),
-            outcome: 'success',
-            details: withActorDetails(context, {
-              planId: input.plan_id,
-              mode: 'native-single-update'
-            })
+      const aliasMatch = aliasesByNormalized.get(token);
+      if (aliasMatch) {
+        const canonical = tagsById.get(aliasMatch.canonicalTagId);
+        if (canonical) {
+          reusedTagIds.add(canonical.id);
+          proposedTagIds.push(canonical.id);
+          decisions.push({
+            candidate: token,
+            confidence: candidate.confidence,
+            action: 'reuse_alias',
+            reason: 'matched_alias',
+            tagId: canonical.id
           });
+          continue;
+        }
+      }
+
+      const similar = findSimilarTagMatch(token, allTags, globalPolicy.similarityThreshold);
+      if (similar) {
+        reusedTagIds.add(similar.tag.id);
+        proposedTagIds.push(similar.tag.id);
+        decisions.push({
+          candidate: token,
+          confidence: candidate.confidence,
+          action: 'reuse_similar',
+          reason: `similarity_${similar.score.toFixed(2)}`,
+          tagId: similar.tag.id
+        });
+        aliasUpdates.set(token, {
+          canonicalTagId: similar.tag.id,
+          confidence: similar.score
+        });
+        continue;
+      }
+
+      const persistedSupport = supportPersisted.get(token) ?? 0;
+      const runSupport = supportInRun.get(token) ?? 0;
+      const totalSupport = persistedSupport + runSupport;
+      if (candidate.confidence < strictnessPreset.minConfidence || totalSupport < strictnessPreset.minSupport) {
+        skippedByPolicy += 1;
+        decisions.push({
+          candidate: token,
+          confidence: candidate.confidence,
+          action: 'skip_policy',
+          reason:
+            candidate.confidence < strictnessPreset.minConfidence
+              ? 'below_confidence_threshold'
+              : `support_${totalSupport}_below_${strictnessPreset.minSupport}`,
+          tagId: null
+        });
+        candidateSupportBumps.set(token, (candidateSupportBumps.get(token) ?? 0) + 1);
+        continue;
+      }
+
+      if (!createdByNormalized.has(token) && !tagsByNormalized.has(token)) {
+        if (createdThisRun >= strictnessPreset.maxNewTagsPerRun) {
+          skippedByBudget += 1;
+          decisions.push({
+            candidate: token,
+            confidence: candidate.confidence,
+            action: 'skip_budget',
+            reason: 'max_new_tags_per_run_reached',
+            tagId: null
+          });
+          candidateSupportBumps.set(token, (candidateSupportBumps.get(token) ?? 0) + 1);
+          continue;
+        }
+
+        if (!input.dryRun) {
+          try {
+            const created = await client.createTag(token);
+            createdThisRun += 1;
+            createdByNormalized.set(token, created);
+            tagsByNormalized.set(token, created);
+            tagsById.set(created.id, created);
+            allTags.push(created);
+            createdTags.push(created);
+          } catch (error) {
+            failures.push({
+              itemId: link.id,
+              code: 'governed_create_tag_failed',
+              message: error instanceof Error ? error.message : 'governed create tag failed',
+              retryable: true
+            });
+            decisions.push({
+              candidate: token,
+              confidence: candidate.confidence,
+              action: 'skip_policy',
+              reason: 'create_tag_failed',
+              tagId: null
+            });
+            continue;
+          }
+        } else {
+          createdThisRun += 1;
+          const simulatedId = -createdThisRun;
+          const simulatedTag: LinkTag = { id: simulatedId, name: token };
+          createdByNormalized.set(token, simulatedTag);
+          createdTags.push(simulatedTag);
+        }
+      }
+
+      const createdTag = createdByNormalized.get(token) ?? tagsByNormalized.get(token) ?? null;
+      if (!createdTag) {
+        skippedByPolicy += 1;
+        decisions.push({
+          candidate: token,
+          confidence: candidate.confidence,
+          action: 'skip_policy',
+          reason: 'created_tag_missing_after_create',
+          tagId: null
+        });
+        continue;
+      }
+
+      proposedTagIds.push(createdTag.id);
+      decisions.push({
+        candidate: token,
+        confidence: candidate.confidence,
+        action: 'create',
+        reason: 'created_under_policy',
+        tagId: createdTag.id
+      });
+      candidateSupportBumps.set(token, (candidateSupportBumps.get(token) ?? 0) + 1);
+    }
+
+    const beforeTagIds = normalizeTagIds(link.tags.map((tag) => tag.id));
+    const merged = appendTagIdsWithLimit(beforeTagIds, normalizeTagIds(proposedTagIds), strictnessPreset.maxTagsPerLink);
+    skippedByLimit += merged.skipped;
+
+    if (merged.skipped > 0) {
+      decisions.push({
+        candidate: '__limit__',
+        confidence: 1,
+        action: 'skip_limit',
+        reason: 'max_tags_per_link_reached',
+        tagId: null
+      });
+    }
+
+    preview.push({
+      linkId: link.id,
+      fetchedContext: Boolean(perLinkFetched.get(link.id)),
+      beforeTagIds,
+      afterTagIds: merged.after,
+      decisions
+    });
+  }
+
+  const changedItems = preview.filter(
+    (item) => JSON.stringify(item.beforeTagIds) !== JSON.stringify(item.afterTagIds)
+  );
+
+  if (input.dryRun) {
+    return ok(
+      {
+        operationId: null,
+        policy: {
+          strictness: userSettings.taggingStrictness,
+          fetchMode: effectiveFetchMode,
+          allowUserFetchModeOverride: globalPolicy.allowUserFetchModeOverride,
+          inferenceProvider: globalPolicy.inferenceProvider,
+          inferenceModel: globalPolicy.inferenceModel
+        },
+        preview: preview.slice(0, input.previewLimit),
+        createdTags: createdTags.map((tag) => ({
+          name: tag.name
+        })),
+        reusedTags: [...reusedTagIds].sort((left, right) => left - right)
+      },
+      {
+        summary: {
+          scanned: resolved.links.length,
+          suggested: totalSuggested,
+          assigned: changedItems.length,
+          created: createdTags.length,
+          skippedByPolicy,
+          skippedByBudget,
+          skippedByLimit,
+          applied: 0
+        },
+        failures
+      }
+    );
+  }
+
+  return withIdempotency(
+    context,
+    'linkwarden_governed_tag_links',
+    input.idempotencyKey,
+    {
+      selector: input.selector,
+      linkIds: input.linkIds,
+      dryRun: false
+    },
+    async () => {
+      const operationId = beginOperation(context, 'linkwarden_governed_tag_links', {
+        scanned: resolved.links.length,
+        changed: changedItems.length,
+        strictness: userSettings.taggingStrictness,
+        fetchMode: effectiveFetchMode,
+        inferenceProvider: globalPolicy.inferenceProvider,
+        inferenceModel: globalPolicy.inferenceModel
+      });
+      const byLink = new Map<number, LinkItem>(resolved.links.map((link) => [link.id, link]));
+      const operationItems: Array<{ itemType: string; itemId: number; before: Record<string, unknown>; after: Record<string, unknown> }> =
+        [];
+      let applied = 0;
+
+      for (const item of changedItems) {
+        const link = byLink.get(item.linkId);
+        if (!link) {
+          continue;
+        }
+        const before = snapshotForUndo(link);
+        const after = {
+          ...before,
+          tagIds: item.afterTagIds
+        };
+        try {
+          await client.updateLink(item.linkId, { tagIds: item.afterTagIds });
+          operationItems.push({
+            itemType: 'link',
+            itemId: item.linkId,
+            before,
+            after
+          });
+          applied += 1;
         } catch (error) {
           failures.push({
-            linkId,
-            message: error instanceof Error ? error.message : 'link update failed'
-          });
-
-          context.db.insertAudit({
-            actor: context.actor,
-            toolName: 'linkwarden_apply_plan',
-            targetType: 'link',
-            targetIds: [linkId],
-            beforeSummary: 'plan-item-snapshot',
-            afterSummary: 'single patch failed',
-            outcome: 'failed',
-            details: withActorDetails(context, {
-              planId: input.plan_id,
-              mode: 'native-single-update',
-              error: error instanceof Error ? error.message : 'unknown'
-            })
+            itemId: item.linkId,
+            code: 'governed_assign_failed',
+            message: error instanceof Error ? error.message : 'governed assign failed',
+            retryable: true
           });
         }
       }
-    }
 
-    if (failures.length === 0) {
-      context.db.updatePlanStatus(input.plan_id, 'applied');
-      context.db.finishPlanRun(runId, 'success', { applied, failures: [] });
-    } else {
-      context.db.updatePlanStatus(input.plan_id, 'failed');
-      context.db.finishPlanRun(runId, 'failed', { applied, failures });
-    }
-
-    context.logger.info(
-      {
-        event: 'tool_apply_plan_completed',
-        planId: input.plan_id,
-        applied,
-        failures: failures.length
-      },
-      'tool_apply_plan_completed'
-    );
-
-    return mcpResult({
-      plan_id: input.plan_id,
-      applied,
-      failures
-    });
-  } catch (error) {
-    context.db.finishPlanRun(runId, 'failed', {
-      applied,
-      failures,
-      fatalError: error instanceof Error ? error.message : 'unknown'
-    });
-
-    context.logger.error(
-      {
-        event: 'tool_apply_plan_failed',
-        planId: input.plan_id,
-        applied,
-        failures: failures.length,
-        error: errorForLog(error)
-      },
-      'tool_apply_plan_failed'
-    );
-
-    throw error;
-  }
-}
-
-// This function handles linkwarden_update_link with write mode guard and audit logging.
-async function handleUpdateLink(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = updateLinkSchema.parse(args);
-  assertWriteAccess(context);
-
-  const client = getClient(context);
-  const before = await client.getLink(input.id);
-  const updates = {
-    ...input.updates,
-    tagIds: input.updates.tagIds ? normalizeTagIds(input.updates.tagIds) : input.updates.tagIds
-  };
-
-  const updated = await client.updateLink(input.id, updates);
-
-  context.db.insertAudit({
-    actor: context.actor,
-    toolName: 'linkwarden_update_link',
-    targetType: 'link',
-    targetIds: [input.id],
-    beforeSummary: JSON.stringify({
-      title: before.title,
-      collectionId: before.collection?.id ?? null,
-      tagIds: before.tags.map((tag) => tag.id)
-    }),
-    afterSummary: JSON.stringify({
-      title: updated.title,
-      collectionId: updated.collection?.id ?? null,
-      tagIds: updated.tags.map((tag) => tag.id)
-    }),
-    outcome: 'success',
-    details: withActorDetails(context)
-  });
-
-  return mcpResult({
-    updated: {
-      id: updated.id,
-      title: updated.title,
-      url: updated.url,
-      collection: updated.collection,
-      tags: updated.tags,
-      archived: updated.archived,
-      pinned: updated.pinned,
-      updatedAt: updated.updatedAt
-    }
-  });
-}
-
-// This function assigns or clears one collection for multiple links with deterministic preview support.
-async function handleSetLinksCollection(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = setLinksCollectionSchema.parse(args);
-  const client = getClient(context);
-  if (typeof input.collectionId === 'number') {
-    const collections = await client.listAllCollections();
-    const targetExists = collections.some((collection) => collection.id === input.collectionId);
-    if (!targetExists) {
-      throw new AppError(404, 'collection_not_found', `Collection ${input.collectionId} was not found.`);
-    }
-  }
-  const links = await Promise.all(input.linkIds.map((linkId) => client.getLink(linkId)));
-  const preview = links.map((link) => ({
-    linkId: link.id,
-    before: {
-      collectionId: link.collection?.id ?? null
-    },
-    after: {
-      collectionId: input.collectionId
-    }
-  }));
-  const changes = preview.filter((item) => item.before.collectionId !== item.after.collectionId);
-
-  if (input.dryRun) {
-    return mcpResult({
-      dryRun: true,
-      summary: {
-        total: input.linkIds.length,
-        changes: changes.length
-      },
-      preview: preview.slice(0, input.previewLimit)
-    });
-  }
-
-  assertWriteAccess(context);
-
-  let applied = 0;
-  const failures: Array<{ linkId: number; message: string }> = [];
-  for (const change of changes) {
-    try {
-      await client.updateLink(change.linkId, {
-        collectionId: input.collectionId
-      });
-      applied += 1;
-    } catch (error) {
-      failures.push({
-        linkId: change.linkId,
-        message: error instanceof Error ? error.message : 'collection update failed'
-      });
-    }
-  }
-
-  context.db.insertAudit({
-    actor: context.actor,
-    toolName: 'linkwarden_set_links_collection',
-    targetType: 'link',
-    targetIds: input.linkIds,
-    beforeSummary: 'collection assignment preview snapshot',
-    afterSummary: JSON.stringify({
-      collectionId: input.collectionId,
-      requested: input.linkIds.length,
-      changed: changes.length
-    }),
-    outcome: failures.length === 0 ? 'success' : 'failed',
-    details: withActorDetails(context, {
-      applied,
-      failures: failures.length
-    })
-  });
-
-  return mcpResult({
-    dryRun: false,
-    summary: {
-      total: input.linkIds.length,
-      changes: changes.length,
-      applied,
-      failures: failures.length
-    },
-    failures
-  });
-}
-
-// This function pins or unpins multiple links using Linkwarden's native pinnedBy relation semantics.
-async function handleSetLinksPinned(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = setLinksPinnedSchema.parse(args);
-  const client = getClient(context);
-  const links = await Promise.all(input.linkIds.map((linkId) => client.getLink(linkId)));
-  const preview = links.map((link) => ({
-    linkId: link.id,
-    before: {
-      pinned: Boolean(link.pinned)
-    },
-    after: {
-      pinned: input.pinned
-    }
-  }));
-  const changes = preview.filter((item) => item.before.pinned !== item.after.pinned);
-
-  if (input.dryRun) {
-    return mcpResult({
-      dryRun: true,
-      summary: {
-        total: input.linkIds.length,
-        changes: changes.length,
-        pinned: input.pinned
-      },
-      preview: preview.slice(0, input.previewLimit)
-    });
-  }
-
-  assertWriteAccess(context);
-
-  let applied = 0;
-  const failures: Array<{ linkId: number; message: string }> = [];
-  for (const change of changes) {
-    try {
-      await client.setLinkPinned(change.linkId, input.pinned);
-      applied += 1;
-    } catch (error) {
-      failures.push({
-        linkId: change.linkId,
-        message: error instanceof Error ? error.message : 'pin update failed'
-      });
-    }
-  }
-
-  context.db.insertAudit({
-    actor: context.actor,
-    toolName: 'linkwarden_set_links_pinned',
-    targetType: 'link',
-    targetIds: input.linkIds,
-    beforeSummary: 'pin assignment preview snapshot',
-    afterSummary: JSON.stringify({
-      pinned: input.pinned,
-      requested: input.linkIds.length,
-      changed: changes.length
-    }),
-    outcome: failures.length === 0 ? 'success' : 'failed',
-    details: withActorDetails(context, {
-      applied,
-      failures: failures.length
-    })
-  });
-
-  return mcpResult({
-    dryRun: false,
-    summary: {
-      total: input.linkIds.length,
-      changes: changes.length,
-      applied,
-      failures: failures.length,
-      pinned: input.pinned
-    },
-    failures
-  });
-}
-
-// This function handles linkwarden_bulk_update_links with dry-run preview and optional apply.
-async function handleBulkUpdate(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = bulkUpdateSchema.parse(args);
-  context.logger.info(
-    {
-      event: 'tool_bulk_update_started',
-      dryRun: input.dryRun,
-      mode: input.mode,
-      linkCount: input.linkIds.length
-    },
-    'tool_bulk_update_started'
-  );
-  const client = getClient(context);
-
-  const sampledLinks = await Promise.all(input.linkIds.map((linkId) => client.getLink(linkId)));
-
-  const preview = sampledLinks.map((link) => {
-    const currentTags = link.tags.map((tag) => tag.id);
-    const nextTags = computeBulkTagResult(currentTags, input.updates.tagIds, input.mode);
-    const hasCollectionUpdate = Object.prototype.hasOwnProperty.call(input.updates, 'collectionId');
-
-    return {
-      linkId: link.id,
-      before: {
-        collectionId: link.collection?.id ?? null,
-        tagIds: currentTags
-      },
-      after: {
-        collectionId: hasCollectionUpdate ? input.updates.collectionId ?? null : link.collection?.id ?? null,
-        tagIds: nextTags
+      for (const [candidate, alias] of aliasUpdates.entries()) {
+        context.db.upsertTagAlias({
+          userId: context.principal.userId,
+          canonicalTagId: alias.canonicalTagId,
+          aliasNormalized: candidate,
+          confidence: alias.confidence
+        });
       }
-    };
-  });
 
-  if (input.dryRun) {
-    context.logger.info(
-      {
-        event: 'tool_bulk_update_dry_run_completed',
-        linkCount: input.linkIds.length,
-        previewCount: preview.length
-      },
-      'tool_bulk_update_dry_run_completed'
-    );
-    return mcpResult({
-      dryRun: true,
-      summary: {
-        total: input.linkIds.length,
-        changes: preview.length
-      },
-      preview: preview.slice(0, input.previewLimit)
-    });
-  }
-
-  assertWriteAccess(context);
-
-  const failures: Array<{ linkId: number; message: string }> = [];
-  let applied = 0;
-
-  for (const link of sampledLinks) {
-    const currentTags = link.tags.map((tag) => tag.id);
-    const nextTags = computeBulkTagResult(currentTags, input.updates.tagIds, input.mode);
-    const updates: Record<string, unknown> = {};
-    const hasCollectionUpdate = Object.prototype.hasOwnProperty.call(input.updates, 'collectionId');
-
-    // This condition keeps native writes collection-neutral when callers do not request collection changes.
-    if (hasCollectionUpdate) {
-      updates.collectionId = input.updates.collectionId ?? null;
-    }
-
-    // This condition keeps native writes tag-neutral when callers only change collections.
-    if (input.updates.tagIds) {
-      updates.tagIds = nextTags;
-    }
-
-    try {
-      await client.updateLink(link.id, updates);
-      applied += 1;
-    } catch (error) {
-      failures.push({
-        linkId: link.id,
-        message: error instanceof Error ? error.message : 'update failed'
-      });
-    }
-  }
-
-  context.db.insertAudit({
-    actor: context.actor,
-    toolName: 'linkwarden_bulk_update_links',
-    targetType: 'link',
-    targetIds: input.linkIds,
-    beforeSummary: 'bulk preview snapshot',
-    afterSummary: JSON.stringify({
-      mode: input.mode,
-      updates: input.updates
-    }),
-    outcome: failures.length === 0 ? 'success' : 'failed',
-    details: withActorDetails(context, {
-      applied,
-      failuresCount: failures.length
-    })
-  });
-
-  return mcpResult({
-    dryRun: false,
-    applied,
-    failures
-  });
-}
-
-// This function removes tracking parameters from URLs and can apply cleaned URLs back to Linkwarden.
-async function handleCleanLinkUrls(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = cleanLinkUrlsSchema.parse(args);
-  const client = getClient(context);
-  const resolvedLinks = await Promise.all(
-    input.linkIds.map(async (linkId) => {
-      try {
-        const link = await client.getLink(linkId);
-        return {
-          linkId,
-          link,
-          error: null as string | null
-        };
-      } catch (error) {
-        return {
-          linkId,
-          link: null as LinkItem | null,
-          error: error instanceof Error ? error.message : 'link lookup failed'
-        };
+      for (const [candidate, delta] of candidateSupportBumps.entries()) {
+        context.db.bumpTagCandidateSupport({
+          userId: context.principal.userId,
+          candidateNormalized: candidate,
+          delta
+        });
       }
-    })
-  );
 
-  const accessibleLinks = resolvedLinks
-    .filter((item): item is { linkId: number; link: LinkItem; error: null } => item.link !== null)
-    .map((item) => item.link);
-  const skipped = resolvedLinks
-    .filter((item) => item.link === null)
-    .map((item) => ({
-      linkId: item.linkId,
-      message: item.error ?? 'link lookup failed'
-    }));
-
-  const preview = accessibleLinks.map((link) => {
-    try {
-      const cleaned = cleanTrackedUrl(link.url, {
-        removeUtm: input.removeUtm,
-        removeKnownTracking: input.removeKnownTracking,
-        keepParams: input.keepParams,
-        extraTrackingParams: input.extraTrackingParams
+      context.db.insertOperationItems(operationId, operationItems);
+      context.db.insertAudit({
+        actor: context.actor,
+        toolName: 'linkwarden_governed_tag_links',
+        targetType: 'link',
+        targetIds: changedItems.map((item) => item.linkId),
+        beforeSummary: 'governed tagging preview',
+        afterSummary: JSON.stringify({
+          strictness: userSettings.taggingStrictness,
+          fetchMode: effectiveFetchMode,
+          inferenceProvider: globalPolicy.inferenceProvider,
+          inferenceModel: globalPolicy.inferenceModel
+        }),
+        outcome: failures.length === 0 ? 'success' : 'failed',
+        details: {
+          userId: context.principal.userId,
+          operationId,
+          applied,
+          failures: failures.length
+        }
       });
 
       return {
-        linkId: link.id,
-        beforeUrl: link.url,
-        afterUrl: cleaned.cleanedUrl,
-        changed: cleaned.changed,
-        removedParams: cleaned.removedParams,
-        error: null as string | null
-      };
-    } catch (error) {
-      return {
-        linkId: link.id,
-        beforeUrl: link.url,
-        afterUrl: link.url,
-        changed: false,
-        removedParams: [] as string[],
-        error: error instanceof Error ? error.message : 'invalid url'
+        ok: true,
+        data: {
+          operationId,
+          policy: {
+            strictness: userSettings.taggingStrictness,
+            fetchMode: effectiveFetchMode,
+            allowUserFetchModeOverride: globalPolicy.allowUserFetchModeOverride,
+            inferenceProvider: globalPolicy.inferenceProvider,
+            inferenceModel: globalPolicy.inferenceModel
+          },
+          preview: preview.slice(0, input.previewLimit),
+          createdTags,
+          reusedTags: [...reusedTagIds].sort((left, right) => left - right)
+        },
+        summary: {
+          scanned: resolved.links.length,
+          suggested: totalSuggested,
+          assigned: changedItems.length,
+          created: createdTags.length,
+          skippedByPolicy,
+          skippedByBudget,
+          skippedByLimit,
+          applied
+        },
+        paging: null,
+        warnings: [],
+        failures
       };
     }
-  });
+  );
+}
 
-  const changed = preview.filter((item) => item.changed && item.error === null);
-  const invalid = preview.filter((item) => item.error !== null);
-
-  if (input.dryRun) {
-    return mcpResult({
-      dryRun: true,
-      summary: {
-        total: input.linkIds.length,
-        accessible: accessibleLinks.length,
-        changed: changed.length,
-        invalid: invalid.length,
-        skipped: skipped.length
-      },
-      preview: preview.slice(0, input.previewLimit),
-      skipped
-    });
-  }
-
-  assertWriteAccess(context);
-
-  let applied = 0;
-  const failures: Array<{ linkId: number; message: string }> = [];
-  for (const item of changed) {
-    try {
-      await client.updateLink(item.linkId, {
-        url: item.afterUrl
-      });
-      applied += 1;
-    } catch (error) {
-      failures.push({
-        linkId: item.linkId,
-        message: error instanceof Error ? error.message : 'url update failed'
-      });
-    }
-  }
-
-  context.db.insertAudit({
-    actor: context.actor,
-    toolName: 'linkwarden_clean_link_urls',
-    targetType: 'link',
-    targetIds: input.linkIds,
-    beforeSummary: 'url cleanup preview snapshot',
-    afterSummary: JSON.stringify({
+// This function handles linkwarden_normalize_urls with dry-run and apply paths.
+async function handleNormalizeUrls(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = normalizeUrlsSchema.parse(args);
+  const resolved = await resolveLinks(context, input.selector, input.linkIds);
+  const preview = resolved.links.map((link) => {
+    const cleaned = cleanTrackedUrl(link.url, {
       removeUtm: input.removeUtm,
       removeKnownTracking: input.removeKnownTracking,
       keepParams: input.keepParams,
       extraTrackingParams: input.extraTrackingParams
-    }),
-    outcome: failures.length === 0 ? 'success' : 'failed',
-    details: withActorDetails(context, {
-      accessible: accessibleLinks.length,
-      changed: changed.length,
-      applied,
-      invalid: invalid.length,
-      failures: failures.length,
-      skipped: skipped.length
-    })
+    });
+    return {
+      linkId: link.id,
+      beforeUrl: link.url,
+      afterUrl: cleaned.cleanedUrl,
+      changed: cleaned.changed,
+      removedParams: cleaned.removedParams
+    };
   });
 
-  return mcpResult({
-    dryRun: false,
-    summary: {
-      total: input.linkIds.length,
-      accessible: accessibleLinks.length,
-      changed: changed.length,
-      applied,
-      invalid: invalid.length,
-      failures: failures.length,
-      skipped: skipped.length
-    },
-    failures,
-    skipped,
-    preview: preview.slice(0, input.previewLimit)
-  });
-}
-
-// This function handles linkwarden_suggest_taxonomy as a pure analysis feature without writes.
-async function handleSuggestTaxonomy(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = suggestTaxonomySchema.parse(args);
-  const client = getClient(context);
-  const links = await client.loadLinksForScope({ query: input.query }, 100);
-  // This optional limit allows either full-corpus analysis or bounded sampling.
-  const subset = typeof input.limit === 'number' ? links.slice(0, input.limit) : links;
-  const stopwords = new Set(['https', 'http', 'www', 'com', 'net', 'org', 'und', 'der', 'die', 'das']);
-  const counts = new Map<string, number>();
-
-  for (const link of subset) {
-    const text = `${link.title} ${link.description ?? ''}`.toLowerCase();
-    const words = text
-      .replace(/[^a-z0-9\s]/g, ' ')
-      .split(/\s+/)
-      .map((word) => word.trim())
-      .filter((word) => word.length >= 4 && !stopwords.has(word));
-
-    for (const word of words) {
-      counts.set(word, (counts.get(word) ?? 0) + 1);
-    }
+  if (input.dryRun) {
+    return ok(
+      {
+        preview: preview.slice(0, input.previewLimit)
+      },
+      {
+        summary: {
+          total: preview.length,
+          changed: preview.filter((item) => item.changed).length,
+          applied: 0
+        }
+      }
+    );
   }
 
-  const suggestedTags = [...counts.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .slice(0, 15)
-    .map(([keyword, frequency]) => ({ keyword, frequency }));
+  assertWriteAccess(context);
+  const client = getClient(context);
+  return withIdempotency(
+    context,
+    'linkwarden_normalize_urls',
+    input.idempotencyKey,
+    {
+      selector: input.selector,
+      linkIds: input.linkIds,
+      removeUtm: input.removeUtm,
+      removeKnownTracking: input.removeKnownTracking,
+      keepParams: input.keepParams,
+      extraTrackingParams: input.extraTrackingParams
+    },
+    async () => {
+      const changed = preview.filter((item) => item.changed);
+      const operationId = beginOperation(context, 'linkwarden_normalize_urls', {
+        total: preview.length,
+        changed: changed.length
+      });
+      const byLink = new Map<number, LinkItem>(resolved.links.map((link) => [link.id, link]));
+      const failures: Array<{ itemId: number; code: string; message: string; retryable: boolean }> = [];
+      const operationItems: Array<{ itemType: string; itemId: number; before: Record<string, unknown>; after: Record<string, unknown> }> =
+        [];
+      let applied = 0;
 
-  return mcpResult({
-    analyzedLinks: subset.length,
-    suggestedTags,
-    note: 'This analysis is read-only and does not modify Linkwarden data.'
-  });
+      for (const item of changed) {
+        const link = byLink.get(item.linkId);
+        if (!link) {
+          continue;
+        }
+        const before = snapshotForUndo(link);
+        const after = {
+          ...before,
+          url: item.afterUrl
+        };
+        try {
+          await client.updateLink(item.linkId, { url: item.afterUrl });
+          operationItems.push({
+            itemType: 'link',
+            itemId: item.linkId,
+            before,
+            after
+          });
+          applied += 1;
+        } catch (error) {
+          failures.push({
+            itemId: item.linkId,
+            code: 'normalize_url_failed',
+            message: error instanceof Error ? error.message : 'normalize url failed',
+            retryable: true
+          });
+        }
+      }
+
+      context.db.insertOperationItems(operationId, operationItems);
+      context.db.insertAudit({
+        actor: context.actor,
+        toolName: 'linkwarden_normalize_urls',
+        targetType: 'link',
+        targetIds: changed.map((item) => item.linkId),
+        beforeSummary: 'normalize urls preview',
+        afterSummary: 'normalize urls apply',
+        outcome: failures.length === 0 ? 'success' : 'failed',
+        details: {
+          userId: context.principal.userId,
+          operationId,
+          applied,
+          failures: failures.length
+        }
+      });
+
+      return {
+        ok: true,
+        data: {
+          operationId,
+          preview: preview.slice(0, input.previewLimit)
+        },
+        summary: {
+          total: preview.length,
+          changed: changed.length,
+          applied
+        },
+        paging: null,
+        warnings: [],
+        failures
+      };
+    }
+  );
 }
 
-// This function extracts URLs from chat text and stores them under ChatGPT Chats > Chat Name.
-async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = captureChatLinksSchema.parse(args);
-  // This fallback keeps extraction unlimited when maxLinks is not provided by the caller.
-  const urls = extractUrlsFromText(input.text, input.maxLinks ?? Number.POSITIVE_INFINITY);
-  const client = getClient(context);
-  const collections = await client.listAllCollections();
-  const parent = findCollectionByNameAndParent(collections, input.parentCollectionName, null);
-  const child = parent ? findCollectionByNameAndParent(collections, input.chatName, parent.id) : undefined;
-
-  if (urls.length === 0) {
-    return mcpResult({
-      dryRun: input.dryRun,
+// This function handles linkwarden_find_duplicates with canonical URL grouping.
+async function handleFindDuplicates(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = findDuplicatesSchema.parse(args);
+  const resolved = await resolveLinks(context, input.selector, undefined);
+  const scoped = input.includeArchived ? resolved.links : resolved.links.filter((link) => !Boolean(link.archived));
+  const groups = groupDuplicates(scoped).slice(0, input.topN);
+  return ok(
+    {
+      groups: groups.map((group) => ({
+        canonicalUrl: group.canonicalUrl,
+        linkIds: group.links.map((link) => link.id),
+        size: group.links.length
+      }))
+    },
+    {
       summary: {
-        extracted: 0,
-        created: 0,
-        skippedDuplicate: 0,
-        failed: 0
-      },
-      target: {
-        parentCollectionName: input.parentCollectionName,
-        chatName: input.chatName,
-        parentCollectionId: parent?.id ?? null,
-        collectionId: child?.id ?? null
+        scanned: scoped.length,
+        duplicateGroups: groups.length
       }
+    }
+  );
+}
+
+// This helper resolves one duplicate-group keep id with deterministic fallback strategy.
+function resolveKeepId(group: { linkIds: number[]; keepId?: number }, strategy: 'lowestId' | 'highestId'): number {
+  if (typeof group.keepId === 'number' && group.linkIds.includes(group.keepId)) {
+    return group.keepId;
+  }
+  const sorted = [...group.linkIds].sort((left, right) => left - right);
+  return strategy === 'lowestId' ? sorted[0] : sorted[sorted.length - 1];
+}
+
+// This function handles linkwarden_merge_duplicates and supports dry-run plus soft/hard delete cleanup.
+async function handleMergeDuplicates(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = mergeDuplicatesSchema.parse(args);
+  const client = getClient(context);
+  const archiveCollection =
+    input.deleteMode === 'soft' ? await resolveArchiveCollection(client, input.archiveCollectionId) : null;
+  const markTag =
+    input.deleteMode === 'soft' ? await resolveTagIdsByName(client, [input.markTagName], true, input.dryRun) : null;
+  const markTagId = markTag?.tagIds[0];
+
+  const groupPreview: Array<{
+    canonicalUrl: string;
+    keepId: number;
+    mergeIds: number[];
+    resultingTagIds: number[];
+  }> = [];
+
+  for (const group of input.groups) {
+    const keepId = resolveKeepId(group, input.keepStrategy);
+    const mergeIds = group.linkIds.filter((id) => id !== keepId);
+    const links = await Promise.all(group.linkIds.map((id) => client.getLink(id)));
+    const keepLink = links.find((link) => link.id === keepId);
+    if (!keepLink) {
+      throw new AppError(404, 'link_not_found', `Keep link ${keepId} was not found.`);
+    }
+    const mergedTagIds = normalizeTagIds(links.flatMap((link) => link.tags.map((tag) => tag.id)));
+    groupPreview.push({
+      canonicalUrl: group.canonicalUrl,
+      keepId,
+      mergeIds,
+      resultingTagIds: mergedTagIds
     });
   }
 
   if (input.dryRun) {
-    return mcpResult({
-      dryRun: true,
-      summary: {
-        extracted: urls.length,
-        created: 0,
-        skippedDuplicate: 0,
-        failed: 0
+    return ok(
+      {
+        preview: groupPreview
       },
-      target: {
-        parentCollectionName: input.parentCollectionName,
-        chatName: input.chatName,
-        parentCollectionId: parent?.id ?? null,
-        collectionId: child?.id ?? null,
-        willCreateParent: !parent,
-        willCreateChild: !child
-      },
-      previewUrls: urls
-    });
+      {
+        summary: {
+          groups: groupPreview.length,
+          deleteMode: input.deleteMode
+        }
+      }
+    );
   }
 
   assertWriteAccess(context);
+  return withIdempotency(
+    context,
+    'linkwarden_merge_duplicates',
+    input.idempotencyKey,
+    {
+      groups: input.groups,
+      keepStrategy: input.keepStrategy,
+      deleteMode: input.deleteMode
+    },
+    async () => {
+      const operationId = beginOperation(context, 'linkwarden_merge_duplicates', {
+        groups: groupPreview.length,
+        deleteMode: input.deleteMode
+      });
+      const failures: Array<{ itemId: number; code: string; message: string; retryable: boolean }> = [];
+      const operationItems: Array<{ itemType: string; itemId: number; before: Record<string, unknown>; after: Record<string, unknown> }> =
+        [];
+      let applied = 0;
 
-  const path = await ensureCollectionPath(client, input.parentCollectionName, input.chatName);
-  const targetCollectionId = path.child.id;
-  const existingInCollection = input.dedupeByUrl ? await client.listLinksByCollection(targetCollectionId) : [];
-  const existingUrlSet = new Set(existingInCollection.map((link) => normalizeUrl(link.url)));
-  const created: Array<{ id: number; url: string; title: string }> = [];
-  const skipped: string[] = [];
-  const failed: Array<{ url: string; message: string }> = [];
+      for (const group of groupPreview) {
+        const keepLink = await client.getLink(group.keepId);
+        const beforeKeep = snapshotForUndo(keepLink);
+        const afterKeep = {
+          ...beforeKeep,
+          tagIds: group.resultingTagIds
+        };
+        try {
+          await client.updateLink(group.keepId, { tagIds: group.resultingTagIds });
+          operationItems.push({
+            itemType: 'link',
+            itemId: group.keepId,
+            before: beforeKeep,
+            after: afterKeep
+          });
+          applied += 1;
+        } catch (error) {
+          failures.push({
+            itemId: group.keepId,
+            code: 'merge_keep_update_failed',
+            message: error instanceof Error ? error.message : 'merge keep update failed',
+            retryable: true
+          });
+          continue;
+        }
 
-  for (const url of urls) {
-    const normalized = normalizeUrl(url);
-    if (input.dedupeByUrl && existingUrlSet.has(normalized)) {
-      skipped.push(url);
+        for (const mergeId of group.mergeIds) {
+          try {
+            const mergeLink = await client.getLink(mergeId);
+            const beforeMerge = snapshotForUndo(mergeLink);
+            if (input.deleteMode === 'hard') {
+              await client.deleteLink(mergeId);
+              operationItems.push({
+                itemType: 'link',
+                itemId: mergeId,
+                before: beforeMerge,
+                after: { deleted: true, mode: 'hard' }
+              });
+            } else {
+              const mergedTags =
+                typeof markTagId === 'number'
+                  ? computeNextTagIds(mergeLink.tags.map((tag) => tag.id), [markTagId], 'add')
+                  : mergeLink.tags.map((tag) => tag.id);
+              await client.updateLink(mergeId, {
+                collectionId: archiveCollection?.id,
+                tagIds: mergedTags,
+                archived: true
+              });
+              operationItems.push({
+                itemType: 'link',
+                itemId: mergeId,
+                before: beforeMerge,
+                after: {
+                  ...beforeMerge,
+                  collectionId: archiveCollection?.id ?? beforeMerge.collectionId,
+                  tagIds: mergedTags,
+                  archived: true
+                }
+              });
+            }
+            applied += 1;
+          } catch (error) {
+            failures.push({
+              itemId: mergeId,
+              code: 'merge_delete_failed',
+              message: error instanceof Error ? error.message : 'merge delete failed',
+              retryable: true
+            });
+          }
+        }
+      }
+
+      context.db.insertOperationItems(operationId, operationItems);
+      context.db.insertAudit({
+        actor: context.actor,
+        toolName: 'linkwarden_merge_duplicates',
+        targetType: 'link',
+        targetIds: groupPreview.flatMap((group) => [group.keepId, ...group.mergeIds]),
+        beforeSummary: 'merge duplicates preview',
+        afterSummary: JSON.stringify({
+          groups: groupPreview.length,
+          deleteMode: input.deleteMode
+        }),
+        outcome: failures.length === 0 ? 'success' : 'failed',
+        details: {
+          userId: context.principal.userId,
+          operationId,
+          applied,
+          failures: failures.length
+        }
+      });
+
+      return {
+        ok: true,
+        data: {
+          operationId,
+          preview: groupPreview
+        },
+        summary: {
+          groups: groupPreview.length,
+          applied
+        },
+        paging: null,
+        warnings: [],
+        failures
+      };
+    }
+  );
+}
+
+// This helper executes one rule action in dry-run or apply mode and returns deterministic result details.
+async function executeRuleAction(
+  context: ToolRuntimeContext,
+  rule: RuleRecord,
+  links: LinkItem[],
+  dryRun: boolean
+): Promise<{
+  applied: number;
+  failures: Array<{ itemId: number; code: string; message: string; retryable: boolean }>;
+  preview: Array<Record<string, unknown>>;
+}> {
+  const client = getClient(context);
+  const actionType = String(rule.action.type ?? 'none');
+  const preview: Array<Record<string, unknown>> = [];
+  const failures: Array<{ itemId: number; code: string; message: string; retryable: boolean }> = [];
+  let applied = 0;
+
+  for (const link of links) {
+    if (actionType === 'add-tags') {
+      const tagNames = Array.isArray(rule.action.tagNames) ? (rule.action.tagNames as string[]) : [];
+      const tags = await resolveTagIdsByName(client, tagNames, true, dryRun);
+      const nextTagIds = computeNextTagIds(link.tags.map((tag) => tag.id), tags.tagIds, 'add');
+      preview.push({
+        linkId: link.id,
+        action: actionType,
+        beforeTagIds: link.tags.map((tag) => tag.id),
+        afterTagIds: nextTagIds
+      });
+      if (!dryRun) {
+        try {
+          await client.updateLink(link.id, { tagIds: nextTagIds });
+          applied += 1;
+        } catch (error) {
+          failures.push({
+            itemId: link.id,
+            code: 'rule_add_tags_failed',
+            message: error instanceof Error ? error.message : 'rule add tags failed',
+            retryable: true
+          });
+        }
+      }
       continue;
     }
 
-    try {
-      const createdLink = await client.createLink({
-        url,
-        title: url,
-        collectionId: targetCollectionId
+    if (actionType === 'move-to-collection') {
+      const collectionId = Number(rule.action.collectionId);
+      preview.push({
+        linkId: link.id,
+        action: actionType,
+        beforeCollectionId: link.collection?.id ?? null,
+        afterCollectionId: collectionId
       });
-
-      created.push({
-        id: createdLink.id,
-        url: createdLink.url,
-        title: createdLink.title
-      });
-      existingUrlSet.add(normalized);
-    } catch (error) {
-      failed.push({
-        url,
-        message: error instanceof Error ? error.message : 'create failed'
-      });
-    }
-  }
-
-  if (created.length > 0) {
-    context.db.insertAudit({
-      actor: context.actor,
-      toolName: 'linkwarden_capture_chat_links',
-      targetType: 'link',
-      targetIds: created.map((item) => item.id),
-      beforeSummary: 'chat link extraction',
-      afterSummary: JSON.stringify({
-        collectionId: targetCollectionId,
-        created: created.length,
-        skipped: skipped.length
-      }),
-      outcome: failed.length === 0 ? 'success' : 'failed',
-      details: withActorDetails(context, {
-        parentCollectionId: path.parent.id,
-        collectionId: targetCollectionId,
-        createdCollections: path.created.map((collection) => collection.id),
-        failed
-      })
-    });
-  }
-
-  return mcpResult({
-    dryRun: false,
-    target: {
-      parentCollectionId: path.parent.id,
-      collectionId: targetCollectionId,
-      parentCollectionName: path.parent.name,
-      chatName: path.child.name,
-      createdCollections: path.created
-    },
-    summary: {
-      extracted: urls.length,
-      created: created.length,
-      skippedDuplicate: skipped.length,
-      failed: failed.length
-    },
-    created,
-    failed
-  });
-}
-
-// This function monitors link availability and applies per-user archive/delete policy when links stay offline.
-async function handleMonitorOfflineLinks(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = monitorOfflineLinksSchema.parse(args);
-  const client = getClient(context);
-  const settings = context.db.getUserSettings(context.principal.userId);
-  const resolvedOfflineDays = input.offlineDays ?? settings.offlineDays;
-  const resolvedMinConsecutiveFailures = input.minConsecutiveFailures ?? settings.offlineMinConsecutiveFailures;
-  const resolvedAction = input.action ?? settings.offlineAction;
-  const resolvedArchiveCollectionId = input.archiveCollectionId ?? settings.offlineArchiveCollectionId ?? undefined;
-  const loaded = await client.loadLinksForScopeDetailed(input.scope, 100);
-  const links = loaded.items;
-  // This paging window applies offset first so callers can scan the full corpus deterministically page by page.
-  const pagedLinks = links.slice(input.offset);
-  // This optional limit allows full scans by default while still supporting explicit bounded probes.
-  const sample = typeof input.limit === 'number' ? pagedLinks.slice(0, input.limit) : pagedLinks;
-  const previousStates = context.db.listLinkHealthStates(
-    context.principal.userId,
-    sample.map((link) => link.id)
-  );
-  const previousByLinkId = new Map<number, LinkHealthState>(previousStates.map((state) => [state.linkId, state]));
-  const now = Date.now();
-  const offlineThresholdMs = resolvedOfflineDays * 24 * 60 * 60 * 1000;
-  const checked: Array<{
-    linkId: number;
-    url: string;
-    status: 'up' | 'down';
-    httpStatus: number | null;
-    consecutiveFailures: number;
-    firstFailureAt: string | null;
-    eligibleForAction: boolean;
-    error: string | null;
-  }> = [];
-
-  for (const link of sample) {
-    const probe = await checkLinkAvailability(link.url, input.timeoutMs);
-    const checkedAtIso = new Date().toISOString();
-    const nextState = computeNextHealthState(
-      context.principal.userId,
-      link,
-      previousByLinkId.get(link.id),
-      probe,
-      checkedAtIso
-    );
-
-    context.db.upsertLinkHealthState(nextState);
-    previousByLinkId.set(link.id, nextState);
-
-    const isEligible =
-      nextState.lastStatus === 'down' &&
-      nextState.firstFailureAt !== null &&
-      now - new Date(nextState.firstFailureAt).getTime() >= offlineThresholdMs &&
-      nextState.consecutiveFailures >= resolvedMinConsecutiveFailures &&
-      nextState.archivedAt === null;
-
-    checked.push({
-      linkId: link.id,
-      url: link.url,
-      status: nextState.lastStatus,
-      httpStatus: nextState.lastHttpStatus,
-      consecutiveFailures: nextState.consecutiveFailures,
-      firstFailureAt: nextState.firstFailureAt,
-      eligibleForAction: isEligible,
-      error: nextState.lastError
-    });
-  }
-
-  const eligibleLinkIds = checked.filter((item) => item.eligibleForAction).map((item) => item.linkId);
-
-  if (input.dryRun) {
-    const payload: Record<string, unknown> = {
-      dryRun: true,
-      summary: {
-        scanned: sample.length,
-        up: checked.filter((item) => item.status === 'up').length,
-        down: checked.filter((item) => item.status === 'down').length,
-        eligibleForAction: eligibleLinkIds.length
-      },
-      policy: {
-        offlineDays: resolvedOfflineDays,
-        minConsecutiveFailures: resolvedMinConsecutiveFailures,
-        action: resolvedAction,
-        archiveCollectionId: resolvedArchiveCollectionId ?? null
-      },
-      paging: {
-        offset: input.offset,
-        limit: input.limit ?? null,
-        totalMatched: links.length
-      },
-      eligibleLinkIds,
-      checked
-    };
-
-    // This optional debug branch exposes scope-loading diagnostics for paging investigations.
-    if (input.debug) {
-      payload.debug = {
-        scopeLoad: loaded.diagnostics,
-        scopeWarning: loaded.warning ?? null
-      };
-    }
-
-    return mcpResult(payload);
-  }
-
-  assertWriteAccess(context);
-  if (resolvedAction === 'archive' && !resolvedArchiveCollectionId) {
-    throw new AppError(
-      400,
-      'validation_error',
-      'archiveCollectionId is required when policy action is archive and dryRun=false.'
-    );
-  }
-
-  if (eligibleLinkIds.length === 0 || resolvedAction === 'none') {
-    const payload: Record<string, unknown> = {
-      dryRun: false,
-      summary: {
-        scanned: sample.length,
-        up: checked.filter((item) => item.status === 'up').length,
-        down: checked.filter((item) => item.status === 'down').length,
-        action: resolvedAction,
-        processed: 0,
-        failures: 0
-      },
-      paging: {
-        offset: input.offset,
-        limit: input.limit ?? null,
-        totalMatched: links.length
-      },
-      processedLinkIds: [],
-      failures: []
-    };
-
-    // This optional debug branch exposes scope-loading diagnostics for paging investigations.
-    if (input.debug) {
-      payload.debug = {
-        scopeLoad: loaded.diagnostics,
-        scopeWarning: loaded.warning ?? null
-      };
-    }
-
-    return mcpResult(payload);
-  }
-
-  const processedLinkIds: number[] = [];
-  const failures: Array<{ linkId: number; message: string }> = [];
-
-  for (const linkId of eligibleLinkIds) {
-    try {
-      if (resolvedAction === 'archive') {
-        await client.updateLink(linkId, { collectionId: resolvedArchiveCollectionId });
-      } else if (resolvedAction === 'delete') {
-        await client.deleteLink(linkId);
+      if (!dryRun) {
+        try {
+          await client.updateLink(link.id, { collectionId });
+          applied += 1;
+        } catch (error) {
+          failures.push({
+            itemId: link.id,
+            code: 'rule_move_failed',
+            message: error instanceof Error ? error.message : 'rule move failed',
+            retryable: true
+          });
+        }
       }
-
-      context.db.markLinkHealthArchived(context.principal.userId, linkId);
-      processedLinkIds.push(linkId);
-    } catch (error) {
-      failures.push({
-        linkId,
-        message: error instanceof Error ? error.message : 'offline action failed'
-      });
+      continue;
     }
+
+    if (actionType === 'pin') {
+      const pinned = Boolean(rule.action.pinned);
+      preview.push({
+        linkId: link.id,
+        action: actionType,
+        beforePinned: Boolean(link.pinned),
+        afterPinned: pinned
+      });
+      if (!dryRun) {
+        try {
+          await client.setLinkPinned(link.id, pinned);
+          applied += 1;
+        } catch (error) {
+          failures.push({
+            itemId: link.id,
+            code: 'rule_pin_failed',
+            message: error instanceof Error ? error.message : 'rule pin failed',
+            retryable: true
+          });
+        }
+      }
+      continue;
+    }
+
+    preview.push({
+      linkId: link.id,
+      action: 'none'
+    });
   }
 
-  context.db.insertAudit({
-    actor: context.actor,
-    toolName: 'linkwarden_monitor_offline_links',
-    targetType: 'link',
-    targetIds: eligibleLinkIds,
-    beforeSummary: 'offline monitor snapshot',
-    afterSummary: JSON.stringify({
-      action: resolvedAction,
-      archiveCollectionId: resolvedArchiveCollectionId ?? null,
-      processed: processedLinkIds.length,
-      failures: failures.length
-    }),
-    outcome: failures.length === 0 ? 'success' : 'failed',
-    details: withActorDetails(context, {
-      offlineDays: resolvedOfflineDays,
-      minConsecutiveFailures: resolvedMinConsecutiveFailures
-    })
-  });
-
-  const payload: Record<string, unknown> = {
-    dryRun: false,
-      summary: {
-        scanned: sample.length,
-        up: checked.filter((item) => item.status === 'up').length,
-        down: checked.filter((item) => item.status === 'down').length,
-        action: resolvedAction,
-        processed: processedLinkIds.length,
-        failures: failures.length
-      },
-      paging: {
-        offset: input.offset,
-        limit: input.limit ?? null,
-        totalMatched: links.length
-      },
-      processedLinkIds,
-      failures
-    };
-
-  // This optional debug branch exposes scope-loading diagnostics for paging investigations.
-  if (input.debug) {
-    payload.debug = {
-      scopeLoad: loaded.diagnostics,
-      scopeWarning: loaded.warning ?? null
-    };
-  }
-
-  return mcpResult(payload);
+  return {
+    applied,
+    failures,
+    preview
+  };
 }
 
-// This function orchestrates daily maintenance as one flow (reorg + offline monitor) with safe apply gating.
-async function handleRunDailyMaintenance(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
-  const input = runDailyMaintenanceSchema.parse(args);
-  if (!input.reorg && !input.offline) {
-    throw new AppError(
-      400,
-      'validation_error',
-      'At least one section is required: reorg and/or offline for linkwarden_run_daily_maintenance.'
-    );
+// This function handles linkwarden_create_rule by persisting one deterministic selector/action schedule record.
+async function handleCreateRule(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = createRuleSchema.parse(args);
+  assertWriteAccess(context);
+  const ruleId = randomUUID();
+  context.db.createRule({
+    id: ruleId,
+    userId: context.principal.userId,
+    name: input.name,
+    selector: input.selector,
+    action: input.action,
+    schedule: input.schedule,
+    enabled: input.enabled
+  });
+  return ok({
+    ruleId
+  });
+}
+
+// This function handles linkwarden_test_rule with read-only selector resolution and action preview.
+async function handleTestRule(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = testRuleSchema.parse(args);
+  const rule = context.db.getRule(input.id, context.principal.userId);
+  if (!rule) {
+    throw new AppError(404, 'rule_not_found', `Rule ${input.id} not found.`);
+  }
+  const resolved = await resolveLinks(context, rule.selector, undefined);
+  const sampledLinks = resolved.links.slice(0, input.limit);
+  const result = await executeRuleAction(context, rule, sampledLinks, true);
+  return ok(
+    {
+      ruleId: rule.id,
+      preview: result.preview
+    },
+    {
+      summary: {
+        scanned: sampledLinks.length,
+        failures: result.failures.length
+      },
+      failures: result.failures
+    }
+  );
+}
+
+// This function handles linkwarden_apply_rule by executing one persisted rule now in dry-run or apply mode.
+async function handleApplyRule(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = applyRuleSchema.parse(args);
+  const rule = context.db.getRule(input.id, context.principal.userId);
+  if (!rule) {
+    throw new AppError(404, 'rule_not_found', `Rule ${input.id} not found.`);
+  }
+  if (!input.dryRun) {
+    assertWriteAccess(context);
   }
 
-  if (input.apply && input.confirm !== 'APPLY') {
-    throw new AppError(
-      400,
-      'validation_error',
-      'confirm=APPLY is required when apply=true for linkwarden_run_daily_maintenance.'
-    );
-  }
+  return withIdempotency(
+    context,
+    'linkwarden_apply_rule',
+    input.idempotencyKey,
+    {
+      id: input.id,
+      dryRun: input.dryRun
+    },
+    async () => {
+      const runId = context.db.createRuleRun(rule.id, context.principal.userId);
+      try {
+        const resolved = await resolveLinks(context, rule.selector, undefined);
+        const actionResult = await executeRuleAction(context, rule, resolved.links, input.dryRun);
+        const status = actionResult.failures.length === 0 ? 'success' : 'failed';
+        context.db.finishRuleRun({
+          runId,
+          status,
+          summary: {
+            dryRun: input.dryRun,
+            scanned: resolved.links.length,
+            applied: actionResult.applied,
+            failures: actionResult.failures.length
+          }
+        });
 
-  if (input.apply) {
+        return {
+          ok: true,
+          data: {
+            ruleId: rule.id,
+            runId,
+            preview: actionResult.preview
+          },
+          summary: {
+            dryRun: input.dryRun,
+            scanned: resolved.links.length,
+            applied: actionResult.applied
+          },
+          paging: null,
+          warnings: [],
+          failures: actionResult.failures
+        };
+      } catch (error) {
+        context.db.finishRuleRun({
+          runId,
+          status: 'failed',
+          summary: {
+            dryRun: input.dryRun
+          },
+          error: {
+            message: error instanceof Error ? error.message : 'rule apply failed'
+          }
+        });
+        throw error;
+      }
+    }
+  );
+}
+
+// This function handles linkwarden_run_rules_now by executing all enabled or selected rules under one maintenance lock.
+async function handleRunRulesNow(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = runRulesNowSchema.parse(args);
+  if (!input.dryRun) {
     assertWriteAccess(context);
   }
   const lockToken = randomUUID();
-  const lockAcquired = context.db.acquireMaintenanceLock(context.principal.userId, lockToken, 1800);
-  if (!lockAcquired) {
-    const activeLock = context.db.getActiveMaintenanceLock(context.principal.userId);
-    throw new AppError(
-      409,
-      'maintenance_locked',
-      `A maintenance run is already active for this user until ${activeLock?.expiresAt ?? 'unknown'}.`
-    );
+  const acquired = context.db.acquireMaintenanceLock(context.principal.userId, lockToken, 1800);
+  if (!acquired) {
+    throw new AppError(409, 'rules_locked', 'A rules run is already active for this user.');
   }
 
-  let runId: number | null = null;
-  const mode: 'dry_run' | 'apply' = input.apply ? 'apply' : 'dry_run';
-  const result: Record<string, unknown> = {
-    dryRun: !input.apply,
-    steps: [] as string[]
-  };
-  const steps = result.steps as string[];
-  const runItems: Array<{
-    itemType: MaintenanceRunItem['itemType'];
-    linkId?: number | null;
-    action: string;
-    outcome: MaintenanceRunItem['outcome'];
-    details?: Record<string, unknown>;
-  }> = [];
-  let hasFailures = false;
-
   try {
-    runId = context.db.createMaintenanceRun({
-      userId: context.principal.userId,
-      mode
-    });
-    result.run_id = runId;
+    const allRules = context.db.listRules(context.principal.userId);
+    const selected = input.ids && input.ids.length > 0 ? allRules.filter((rule) => input.ids?.includes(rule.id)) : allRules.filter((rule) => rule.enabled);
+    const results: Array<Record<string, unknown>> = [];
+    const failures: Array<{ itemId: string; code: string; message: string; retryable: boolean }> = [];
+    let applied = 0;
 
-    if (input.reorg) {
-      steps.push('reorg');
-      const planResponse = await handlePlanReorg(
-        {
-          strategy: input.reorg.strategy,
-          parameters: input.reorg.parameters,
-          scope: input.reorg.scope,
-          previewLimit: input.reorg.previewLimit,
-          dryRun: true
-        },
-        context
-      );
-
-      const planPayload = planResponse.structuredContent as Record<string, unknown>;
-      const reorgSummary: Record<string, unknown> = {
-        plan: planPayload
-      };
-
-      runItems.push({
-        itemType: 'reorg',
-        action: 'plan_created',
-        outcome: 'success',
-        details: {
-          plan_id: planPayload.plan_id,
-          summary: planPayload.summary,
-          warnings: planPayload.warnings
-        }
-      });
-
-      if (typeof planPayload.plan_id === 'string') {
-        context.db.setMaintenanceRunReorgPlanId(runId, planPayload.plan_id);
-      }
-
-      if (input.apply) {
-        const planId = planPayload.plan_id;
-        if (typeof planId !== 'string' || planId.length < 8) {
-          throw new AppError(500, 'plan_apply_failed', 'Generated plan_id is missing or invalid.');
-        }
-
-        const applyResponse = await handleApplyPlan(
-          {
-            plan_id: planId,
-            confirm: 'APPLY'
-          },
-          context
-        );
-
-        const applyPayload = applyResponse.structuredContent as Record<string, unknown>;
-        const applyFailures = readFailureCount(applyPayload);
-        if (applyFailures > 0) {
-          hasFailures = true;
-        }
-
-        runItems.push({
-          itemType: 'reorg',
-          action: 'plan_applied',
-          outcome: applyFailures > 0 ? 'failed' : 'success',
-          details: applyPayload
+    for (const rule of selected) {
+      const runId = context.db.createRuleRun(rule.id, context.principal.userId);
+      try {
+        const resolved = await resolveLinks(context, rule.selector, undefined);
+        const actionResult = await executeRuleAction(context, rule, resolved.links, input.dryRun);
+        applied += actionResult.applied;
+        const status = actionResult.failures.length === 0 ? 'success' : 'failed';
+        context.db.finishRuleRun({
+          runId,
+          status,
+          summary: {
+            dryRun: input.dryRun,
+            scanned: resolved.links.length,
+            applied: actionResult.applied,
+            failures: actionResult.failures.length
+          }
         });
-
-        reorgSummary.apply = applyPayload;
+        results.push({
+          ruleId: rule.id,
+          runId,
+          scanned: resolved.links.length,
+          applied: actionResult.applied,
+          failures: actionResult.failures
+        });
+      } catch (error) {
+        context.db.finishRuleRun({
+          runId,
+          status: 'failed',
+          summary: {
+            dryRun: input.dryRun
+          },
+          error: {
+            message: error instanceof Error ? error.message : 'rule run failed'
+          }
+        });
+        failures.push({
+          itemId: rule.id,
+          code: 'rule_run_failed',
+          message: error instanceof Error ? error.message : 'rule run failed',
+          retryable: true
+        });
       }
-
-      result.reorg = reorgSummary;
     }
 
-    if (input.offline) {
-      steps.push('offline');
-      const monitorResponse = await handleMonitorOfflineLinks(
-        {
-          scope: input.offline.scope,
-          offset: input.offline.offset,
-          limit: input.offline.limit,
-          timeoutMs: input.offline.timeoutMs,
-          offlineDays: input.offline.offlineDays,
-          minConsecutiveFailures: input.offline.minConsecutiveFailures,
-          action: input.offline.action,
-          archiveCollectionId: input.offline.archiveCollectionId,
-          dryRun: !input.apply
+    return ok(
+      {
+        runs: results
+      },
+      {
+        summary: {
+          selectedRules: selected.length,
+          applied
         },
-        context
-      );
-
-      const monitorPayload = monitorResponse.structuredContent as Record<string, unknown>;
-      const offlineFailures = readFailureCount(monitorPayload);
-      if (offlineFailures > 0) {
-        hasFailures = true;
+        failures
       }
-
-      runItems.push({
-        itemType: 'offline',
-        action: input.apply ? 'monitor_and_archive' : 'monitor_dry_run',
-        outcome: offlineFailures > 0 ? 'failed' : 'success',
-        details: monitorPayload
-      });
-
-      result.offline = monitorPayload;
-    }
-
-    if (runItems.length > 0) {
-      context.db.insertMaintenanceRunItems(runId, runItems);
-    }
-
-    context.db.finishMaintenanceRun({
-      runId,
-      status: hasFailures ? 'failed' : 'success',
-      summary: result
-    });
-
-    return mcpResult(result);
-  } catch (error) {
-    if (runId !== null) {
-      if (runItems.length > 0) {
-        context.db.insertMaintenanceRunItems(runId, runItems);
-      }
-
-      context.db.finishMaintenanceRun({
-        runId,
-        status: 'failed',
-        summary: result,
-        error: {
-          message: error instanceof Error ? error.message : 'unknown',
-          detail: sanitizeForLog(error)
-        }
-      });
-    }
-    throw error;
+    );
   } finally {
     context.db.releaseMaintenanceLock(context.principal.userId, lockToken);
   }
 }
 
+// This function handles linkwarden_get_new_links_routine_status and returns schedule, settings, and backlog warnings.
+async function handleGetNewLinksRoutineStatus(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  getNewLinksRoutineStatusSchema.parse(args);
+  const status = await getNewLinksRoutineStatus(context, {
+    includeBacklogEstimate: true
+  });
+
+  return ok(
+    {
+      routine: status
+    },
+    {
+      summary: {
+        enabled: status.settings.enabled,
+        due: status.due
+      },
+      warnings: status.warnings
+    }
+  );
+}
+
+// This function handles linkwarden_run_new_links_routine_now and delegates to the shared routine service path.
+async function handleRunNewLinksRoutineNow(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  runNewLinksRoutineNowSchema.parse(args);
+  const routineResult = await runNewLinksRoutineNow(
+    context,
+    async (toolName, payload, nestedContext) => {
+      const handler = toolHandlers[toolName];
+      if (!handler) {
+        throw new AppError(404, 'tool_not_found', `Unknown tool: ${toolName}`);
+      }
+      return handler(payload, nestedContext);
+    },
+    {
+      ignoreSchedule: true
+    }
+  );
+
+  return ok(
+    {
+      routine: routineResult
+    },
+    {
+      summary: routineResult.summary,
+      warnings: routineResult.warnings,
+      failures: routineResult.failures.map((failure) => ({ ...failure }))
+    }
+  );
+}
+
+// This function handles linkwarden_list_rules and supports optional enabled-only filtering.
+async function handleListRules(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = listRulesSchema.parse(args);
+  const all = context.db.listRules(context.principal.userId);
+  const rules = input.enabledOnly ? all.filter((rule) => rule.enabled) : all;
+  return ok({
+    rules
+  });
+}
+
+// This function handles linkwarden_delete_rule for one user-owned rule identifier.
+async function handleDeleteRule(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = deleteRuleSchema.parse(args);
+  assertWriteAccess(context);
+  context.db.deleteRule(input.id, context.principal.userId);
+  return ok({
+    deleted: true,
+    ruleId: input.id
+  });
+}
+
+// This function handles linkwarden_create_saved_query for compact query-id based retrieval.
+async function handleCreateSavedQuery(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = createSavedQuerySchema.parse(args);
+  assertWriteAccess(context);
+  const id = randomUUID();
+  context.db.createSavedQuery({
+    id,
+    userId: context.principal.userId,
+    name: input.name,
+    selector: input.selector,
+    fields: input.fields,
+    verbosity: input.verbosity
+  });
+  return ok({
+    savedQueryId: id
+  });
+}
+
+// This function handles linkwarden_list_saved_queries for one user.
+async function handleListSavedQueries(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  listSavedQueriesSchema.parse(args);
+  return ok({
+    savedQueries: context.db.listSavedQueries(context.principal.userId)
+  });
+}
+
+// This function handles linkwarden_run_saved_query by delegating to deterministic query snapshot paging.
+async function handleRunSavedQuery(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = runSavedQuerySchema.parse(args);
+  const saved = context.db.getSavedQuery(input.id, context.principal.userId);
+  if (!saved) {
+    throw new AppError(404, 'saved_query_not_found', `Saved query ${input.id} not found.`);
+  }
+  return handleQueryLinks(
+    {
+      selector: saved.selector,
+      fields: saved.fields,
+      verbosity: saved.verbosity,
+      limit: input.limit,
+      cursor: input.cursor
+    },
+    context
+  );
+}
+
+// This function handles linkwarden_get_audit by returning both operation history and write audit records.
+async function handleGetAudit(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = getAuditSchema.parse(args);
+  const operations = context.db.listOperations(context.principal.userId, input.limit, input.offset);
+  const audit = context.db.listAuditEntries(context.principal.userId, input.limit, input.offset);
+  return ok(
+    {
+      operations,
+      audit
+    },
+    {
+      paging: {
+        limit: input.limit,
+        offset: input.offset,
+        returned: Math.max(operations.length, audit.length)
+      }
+    }
+  );
+}
+
+// This helper applies one before-snapshot to a link and updates operation item state based on outcome.
+async function undoOperationItem(
+  context: ToolRuntimeContext,
+  client: LinkwardenClient,
+  operationId: string,
+  item: OperationItemRecord
+): Promise<{ ok: boolean; message?: string }> {
+  if (item.before.deleted === true) {
+    context.db.setOperationItemUndoStatus(operationId, item.itemId, 'failed');
+    return {
+      ok: false,
+      message: 'Hard-deleted links cannot be restored.'
+    };
+  }
+
+  try {
+    await client.updateLink(item.itemId, {
+      title: item.before.title,
+      url: item.before.url,
+      description: item.before.description,
+      collectionId: item.before.collectionId,
+      tagIds: item.before.tagIds,
+      pinned: item.before.pinned,
+      archived: item.before.archived
+    });
+    context.db.setOperationItemUndoStatus(operationId, item.itemId, 'applied');
+    return { ok: true };
+  } catch (error) {
+    context.db.setOperationItemUndoStatus(operationId, item.itemId, 'failed');
+    return {
+      ok: false,
+      message: error instanceof Error ? error.message : 'undo failed'
+    };
+  }
+}
+
+// This function handles linkwarden_undo_operation by replaying before-snapshots in reverse item order.
+async function handleUndoOperation(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = undoOperationSchema.parse(args);
+  assertWriteAccess(context);
+  const operation = context.db.getOperationWithItems(input.operationId, context.principal.userId);
+  if (!operation) {
+    throw new AppError(404, 'operation_not_found', `Operation ${input.operationId} not found.`);
+  }
+  if (!operation.operation.undoUntil || new Date(operation.operation.undoUntil).getTime() <= Date.now()) {
+    throw new AppError(409, 'undo_expired', `Operation ${input.operationId} is no longer undoable.`);
+  }
+
+  const client = getClient(context);
+  const failures: Array<{ itemId: number; code: string; message: string; retryable: boolean }> = [];
+  let undone = 0;
+
+  for (const item of operation.items) {
+    const result = await undoOperationItem(context, client, input.operationId, item);
+    if (result.ok) {
+      undone += 1;
+    } else {
+      failures.push({
+        itemId: item.itemId,
+        code: 'undo_failed',
+        message: result.message ?? 'undo failed',
+        retryable: false
+      });
+    }
+  }
+
+  context.db.insertAudit({
+    actor: context.actor,
+    toolName: 'linkwarden_undo_operation',
+    targetType: 'operation',
+    targetIds: [input.operationId],
+    beforeSummary: 'undo operation requested',
+    afterSummary: JSON.stringify({
+      undone,
+      failures: failures.length
+    }),
+    outcome: failures.length === 0 ? 'success' : 'failed',
+    details: {
+      userId: context.principal.userId
+    }
+  });
+
+  return ok(
+    {
+      operationId: input.operationId
+    },
+    {
+      summary: {
+        items: operation.items.length,
+        undone
+      },
+      failures
+    }
+  );
+}
+
 const toolHandlers: Record<string, (args: unknown, context: ToolRuntimeContext) => Promise<ToolCallResult>> = {
-  search: handleConnectorSearch,
-  fetch: handleConnectorFetch,
   linkwarden_get_server_info: handleGetServerInfo,
-  linkwarden_search_links: handleSearchLinks,
+  linkwarden_get_stats: handleGetStats,
+  linkwarden_query_links: handleQueryLinks,
+  linkwarden_aggregate_links: handleAggregateLinks,
+  linkwarden_get_link: handleGetLink,
+  linkwarden_mutate_links: handleMutateLinks,
+  linkwarden_delete_links: handleDeleteLinks,
   linkwarden_list_collections: handleListCollections,
   linkwarden_create_collection: handleCreateCollection,
   linkwarden_update_collection: handleUpdateCollection,
@@ -2197,21 +3366,26 @@ const toolHandlers: Record<string, (args: unknown, context: ToolRuntimeContext) 
   linkwarden_create_tag: handleCreateTag,
   linkwarden_delete_tag: handleDeleteTag,
   linkwarden_assign_tags: handleAssignTags,
-  linkwarden_get_link: handleGetLink,
-  linkwarden_plan_reorg: handlePlanReorg,
-  linkwarden_apply_plan: handleApplyPlan,
-  linkwarden_update_link: handleUpdateLink,
-  linkwarden_set_links_collection: handleSetLinksCollection,
-  linkwarden_set_links_pinned: handleSetLinksPinned,
-  linkwarden_bulk_update_links: handleBulkUpdate,
-  linkwarden_clean_link_urls: handleCleanLinkUrls,
-  linkwarden_suggest_taxonomy: handleSuggestTaxonomy,
-  linkwarden_capture_chat_links: handleCaptureChatLinks,
-  linkwarden_monitor_offline_links: handleMonitorOfflineLinks,
-  linkwarden_run_daily_maintenance: handleRunDailyMaintenance
+  linkwarden_governed_tag_links: handleGovernedTagLinks,
+  linkwarden_normalize_urls: handleNormalizeUrls,
+  linkwarden_find_duplicates: handleFindDuplicates,
+  linkwarden_merge_duplicates: handleMergeDuplicates,
+  linkwarden_create_rule: handleCreateRule,
+  linkwarden_test_rule: handleTestRule,
+  linkwarden_apply_rule: handleApplyRule,
+  linkwarden_run_rules_now: handleRunRulesNow,
+  linkwarden_get_new_links_routine_status: handleGetNewLinksRoutineStatus,
+  linkwarden_run_new_links_routine_now: handleRunNewLinksRoutineNow,
+  linkwarden_list_rules: handleListRules,
+  linkwarden_delete_rule: handleDeleteRule,
+  linkwarden_create_saved_query: handleCreateSavedQuery,
+  linkwarden_list_saved_queries: handleListSavedQueries,
+  linkwarden_run_saved_query: handleRunSavedQuery,
+  linkwarden_get_audit: handleGetAudit,
+  linkwarden_undo_operation: handleUndoOperation
 };
 
-// This function dispatches validated tool calls and normalizes validation errors.
+// This function dispatches validated tool calls and normalizes validation errors for JSON-RPC transport.
 export async function executeTool(
   toolName: string,
   args: unknown,
@@ -2234,20 +3408,13 @@ export async function executeTool(
 
   const handler = toolHandlers[toolName];
   if (!handler) {
-    context.logger.warn(
-      {
-        event: 'mcp_tool_not_found',
-        toolName,
-        actor: context.actor
-      },
-      'mcp_tool_not_found'
-    );
     throw new AppError(404, 'tool_not_found', `Unknown tool: ${toolName}`);
   }
 
+  assertToolScopeAccess(context, toolName);
+
   try {
     const result = await handler(args, context);
-
     context.logger.info(
       {
         event: 'mcp_tool_execution_completed',
@@ -2259,7 +3426,6 @@ export async function executeTool(
       },
       'mcp_tool_execution_completed'
     );
-
     return result;
   } catch (error) {
     context.logger.error(
@@ -2277,7 +3443,6 @@ export async function executeTool(
     if (error instanceof z.ZodError) {
       throw new AppError(400, 'validation_error', 'Tool input validation failed.', error.flatten());
     }
-
     throw error;
   }
 }

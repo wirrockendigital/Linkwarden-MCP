@@ -1,53 +1,172 @@
-// This module defines all MCP tool contracts with strict input validation and safe defaults.
+// This module defines alpha MCP tool contracts with deterministic selectors, cursor paging, and compact response controls.
 
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import type { McpTool } from '../types/mcp.js';
 
-// This schema keeps paging flexible so tools can process full datasets when limit is omitted.
-const pagingSchema = {
-  limit: z.number().int().min(1).optional(),
-  offset: z.number().int().min(0).default(0)
-};
+// This enum keeps output verbosity explicit so agents can optimize token usage deterministically.
+export const verbositySchema = z.enum(['minimal', 'normal', 'debug']).default('minimal');
 
-export const searchLinksSchema = z.object({
-  query: z.string().min(1),
-  limit: pagingSchema.limit,
-  offset: pagingSchema.offset,
-  collectionId: z.number().int().positive().optional(),
-  collection_id: z.number().int().positive().optional(),
-  tagIds: z.array(z.number().int().positive()).max(50).optional(),
-  tag_ids: z.array(z.number().int().positive()).max(50).optional(),
-  archived: z.boolean().optional(),
-  pinned: z.boolean().optional(),
-  debug: z.boolean().optional()
+// This helper validates IANA time zone identifiers with the runtime Intl implementation.
+function isValidTimeZone(value: string): boolean {
+  try {
+    Intl.DateTimeFormat('en-US', { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// This schema models relative created-at windows for natural date filters.
+const createdAtRelativeSchema = z.object({
+  amount: z.number().int().min(1).max(120),
+  unit: z.enum(['day', 'week', 'month', 'year']),
+  mode: z.enum(['rolling', 'previous_calendar'])
 });
 
-// This schema keeps the generic connector search tool aligned with OpenAI search/fetch expectations.
-export const connectorSearchSchema = z.object({
-  query: z.string().min(1)
-});
+// This schema provides one shared selector language across query, mutate, delete, and rule tools.
+export const selectorSchema = z
+  .object({
+    query: z.string().trim().min(1).optional(),
+    ids: z.array(z.number().int().positive()).min(1).optional(),
+    collectionId: z.number().int().positive().optional(),
+    collectionNamesAny: z.array(z.string().trim().min(1).max(160)).min(1).max(200).optional(),
+    includeDescendants: z.boolean().default(false),
+    tagIdsAny: z.array(z.number().int().positive()).max(200).optional(),
+    tagIdsAll: z.array(z.number().int().positive()).max(200).optional(),
+    tagNamesAny: z.array(z.string().trim().min(1).max(80)).min(1).max(200).optional(),
+    tagNamesAll: z.array(z.string().trim().min(1).max(80)).min(1).max(200).optional(),
+    archived: z.boolean().optional(),
+    pinned: z.boolean().optional(),
+    changedSince: z.string().datetime().optional(),
+    createdAtFrom: z.string().trim().min(1).max(80).optional(),
+    createdAtTo: z.string().trim().min(1).max(80).optional(),
+    createdAtRelative: createdAtRelativeSchema.optional(),
+    timeZone: z.string().trim().min(1).max(100).optional()
+  })
+  .superRefine((payload, ctx) => {
+    // This rule prevents mixed relative and absolute created-at filters in one selector.
+    if (payload.createdAtRelative && (payload.createdAtFrom || payload.createdAtTo)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['createdAtRelative'],
+        message: 'createdAtRelative cannot be combined with createdAtFrom/createdAtTo.'
+      });
+    }
 
-// This schema keeps the generic connector fetch tool input compact and deterministic.
-export const connectorFetchSchema = z.object({
-  id: z.string().min(1)
-});
+    // This rule keeps tag any-filter semantics deterministic between id and name modes.
+    if (payload.tagIdsAny && payload.tagNamesAny) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['tagNamesAny'],
+        message: 'Use either tagIdsAny or tagNamesAny, not both.'
+      });
+    }
 
-// This schema keeps server info retrieval argument-free and deterministic.
+    // This rule keeps tag all-filter semantics deterministic between id and name modes.
+    if (payload.tagIdsAll && payload.tagNamesAll) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['tagNamesAll'],
+        message: 'Use either tagIdsAll or tagNamesAll, not both.'
+      });
+    }
+
+    // This rule avoids mixing collection ids and collection names in one selector axis.
+    if (payload.collectionId && payload.collectionNamesAny) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['collectionNamesAny'],
+        message: 'Use either collectionId or collectionNamesAny, not both.'
+      });
+    }
+
+    // This rule validates timezone identifiers early so runtime filtering stays deterministic.
+    if (payload.timeZone && !isValidTimeZone(payload.timeZone)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['timeZone'],
+        message: 'timeZone must be a valid IANA identifier.'
+      });
+    }
+  });
+
+// This schema validates one compact field projection list for token-efficient reads.
+export const fieldsSchema = z.array(z.string().trim().min(1).max(80)).max(100).default([]);
+
 export const serverInfoSchema = z.object({});
 
-export const listCollectionsSchema = z.object({
-  limit: pagingSchema.limit,
-  offset: pagingSchema.offset
+export const getStatsSchema = z.object({
+  selector: selectorSchema.optional()
 });
 
-// This schema creates one collection and supports optional parent assignment for nested trees.
+export const queryLinksSchema = z.object({
+  selector: selectorSchema.optional(),
+  limit: z.number().int().min(1).max(500).default(50),
+  cursor: z.string().min(8).optional(),
+  fields: fieldsSchema,
+  verbosity: verbositySchema
+});
+
+export const aggregateLinksSchema = z.object({
+  selector: selectorSchema.optional(),
+  groupBy: z.enum(['collection', 'tag', 'domain', 'pinned', 'archived']).default('collection'),
+  topN: z.number().int().min(1).max(500).default(50)
+});
+
+export const getLinkSchema = z.object({
+  id: z.number().int().positive(),
+  fields: fieldsSchema,
+  verbosity: verbositySchema
+});
+
+// This schema captures one deterministic link mutation payload for selector-based batch writes.
+export const mutateLinksSchema = z
+  .object({
+    selector: selectorSchema.optional(),
+    ids: z.array(z.number().int().positive()).min(1).optional(),
+    updates: z
+      .object({
+        title: z.string().trim().min(1).max(2000).optional(),
+        url: z.string().url().optional(),
+        description: z.string().max(4000).optional(),
+        collectionId: z.number().int().positive().nullable().optional(),
+        pinned: z.boolean().optional(),
+        archived: z.boolean().optional(),
+        tagMode: z.enum(['replace', 'add', 'remove']).default('add'),
+        tagNames: z.array(z.string().trim().min(1).max(80)).max(200).optional(),
+        createMissingTags: z.boolean().default(true)
+      })
+      .refine((value) => Object.keys(value).length > 0, 'At least one update field must be provided.'),
+    dryRun: z.boolean().default(true),
+    previewLimit: z.number().int().min(1).max(200).default(20),
+    idempotencyKey: z.string().trim().min(8).max(128).optional()
+  })
+  .refine((value) => Boolean(value.selector) || Boolean(value.ids), 'Either selector or ids must be provided.');
+
+export const deleteLinksSchema = z
+  .object({
+    selector: selectorSchema.optional(),
+    ids: z.array(z.number().int().positive()).min(1).optional(),
+    mode: z.enum(['soft', 'hard']).default('soft'),
+    dryRun: z.boolean().default(true),
+    archiveCollectionId: z.number().int().positive().optional(),
+    markTagName: z.string().trim().min(1).max(80).default('to-delete'),
+    previewLimit: z.number().int().min(1).max(200).default(20),
+    idempotencyKey: z.string().trim().min(8).max(128).optional()
+  })
+  .refine((value) => Boolean(value.selector) || Boolean(value.ids), 'Either selector or ids must be provided.');
+
+export const listCollectionsSchema = z.object({
+  limit: z.number().int().min(1).max(500).default(100),
+  offset: z.number().int().min(0).default(0)
+});
+
 export const createCollectionSchema = z.object({
   name: z.string().trim().min(1).max(160),
   parentId: z.number().int().positive().nullable().optional()
 });
 
-// This schema updates one collection for rename and/or move operations.
 export const updateCollectionSchema = z.object({
   id: z.number().int().positive(),
   updates: z
@@ -55,179 +174,156 @@ export const updateCollectionSchema = z.object({
       name: z.string().trim().min(1).max(160).optional(),
       parentId: z.number().int().positive().nullable().optional()
     })
-    .refine((data) => Object.keys(data).length > 0, 'At least one update field must be provided.')
+    .refine((value) => Object.keys(value).length > 0, 'At least one update field must be provided.')
 });
 
-// This schema deletes one collection by id.
 export const deleteCollectionSchema = z.object({
   id: z.number().int().positive()
 });
 
 export const listTagsSchema = z.object({
-  limit: pagingSchema.limit,
-  offset: pagingSchema.offset
+  limit: z.number().int().min(1).max(500).default(100),
+  offset: z.number().int().min(0).default(0)
 });
 
-// This schema creates one tag and keeps naming constraints explicit for deterministic automation flows.
 export const createTagSchema = z.object({
   name: z.string().trim().min(1).max(80)
 });
 
-// This schema deletes one tag by id.
 export const deleteTagSchema = z.object({
   id: z.number().int().positive()
 });
 
-// This schema assigns tags to links by tag names and can auto-create missing tags when requested.
-export const assignTagsSchema = z.object({
-  linkIds: z.array(z.number().int().positive()).min(1),
-  tagNames: z.array(z.string().trim().min(1).max(80)).min(1).max(50),
-  mode: z.enum(['replace', 'add', 'remove']).default('add'),
-  createMissingTags: z.boolean().default(true),
-  dryRun: z.boolean().default(true),
-  previewLimit: z.number().int().min(1).max(100).default(20)
+export const assignTagsSchema = z
+  .object({
+    selector: selectorSchema.optional(),
+    linkIds: z.array(z.number().int().positive()).min(1).optional(),
+    tagNames: z.array(z.string().trim().min(1).max(80)).min(1).max(200),
+    mode: z.enum(['replace', 'add', 'remove']).default('add'),
+    createMissingTags: z.boolean().default(true),
+    dryRun: z.boolean().default(true),
+    previewLimit: z.number().int().min(1).max(200).default(20),
+    idempotencyKey: z.string().trim().min(8).max(128).optional()
+  })
+  .refine((value) => Boolean(value.selector) || Boolean(value.linkIds), 'Either selector or linkIds must be provided.');
+
+export const governedTagLinksSchema = z
+  .object({
+    selector: selectorSchema.optional(),
+    linkIds: z.array(z.number().int().positive()).min(1).optional(),
+    dryRun: z.boolean().default(true),
+    previewLimit: z.number().int().min(1).max(200).default(50),
+    idempotencyKey: z.string().trim().min(8).max(128).optional()
+  })
+  .refine((value) => Boolean(value.selector) || Boolean(value.linkIds), 'Either selector or linkIds must be provided.');
+
+export const normalizeUrlsSchema = z
+  .object({
+    selector: selectorSchema.optional(),
+    linkIds: z.array(z.number().int().positive()).min(1).optional(),
+    removeUtm: z.boolean().default(true),
+    removeKnownTracking: z.boolean().default(true),
+    keepParams: z.array(z.string().trim().min(1).max(120)).max(200).default([]),
+    extraTrackingParams: z.array(z.string().trim().min(1).max(120)).max(200).default([]),
+    dryRun: z.boolean().default(true),
+    previewLimit: z.number().int().min(1).max(200).default(20),
+    idempotencyKey: z.string().trim().min(8).max(128).optional()
+  })
+  .refine((value) => Boolean(value.selector) || Boolean(value.linkIds), 'Either selector or linkIds must be provided.');
+
+export const findDuplicatesSchema = z.object({
+  selector: selectorSchema.optional(),
+  includeArchived: z.boolean().default(true),
+  topN: z.number().int().min(1).max(500).default(100)
 });
 
-export const getLinkSchema = z.object({
-  id: z.number().int().positive()
-});
-
-const planScopeSchema = z.object({
-  query: z.string().min(1).optional(),
-  collectionId: z.number().int().positive().optional(),
-  tagIds: z.array(z.number().int().positive()).max(50).optional(),
-  archived: z.boolean().optional(),
-  pinned: z.boolean().optional()
-});
-
-export const planReorgSchema = z.object({
-  strategy: z.enum(['tag-by-keywords', 'move-to-collection', 'rename-tags', 'dedupe-tags']),
-  parameters: z.record(z.string(), z.unknown()),
-  scope: planScopeSchema.optional(),
-  dryRun: z.literal(true).default(true),
-  previewLimit: z.number().int().min(1).max(100).default(20)
-});
-
-export const applyPlanSchema = z.object({
-  plan_id: z.string().min(8),
-  confirm: z.literal('APPLY')
-});
-
-export const updateLinkSchema = z.object({
-  id: z.number().int().positive(),
-  updates: z
-    .object({
-      title: z.string().min(1).optional(),
-      url: z.string().url().optional(),
-      description: z.string().max(4000).optional(),
-      collectionId: z.number().int().positive().nullable().optional(),
-      tagIds: z.array(z.number().int().positive()).max(100).optional(),
-      archived: z.boolean().optional(),
-      pinned: z.boolean().optional()
-    })
-    .refine((data) => Object.keys(data).length > 0, 'At least one update field must be provided.')
-});
-
-// This schema assigns one collection (or null) to multiple links with dry-run preview support.
-export const setLinksCollectionSchema = z.object({
-  linkIds: z.array(z.number().int().positive()).min(1),
-  collectionId: z.number().int().positive().nullable(),
-  dryRun: z.boolean().default(true),
-  previewLimit: z.number().int().min(1).max(100).default(20)
-});
-
-// This schema pins or unpins multiple links with dry-run preview support.
-export const setLinksPinnedSchema = z.object({
-  linkIds: z.array(z.number().int().positive()).min(1),
-  pinned: z.boolean(),
-  dryRun: z.boolean().default(true),
-  previewLimit: z.number().int().min(1).max(100).default(20)
-});
-
-export const bulkUpdateSchema = z.object({
-  // This array stays unbounded so batch operations can target every matching link.
-  linkIds: z.array(z.number().int().positive()).min(1),
-  updates: z
-    .object({
-      collectionId: z.number().int().positive().nullable().optional(),
-      tagIds: z.array(z.number().int().positive()).max(100).optional()
-    })
-    .refine((data) => Object.keys(data).length > 0, 'At least one update field must be provided.'),
-  mode: z.enum(['replace', 'add', 'remove']).default('replace'),
-  dryRun: z.boolean().default(true),
-  previewLimit: z.number().int().min(1).max(100).default(20)
-});
-
-// This schema removes tracking parameters from link URLs while keeping a dry-run preview by default.
-export const cleanLinkUrlsSchema = z.object({
-  linkIds: z.array(z.number().int().positive()).min(1),
-  dryRun: z.boolean().default(true),
-  previewLimit: z.number().int().min(1).max(100).default(20),
-  removeUtm: z.boolean().default(true),
-  removeKnownTracking: z.boolean().default(true),
-  keepParams: z.array(z.string().trim().min(1).max(120)).max(200).default([]),
-  extraTrackingParams: z.array(z.string().trim().min(1).max(120)).max(200).default([])
-});
-
-export const suggestTaxonomySchema = z.object({
-  query: z.string().optional(),
-  limit: z.number().int().min(1).optional()
-});
-
-export const captureChatLinksSchema = z.object({
-  chatName: z.string().min(1).max(160),
-  text: z.string().min(1).max(250_000),
-  parentCollectionName: z.string().min(1).max(160).default('ChatGPT Chats'),
-  dedupeByUrl: z.boolean().default(true),
-  // This optional cap lets callers decide whether to ingest all extracted URLs or only a subset.
-  maxLinks: z.number().int().min(1).optional(),
-  dryRun: z.boolean().default(false)
-});
-
-export const monitorOfflineLinksSchema = z.object({
-  scope: planScopeSchema.optional(),
-  offset: z.number().int().min(0).default(0),
-  limit: z.number().int().min(1).optional(),
-  timeoutMs: z.number().int().min(1000).max(15000).default(5000),
-  offlineDays: z.number().int().min(1).max(365).optional(),
-  minConsecutiveFailures: z.number().int().min(1).max(30).optional(),
-  action: z.enum(['archive', 'delete', 'none']).optional(),
+export const mergeDuplicatesSchema = z.object({
+  groups: z
+    .array(
+      z.object({
+        canonicalUrl: z.string().url(),
+        linkIds: z.array(z.number().int().positive()).min(2),
+        keepId: z.number().int().positive().optional()
+      })
+    )
+    .min(1),
+  keepStrategy: z.enum(['lowestId', 'highestId']).default('lowestId'),
+  deleteMode: z.enum(['soft', 'hard']).default('soft'),
   archiveCollectionId: z.number().int().positive().optional(),
+  markTagName: z.string().trim().min(1).max(80).default('to-delete'),
   dryRun: z.boolean().default(true),
-  debug: z.boolean().optional()
+  idempotencyKey: z.string().trim().min(8).max(128).optional()
 });
 
-export const runDailyMaintenanceSchema = z.object({
-  reorg: z
-    .object({
-      strategy: z.enum(['tag-by-keywords', 'move-to-collection', 'rename-tags', 'dedupe-tags']),
-      parameters: z.record(z.string(), z.unknown()),
-      scope: planScopeSchema.optional(),
-      previewLimit: z.number().int().min(1).max(100).default(20)
-    })
-    .optional(),
-  offline: z
-    .object({
-      scope: planScopeSchema.optional(),
-      offset: z.number().int().min(0).default(0),
-      limit: z.number().int().min(1).optional(),
-      timeoutMs: z.number().int().min(1000).max(15000).default(5000),
-      offlineDays: z.number().int().min(1).max(365).optional(),
-      minConsecutiveFailures: z.number().int().min(1).max(30).optional(),
-      action: z.enum(['archive', 'delete', 'none']).optional(),
-      archiveCollectionId: z.number().int().positive().optional()
-    })
-    .optional(),
-  apply: z.boolean().default(false),
-  confirm: z.literal('APPLY').optional()
+export const createRuleSchema = z.object({
+  name: z.string().trim().min(1).max(160),
+  selector: selectorSchema,
+  action: z.record(z.string(), z.unknown()),
+  schedule: z.record(z.string(), z.unknown()).default({}),
+  enabled: z.boolean().default(true)
 });
 
-// This registry maps tool names to runtime schemas.
+export const testRuleSchema = z.object({
+  id: z.string().min(8),
+  limit: z.number().int().min(1).max(500).default(50)
+});
+
+export const applyRuleSchema = z.object({
+  id: z.string().min(8),
+  dryRun: z.boolean().default(true),
+  idempotencyKey: z.string().trim().min(8).max(128).optional()
+});
+
+export const runRulesNowSchema = z.object({
+  ids: z.array(z.string().min(8)).optional(),
+  dryRun: z.boolean().default(true)
+});
+
+export const getNewLinksRoutineStatusSchema = z.object({});
+
+export const runNewLinksRoutineNowSchema = z.object({});
+
+export const listRulesSchema = z.object({
+  enabledOnly: z.boolean().default(false)
+});
+
+export const deleteRuleSchema = z.object({
+  id: z.string().min(8)
+});
+
+export const createSavedQuerySchema = z.object({
+  name: z.string().trim().min(1).max(160),
+  selector: selectorSchema.default({ includeDescendants: false }),
+  fields: fieldsSchema,
+  verbosity: verbositySchema
+});
+
+export const listSavedQueriesSchema = z.object({});
+
+export const runSavedQuerySchema = z.object({
+  id: z.string().min(8),
+  limit: z.number().int().min(1).max(500).default(50),
+  cursor: z.string().min(8).optional()
+});
+
+export const getAuditSchema = z.object({
+  limit: z.number().int().min(1).max(500).default(100),
+  offset: z.number().int().min(0).default(0)
+});
+
+export const undoOperationSchema = z.object({
+  operationId: z.string().min(8)
+});
+
+// This registry maps tool names to runtime schemas for strict MCP argument validation.
 export const toolSchemas = {
-  search: connectorSearchSchema,
-  fetch: connectorFetchSchema,
   linkwarden_get_server_info: serverInfoSchema,
-  linkwarden_search_links: searchLinksSchema,
+  linkwarden_get_stats: getStatsSchema,
+  linkwarden_query_links: queryLinksSchema,
+  linkwarden_aggregate_links: aggregateLinksSchema,
+  linkwarden_get_link: getLinkSchema,
+  linkwarden_mutate_links: mutateLinksSchema,
+  linkwarden_delete_links: deleteLinksSchema,
   linkwarden_list_collections: listCollectionsSchema,
   linkwarden_create_collection: createCollectionSchema,
   linkwarden_update_collection: updateCollectionSchema,
@@ -236,144 +332,75 @@ export const toolSchemas = {
   linkwarden_create_tag: createTagSchema,
   linkwarden_delete_tag: deleteTagSchema,
   linkwarden_assign_tags: assignTagsSchema,
-  linkwarden_get_link: getLinkSchema,
-  linkwarden_plan_reorg: planReorgSchema,
-  linkwarden_apply_plan: applyPlanSchema,
-  linkwarden_update_link: updateLinkSchema,
-  linkwarden_set_links_collection: setLinksCollectionSchema,
-  linkwarden_set_links_pinned: setLinksPinnedSchema,
-  linkwarden_bulk_update_links: bulkUpdateSchema,
-  linkwarden_clean_link_urls: cleanLinkUrlsSchema,
-  linkwarden_suggest_taxonomy: suggestTaxonomySchema,
-  linkwarden_capture_chat_links: captureChatLinksSchema,
-  linkwarden_monitor_offline_links: monitorOfflineLinksSchema,
-  linkwarden_run_daily_maintenance: runDailyMaintenanceSchema
+  linkwarden_governed_tag_links: governedTagLinksSchema,
+  linkwarden_normalize_urls: normalizeUrlsSchema,
+  linkwarden_find_duplicates: findDuplicatesSchema,
+  linkwarden_merge_duplicates: mergeDuplicatesSchema,
+  linkwarden_create_rule: createRuleSchema,
+  linkwarden_test_rule: testRuleSchema,
+  linkwarden_apply_rule: applyRuleSchema,
+  linkwarden_run_rules_now: runRulesNowSchema,
+  linkwarden_get_new_links_routine_status: getNewLinksRoutineStatusSchema,
+  linkwarden_run_new_links_routine_now: runNewLinksRoutineNowSchema,
+  linkwarden_list_rules: listRulesSchema,
+  linkwarden_delete_rule: deleteRuleSchema,
+  linkwarden_create_saved_query: createSavedQuerySchema,
+  linkwarden_list_saved_queries: listSavedQueriesSchema,
+  linkwarden_run_saved_query: runSavedQuerySchema,
+  linkwarden_get_audit: getAuditSchema,
+  linkwarden_undo_operation: undoOperationSchema
 } as const;
 
-// This helper exports tool metadata used by MCP tools/list responses.
+// This helper exports MCP tool metadata so discovery always reflects the alpha tool surface.
 export function buildToolList(): McpTool[] {
-  return [
+  const entries: Array<{ name: keyof typeof toolSchemas; description: string }> = [
+    { name: 'linkwarden_get_server_info', description: 'Return MCP server metadata and protocol info.' },
+    { name: 'linkwarden_get_stats', description: 'Return hard counters for links, collections, tags, pinned, and archived.' },
+    { name: 'linkwarden_query_links', description: 'Query links with deterministic cursor paging, selector filters, and projection.' },
+    { name: 'linkwarden_aggregate_links', description: 'Aggregate links by collection, tag, domain, pinned, or archived state.' },
+    { name: 'linkwarden_get_link', description: 'Return one link by id with optional field projection and verbosity controls.' },
+    { name: 'linkwarden_mutate_links', description: 'Mutate links selected by ids/selector with dry-run and idempotency support.' },
+    { name: 'linkwarden_delete_links', description: 'Delete links in soft or hard mode with dry-run and idempotency support.' },
+    { name: 'linkwarden_list_collections', description: 'List collections with deterministic offset paging.' },
+    { name: 'linkwarden_create_collection', description: 'Create one collection and optionally assign a parent.' },
+    { name: 'linkwarden_update_collection', description: 'Rename or move one collection.' },
+    { name: 'linkwarden_delete_collection', description: 'Delete one collection by id.' },
+    { name: 'linkwarden_list_tags', description: 'List tags with deterministic offset paging.' },
+    { name: 'linkwarden_create_tag', description: 'Create one tag by name.' },
+    { name: 'linkwarden_delete_tag', description: 'Delete one tag by id.' },
+    { name: 'linkwarden_assign_tags', description: 'Assign, replace, or remove tags on selected links.' },
     {
-      name: 'search',
-      description: 'Connector-compatible search tool that returns results[] with id, title, and url.',
-      inputSchema: zodToJsonSchema(connectorSearchSchema, 'search') as Record<string, unknown>
-    },
-    {
-      name: 'fetch',
-      description: 'Connector-compatible fetch tool that returns one document by id.',
-      inputSchema: zodToJsonSchema(connectorFetchSchema, 'fetch') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_get_server_info',
-      description: 'Return MCP server name, version, and protocol metadata.',
-      inputSchema: zodToJsonSchema(serverInfoSchema, 'linkwarden_get_server_info') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_search_links',
-      description: 'Search links by text query with optional collection/tag/archive filters and paging.',
-      inputSchema: zodToJsonSchema(searchLinksSchema, 'linkwarden_search_links') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_list_collections',
-      description: 'List collections with paging.',
-      inputSchema: zodToJsonSchema(listCollectionsSchema, 'linkwarden_list_collections') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_create_collection',
-      description: 'Create one collection (optionally nested under parentId). Requires write mode.',
-      inputSchema: zodToJsonSchema(createCollectionSchema, 'linkwarden_create_collection') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_update_collection',
-      description: 'Rename or move one collection by id. Requires write mode.',
-      inputSchema: zodToJsonSchema(updateCollectionSchema, 'linkwarden_update_collection') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_delete_collection',
-      description: 'Delete one collection by id. Requires write mode.',
-      inputSchema: zodToJsonSchema(deleteCollectionSchema, 'linkwarden_delete_collection') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_list_tags',
-      description: 'List tags with paging.',
-      inputSchema: zodToJsonSchema(listTagsSchema, 'linkwarden_list_tags') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_create_tag',
-      description: 'Create one tag by name (idempotent by normalized name). Requires write mode.',
-      inputSchema: zodToJsonSchema(createTagSchema, 'linkwarden_create_tag') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_delete_tag',
-      description: 'Delete one tag by id. Requires write mode.',
-      inputSchema: zodToJsonSchema(deleteTagSchema, 'linkwarden_delete_tag') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_assign_tags',
+      name: 'linkwarden_governed_tag_links',
       description:
-        'Assign tags to links by tag names with replace/add/remove mode and optional auto-create for missing tags.',
-      inputSchema: zodToJsonSchema(assignTagsSchema, 'linkwarden_assign_tags') as Record<string, unknown>
+        'Scan links, reuse existing taxonomy, create bounded new tags, and assign tags in one governed run.'
+    },
+    { name: 'linkwarden_normalize_urls', description: 'Normalize URLs by removing tracking parameters with dry-run/apply.' },
+    { name: 'linkwarden_find_duplicates', description: 'Find duplicate links by canonical URL grouping.' },
+    { name: 'linkwarden_merge_duplicates', description: 'Merge duplicate groups and delete redundant items.' },
+    { name: 'linkwarden_create_rule', description: 'Create one persisted automation rule.' },
+    { name: 'linkwarden_test_rule', description: 'Test one rule in read-only preview mode.' },
+    { name: 'linkwarden_apply_rule', description: 'Apply one rule immediately in dry-run or write mode.' },
+    { name: 'linkwarden_run_rules_now', description: 'Run all or selected rules now with per-user locking.' },
+    {
+      name: 'linkwarden_get_new_links_routine_status',
+      description: 'Return user-specific status, schedule, and warnings for automatic processing of newly created links.'
     },
     {
-      name: 'linkwarden_get_link',
-      description: 'Get one link by id with bounded details.',
-      inputSchema: zodToJsonSchema(getLinkSchema, 'linkwarden_get_link') as Record<string, unknown>
+      name: 'linkwarden_run_new_links_routine_now',
+      description: 'Run the user-specific new-links routine immediately via the native scheduler service.'
     },
-    {
-      name: 'linkwarden_plan_reorg',
-      description:
-        'Create a dry-run reorganization plan (tag-by-keywords, move-to-collection, rename-tags, dedupe-tags).',
-      inputSchema: zodToJsonSchema(planReorgSchema, 'linkwarden_plan_reorg') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_apply_plan',
-      description: 'Apply a stored plan_id after explicit confirm=APPLY.',
-      inputSchema: zodToJsonSchema(applyPlanSchema, 'linkwarden_apply_plan') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_update_link',
-      description: 'Update one link. Requires write mode.',
-      inputSchema: zodToJsonSchema(updateLinkSchema, 'linkwarden_update_link') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_set_links_collection',
-      description: 'Assign or clear collection for multiple links with dry-run preview. Requires write mode.',
-      inputSchema: zodToJsonSchema(setLinksCollectionSchema, 'linkwarden_set_links_collection') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_set_links_pinned',
-      description: 'Pin or unpin multiple links with dry-run preview. Requires write mode.',
-      inputSchema: zodToJsonSchema(setLinksPinnedSchema, 'linkwarden_set_links_pinned') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_bulk_update_links',
-      description: 'Bulk update links with replace/add/remove tag mode and optional dry-run preview.',
-      inputSchema: zodToJsonSchema(bulkUpdateSchema, 'linkwarden_bulk_update_links') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_clean_link_urls',
-      description: 'Remove tracker parameters from link URLs with dry-run preview and optional apply.',
-      inputSchema: zodToJsonSchema(cleanLinkUrlsSchema, 'linkwarden_clean_link_urls') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_suggest_taxonomy',
-      description: 'Suggest a taxonomy from scoped links without writing any data.',
-      inputSchema: zodToJsonSchema(suggestTaxonomySchema, 'linkwarden_suggest_taxonomy') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_capture_chat_links',
-      description: 'Extract URLs from chat text and store them under ChatGPT Chats > Chat Name.',
-      inputSchema: zodToJsonSchema(captureChatLinksSchema, 'linkwarden_capture_chat_links') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_monitor_offline_links',
-      description: 'Check link reachability, track failure streaks, and optionally archive long-offline links.',
-      inputSchema: zodToJsonSchema(monitorOfflineLinksSchema, 'linkwarden_monitor_offline_links') as Record<string, unknown>
-    },
-    {
-      name: 'linkwarden_run_daily_maintenance',
-      description: 'Run reorg + offline checks in one flow with safe dry-run defaults and optional apply.',
-      inputSchema: zodToJsonSchema(runDailyMaintenanceSchema, 'linkwarden_run_daily_maintenance') as Record<string, unknown>
-    }
+    { name: 'linkwarden_list_rules', description: 'List persisted rules for the current user.' },
+    { name: 'linkwarden_delete_rule', description: 'Delete one rule by id.' },
+    { name: 'linkwarden_create_saved_query', description: 'Create one persisted saved query for short-id execution.' },
+    { name: 'linkwarden_list_saved_queries', description: 'List saved queries for the current user.' },
+    { name: 'linkwarden_run_saved_query', description: 'Execute one saved query by id with cursor paging.' },
+    { name: 'linkwarden_get_audit', description: 'Return audit and operation history for the current user.' },
+    { name: 'linkwarden_undo_operation', description: 'Undo one previously recorded operation by id when still eligible.' }
   ];
+
+  return entries.map((entry) => ({
+    name: entry.name,
+    description: entry.description,
+    inputSchema: zodToJsonSchema(toolSchemas[entry.name], entry.name) as Record<string, unknown>
+  }));
 }

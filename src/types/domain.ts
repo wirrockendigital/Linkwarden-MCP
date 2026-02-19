@@ -37,6 +37,33 @@ export interface PagingOutput {
   total?: number;
 }
 
+// This selector captures deterministic scope filters shared by query, mutate, delete, and rule tools.
+export interface LinkSelector {
+  query?: string;
+  ids?: number[];
+  collectionId?: number;
+  collectionNamesAny?: string[];
+  includeDescendants?: boolean;
+  tagIdsAny?: number[];
+  tagIdsAll?: number[];
+  tagNamesAny?: string[];
+  tagNamesAll?: string[];
+  archived?: boolean;
+  pinned?: boolean;
+  changedSince?: string;
+  createdAtFrom?: string;
+  createdAtTo?: string;
+  createdAtRelative?: CreatedAtRelativeWindow;
+  timeZone?: string;
+}
+
+// This model captures relative created-at windows for natural date filters in query selectors.
+export interface CreatedAtRelativeWindow {
+  amount: number;
+  unit: 'day' | 'week' | 'month' | 'year';
+  mode: 'rolling' | 'previous_calendar';
+}
+
 export type PlanStrategy =
   | 'tag-by-keywords'
   | 'move-to-collection'
@@ -123,6 +150,8 @@ export interface AuthenticatedPrincipal {
   username: string;
   role: UserRole;
   apiKeyId: string;
+  toolScopes?: string[];
+  collectionScopes?: number[];
 }
 
 export type AuthMethod = 'api_key' | 'oauth';
@@ -172,10 +201,118 @@ export interface SessionPrincipal {
 export interface UserSettings {
   userId: number;
   writeModeEnabled: boolean;
+  taggingStrictness: TaggingStrictness;
+  fetchMode: FetchMode;
+  queryTimeZone: string | null;
+  newLinksRoutineEnabled: boolean;
+  newLinksRoutineIntervalMinutes: number;
+  newLinksRoutineModules: NewLinksRoutineModule[];
+  newLinksRoutineBatchSize: number;
+  newLinksCursor: NewLinksCursor | null;
+  newLinksLastRunAt: string | null;
+  newLinksLastStatus: string | null;
+  newLinksLastError: string | null;
+  newLinksBackfillRequested: boolean;
+  newLinksBackfillConfirmed: boolean;
   offlineDays: number;
   offlineMinConsecutiveFailures: number;
   offlineAction: 'archive' | 'delete' | 'none';
   offlineArchiveCollectionId: number | null;
+  updatedAt: string;
+}
+
+// This union keeps per-user tagging strictness presets explicit and validation-friendly.
+export type TaggingStrictness = 'very_strict' | 'medium' | 'relaxed';
+
+// This union captures the allowed context-fetch behavior for governed tagging.
+export type FetchMode = 'never' | 'optional' | 'always';
+
+// This union captures the supported provider backends for optional AI-assisted tag extraction.
+export type TaggingInferenceProvider = 'builtin' | 'perplexity' | 'mistral' | 'huggingface';
+
+// This union keeps new-link auto-routine modules explicit and validation-friendly.
+export type NewLinksRoutineModule = 'governed_tagging' | 'normalize_urls' | 'dedupe';
+
+// This model stores one deterministic createdAt/id cursor for new-link delta processing.
+export interface NewLinksCursor {
+  createdAt: string;
+  linkId: number;
+}
+
+// This model stores one user's configurable new-link routine preferences and state.
+export interface NewLinksRoutineSettings {
+  userId: number;
+  enabled: boolean;
+  intervalMinutes: number;
+  modules: NewLinksRoutineModule[];
+  batchSize: number;
+  cursor: NewLinksCursor | null;
+  lastRunAt: string | null;
+  lastStatus: string | null;
+  lastError: string | null;
+  backfillRequested: boolean;
+  backfillConfirmed: boolean;
+  updatedAt: string;
+}
+
+// This model stores one computed runtime status payload for the new-link auto-routine.
+export interface NewLinksRoutineStatus {
+  userId: number;
+  settings: NewLinksRoutineSettings;
+  due: boolean;
+  nextDueAt: string | null;
+  backlogCount: number | null;
+  warnings: string[];
+}
+
+// This model stores global governed-tagging policy values controlled by admins.
+export interface GlobalTaggingPolicy {
+  fetchMode: FetchMode;
+  allowUserFetchModeOverride: boolean;
+  inferenceProvider: TaggingInferenceProvider;
+  inferenceModel: string | null;
+  blockedTagNames: string[];
+  similarityThreshold: number;
+  fetchTimeoutMs: number;
+  fetchMaxBytes: number;
+}
+
+// This model stores one user's governed-tagging preferences consumed at tool runtime.
+export interface UserTaggingPreferences {
+  userId: number;
+  taggingStrictness: TaggingStrictness;
+  fetchMode: FetchMode;
+  queryTimeZone: string | null;
+  updatedAt: string;
+}
+
+// This model stores deterministic alias mappings from normalized tokens to canonical tags.
+export interface TagAliasRecord {
+  userId: number;
+  canonicalTagId: number;
+  aliasNormalized: string;
+  confidence: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// This model stores candidate support counters used to gate new-tag creation.
+export interface TagCandidateRecord {
+  userId: number;
+  candidateNormalized: string;
+  supportCount: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  blockedReason: string | null;
+}
+
+// This model stores cached extracted context tokens per link to reduce repeated fetch/token usage.
+export interface LinkContextCacheRecord {
+  userId: number;
+  linkId: number;
+  contextHash: string;
+  extractedTokens: string[];
+  expiresAt: string;
   updatedAt: string;
 }
 
@@ -239,4 +376,49 @@ export interface BulkUpdateRequest {
   };
   mode: 'replace' | 'add' | 'remove';
   dryRun?: boolean;
+}
+
+// This model stores one persisted saved-query definition for deterministic short-id execution.
+export interface SavedQueryRecord {
+  id: string;
+  userId: number;
+  name: string;
+  selector: LinkSelector;
+  fields: string[];
+  verbosity: 'minimal' | 'normal' | 'debug';
+  createdAt: string;
+  updatedAt: string;
+}
+
+// This model stores one persisted rule definition used by the maintenance rule runner.
+export interface RuleRecord {
+  id: string;
+  userId: number;
+  name: string;
+  selector: LinkSelector;
+  action: Record<string, unknown>;
+  schedule: Record<string, unknown>;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// This model stores one operation header used for audit views and undo eligibility checks.
+export interface OperationRecord {
+  id: string;
+  userId: number;
+  toolName: string;
+  summary: Record<string, unknown>;
+  undoUntil: string | null;
+  createdAt: string;
+}
+
+// This model stores one operation item with before/after snapshots for deterministic undo.
+export interface OperationItemRecord {
+  operationId: string;
+  itemType: string;
+  itemId: number;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+  undoStatus: 'pending' | 'applied' | 'failed';
 }

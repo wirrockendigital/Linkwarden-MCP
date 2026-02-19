@@ -1,7 +1,7 @@
 // This module centralizes server identity values so protocol metadata and tools stay in sync.
 
 export const MCP_SERVER_NAME = 'linkwarden-mcp';
-export const MCP_SERVER_VERSION = '0.1.10';
+export const MCP_SERVER_VERSION = '0.2.13';
 export const MCP_PROTOCOL_VERSION = '2025-03-26';
 
 // This helper formats one date segment with two digits for stable protocol metadata output.

@@ -10,6 +10,9 @@ import { registerSetupRoutes } from './http/setup.js';
 import { registerUiRoutes } from './http/ui.js';
 import { createValidatedLinkwardenClientWithToken } from './linkwarden/runtime.js';
 import { registerMcpRoutes } from './mcp/protocol.js';
+import { executeTool } from './mcp/tools.js';
+import { runNewLinksRoutineNow } from './services/new-links-routine.js';
+import type { AuthenticatedPrincipal } from './types/domain.js';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION, formatProtocolVersionWithTimestamp } from './version.js';
 import { AppError, normalizeError } from './utils/errors.js';
 import { buildLoggerOptions, errorForLog, sanitizeForLog } from './utils/logger.js';
@@ -51,6 +54,18 @@ function normalizeInternalNextPath(value: unknown): string | null {
   }
 
   return trimmed;
+}
+
+// This helper builds one internal principal used by scheduler-triggered routine runs.
+function buildSchedulerPrincipal(user: { userId: number; username: string; role: AuthenticatedPrincipal['role'] }): AuthenticatedPrincipal {
+  return {
+    userId: user.userId,
+    username: user.username,
+    role: user.role,
+    apiKeyId: 'scheduler',
+    toolScopes: ['*'],
+    collectionScopes: []
+  };
 }
 
 // This function builds and configures the full HTTP application.
@@ -305,6 +320,89 @@ export function createServer(): ServerResources {
   registerSetupRoutes(app, configStore, db);
   registerOAuthRoutes(app, { configStore, db });
   registerMcpRoutes(app, { configStore, db });
+
+  let newLinksRoutineSchedulerTimer: NodeJS.Timeout | null = null;
+  let newLinksRoutineSchedulerRunning = false;
+  const schedulerTickMs = 60 * 1000;
+
+  // This helper executes one scheduler tick and triggers due user routines with shared service logic.
+  const runNewLinksRoutineSchedulerTick = async (): Promise<void> => {
+    if (newLinksRoutineSchedulerRunning) {
+      app.log.debug(
+        {
+          event: 'new_links_routine_scheduler_tick_skipped_running'
+        },
+        'new_links_routine_scheduler_tick_skipped_running'
+      );
+      return;
+    }
+
+    if (!configStore.isInitialized() || !configStore.isUnlocked()) {
+      return;
+    }
+
+    newLinksRoutineSchedulerRunning = true;
+    try {
+      const candidates = db.listUsersWithEnabledNewLinksRoutine();
+      for (const candidate of candidates) {
+        const principal = buildSchedulerPrincipal({
+          userId: candidate.userId,
+          username: candidate.username,
+          role: candidate.role
+        });
+
+        const result = await runNewLinksRoutineNow(
+          {
+            actor: `scheduler#user:${candidate.userId}`,
+            principal,
+            configStore,
+            db,
+            logger: app.log
+          },
+          executeTool,
+          {
+            ignoreSchedule: false
+          }
+        );
+
+        app.log.info(
+          {
+            event: 'new_links_routine_scheduler_user_completed',
+            userId: candidate.userId,
+            status: result.status,
+            summary: result.summary,
+            warnings: result.warnings,
+            failures: result.failures.length
+          },
+          'new_links_routine_scheduler_user_completed'
+        );
+      }
+    } catch (error) {
+      app.log.error(
+        {
+          event: 'new_links_routine_scheduler_tick_failed',
+          error: errorForLog(error)
+        },
+        'new_links_routine_scheduler_tick_failed'
+      );
+    } finally {
+      newLinksRoutineSchedulerRunning = false;
+    }
+  };
+
+  // This startup task enables one in-process scheduler loop so no external cron dependency is required.
+  newLinksRoutineSchedulerTimer = setInterval(() => {
+    void runNewLinksRoutineSchedulerTick();
+  }, schedulerTickMs);
+  void runNewLinksRoutineSchedulerTick();
+
+  // This shutdown hook clears scheduler timers so app close remains deterministic.
+  app.addHook('onClose', async () => {
+    if (newLinksRoutineSchedulerTimer) {
+      clearInterval(newLinksRoutineSchedulerTimer);
+      newLinksRoutineSchedulerTimer = null;
+    }
+  });
 
   // This handler maps internal exceptions into structured JSON errors.
   app.setErrorHandler((error, request, reply) => {

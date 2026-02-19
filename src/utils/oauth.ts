@@ -37,6 +37,25 @@ export function getAcceptedResources(request: FastifyRequest): string[] {
   return [mcp, base];
 }
 
+// This function normalizes one OAuth resource URL so auth checks stay stable across trailing slashes and host casing.
+export function normalizeResourceValue(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return '';
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    const protocol = parsed.protocol.toLowerCase();
+    const host = parsed.host.toLowerCase();
+    const normalizedPath = parsed.pathname.replace(/\/+$/, '');
+    const pathSegment = normalizedPath === '' || normalizedPath === '/' ? '' : normalizedPath;
+    return `${protocol}//${host}${pathSegment}`;
+  } catch {
+    return stripTrailingSlash(trimmed);
+  }
+}
+
 // This function builds OAuth protected-resource metadata as defined by RFC 9728.
 export function buildProtectedResourceMetadata(request: FastifyRequest): Record<string, unknown> {
   const base = getPublicBaseUrl(request);
@@ -149,12 +168,12 @@ export function assertAcceptedResource(resource: string | undefined, request: Fa
   }
 
   const accepted = getAcceptedResources(request);
-  const normalized = normalizeUrl(resource);
-  if (!accepted.map((value) => normalizeUrl(value)).includes(normalized)) {
+  const normalized = normalizeResourceValue(resource);
+  if (!accepted.map((value) => normalizeResourceValue(value)).includes(normalized)) {
     throw new AppError(400, 'invalid_resource', 'Requested resource is not served by this MCP server.');
   }
 
-  return accepted.find((value) => normalizeUrl(value) === normalized) ?? defaultResource;
+  return accepted.find((value) => normalizeResourceValue(value) === normalized) ?? defaultResource;
 }
 
 // This function creates one RFC 6750 WWW-Authenticate header with resource metadata hint.
@@ -185,9 +204,4 @@ function headerAsString(value: string | string[] | undefined): string | undefine
 // This helper strips one optional trailing slash for canonical URL comparisons.
 function stripTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '');
-}
-
-// This helper normalizes one URL for strict equality checks.
-function normalizeUrl(value: string): string {
-  return stripTrailingSlash(value.trim());
 }

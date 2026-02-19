@@ -1,7 +1,7 @@
 // This test suite verifies OAuth resource resolution defaults and strict resource validation.
 
 import { describe, expect, it } from 'vitest';
-import { assertAcceptedResource, getPublicBaseUrl } from '../src/utils/oauth.js';
+import { assertAcceptedResource, getPublicBaseUrl, normalizeResourceValue } from '../src/utils/oauth.js';
 import { AppError } from '../src/utils/errors.js';
 
 function makeRequest(): any {
@@ -24,6 +24,14 @@ describe('oauth resource validation', () => {
     const request = makeRequest();
     expect(assertAcceptedResource('https://lwmcp.rocken.digital', request)).toBe('https://lwmcp.rocken.digital');
     expect(assertAcceptedResource('https://lwmcp.rocken.digital/mcp', request)).toBe('https://lwmcp.rocken.digital/mcp');
+  });
+
+  it('accepts equivalent resources with host casing and trailing slash variations', () => {
+    const request = makeRequest();
+    expect(assertAcceptedResource('HTTPS://LWMCP.ROCKEN.DIGITAL/mcp/', request)).toBe('https://lwmcp.rocken.digital/mcp');
+    expect(normalizeResourceValue('https://LWMCP.ROCKEN.DIGITAL/mcp/?x=1#fragment')).toBe(
+      'https://lwmcp.rocken.digital/mcp'
+    );
   });
 
   it('rejects foreign resources', () => {

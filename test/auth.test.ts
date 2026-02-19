@@ -8,6 +8,9 @@ describe('auth helpers', () => {
   it('extracts bearer token from header', () => {
     expect(extractBearerToken('Bearer abc123')).toBe('abc123');
     expect(extractBearerToken('bearer abc123')).toBe('abc123');
+    expect(extractBearerToken('  Bearer    abc123  ')).toBe('abc123');
+    expect(extractBearerToken('Bearer\tabc123')).toBe('abc123');
+    expect(extractBearerToken('Bearer abc 123')).toBeNull();
     expect(extractBearerToken('Basic abc123')).toBeNull();
     expect(extractBearerToken(undefined)).toBeNull();
   });
