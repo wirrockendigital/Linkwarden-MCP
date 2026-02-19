@@ -7,7 +7,7 @@ COPY package.json ./
 RUN npm install
 
 # This step copies source files and builds the project.
-COPY tsconfig.json eslint.config.js .prettierrc ./
+COPY tsconfig.json eslint.config.js ./
 COPY src ./src
 RUN npm run build
 
