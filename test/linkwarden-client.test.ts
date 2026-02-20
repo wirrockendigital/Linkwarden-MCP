@@ -202,7 +202,9 @@ describe('linkwarden client', () => {
     });
     const createLinkRequest = createLinkCall?.[1] as { body?: string } | undefined;
     expect(createLinkRequest?.body).toContain('"tags":[{"id":11,"name":"AI Chat"},{"id":12,"name":"ChatGPT"}]');
+    expect(createLinkRequest?.body).toContain('"collection":{"id":5}');
     expect(createLinkRequest?.body).not.toContain('"tags":[11,12]');
+    expect(createLinkRequest?.body).not.toContain('"collectionId":5');
   });
 
   it('uses native POST /api/v1/tags for createTag', async () => {

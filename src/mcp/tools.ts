@@ -3464,6 +3464,8 @@ async function handleRunRulesNow(args: unknown, context: ToolRuntimeContext): Pr
 
 // This function handles link capture from AI chats into deterministic AI Chats > <AI Name> > <Chat Name> collections.
 async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const rawArgs = typeof args === 'object' && args !== null ? (args as Record<string, unknown>) : {};
+  const hasExplicitChatName = typeof rawArgs.chatName === 'string' && rawArgs.chatName.trim().length > 0;
   const input = captureChatLinksSchema.parse(args);
   if (!input.dryRun) {
     assertWriteAccess(context);
@@ -3491,6 +3493,12 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
       const normalizedCandidates = normalizeChatUrlCandidates(allInputUrls);
       const hierarchy = await resolveChatCollectionHierarchy(client, aiCollectionName, chatCollectionName, !input.dryRun);
       const warnings = [...normalizedCandidates.warnings];
+
+      if (!hasExplicitChatName) {
+        warnings.push(
+          `capture_chat_links: chatName not provided, fallback "${chatCollectionName}" was used.`
+        );
+      }
 
       for (const pending of hierarchy.wouldCreate) {
         warnings.push(

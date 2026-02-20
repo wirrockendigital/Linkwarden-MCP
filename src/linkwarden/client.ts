@@ -897,29 +897,43 @@ export class LinkwardenClient {
 
   // This method creates one URL link and returns normalized bounded link output.
   public async createLink(input: CreateLinkInput): Promise<LinkItem> {
+    // This normalization ensures collection targeting is sent in Linkwarden's native relation shape.
+    const normalizedCollectionId =
+      Number.isInteger(Number(input.collectionId)) && Number(input.collectionId) > 0
+        ? Number(input.collectionId)
+        : undefined;
+
     // This normalization keeps tag payload generation strict and deterministic for Linkwarden create requests.
     const normalizedTagIds = Array.isArray(input.tagIds) ? input.tagIds.map((tagId) => Number(tagId)) : [];
     const resolvedTags = normalizedTagIds.length > 0 ? await this.resolveTagPayload(normalizedTagIds) : [];
+
+    const body: Record<string, unknown> = {
+      type: 'url',
+      name: input.title ?? input.url,
+      url: input.url,
+      description: input.description ?? '',
+      tags: resolvedTags,
+      archived: input.archived
+    };
+
+    if (normalizedCollectionId !== undefined) {
+      // This relation payload is required by newer Linkwarden create validators to avoid defaulting to Unorganized.
+      body.collection = {
+        id: normalizedCollectionId
+      };
+    }
 
     // This debug event only logs payload shape metadata and never includes secrets or full payload content.
     this.log('debug', 'linkwarden_create_link_payload_shape', {
       hasTags: resolvedTags.length > 0,
       tagsCount: resolvedTags.length,
       firstTagType: resolvedTags.length > 0 ? typeof resolvedTags[0] : 'none',
-      hasCollectionId: typeof input.collectionId === 'number',
+      hasCollectionId: normalizedCollectionId !== undefined,
       hasArchivedFlag: typeof input.archived === 'boolean'
     });
 
     const response = await this.request<any>('POST', '/api/v1/links', {
-      body: {
-        type: 'url',
-        name: input.title ?? input.url,
-        url: input.url,
-        description: input.description ?? '',
-        collectionId: input.collectionId,
-        tags: resolvedTags,
-        archived: input.archived
-      }
+      body
     });
 
     return this.mapLink(this.extractSingleItem(response));

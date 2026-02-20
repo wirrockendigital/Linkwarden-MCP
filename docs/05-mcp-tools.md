@@ -147,6 +147,7 @@ Nutze linkwarden_capture_chat_links mit chatText "<chat transcript>" aiName "Cha
 Hinweis:
 
 - Ziel ist immer `AI Chats > <AI Name> > <Chat Name>`.
+- Wenn `chatName` nicht übergeben wird, nutzt das Tool den Fallback `Current Chat` und gibt dafür einen Warning-Hinweis zurück.
 - Tagging wird über User-Chat-Control gesteuert (`AI Chat`-Tag und optionaler `AI Name`-Tag separat schaltbar).
 - Falls Link-Erstellung mit Tags durch ein Upstream-Tag-Validation-Problem fehlschlägt, wird einmal ohne Tags erneut versucht und als Warning + `summary.createdWithoutTags` ausgewiesen.
 

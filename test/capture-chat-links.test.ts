@@ -435,6 +435,40 @@ describe('capture chat links', () => {
     expect(fake.state.createLinkCalls).toHaveLength(0);
   });
 
+  it('reports explicit warning when chatName is missing and fallback is used', async () => {
+    const store = createStore();
+    const userId = store.createUser({
+      username: 'capture-chatname-warning-user',
+      role: 'user',
+      passwordSalt: 'salt',
+      passwordHash: 'hash',
+      passwordKdf: 'scrypt',
+      passwordIterations: 16384,
+      writeModeEnabled: true
+    });
+    const fake = createFakeClient();
+    activeClient = fake.client;
+
+    const result = await executeTool(
+      'linkwarden_capture_chat_links',
+      {
+        chatText: 'https://example.com/fallback-chat-name',
+        aiName: 'ChatGPT',
+        dryRun: true
+      },
+      createContext(store, userId)
+    );
+
+    const payload = result.structuredContent as any;
+    expect(payload.ok).toBe(true);
+    expect(payload.data.chatName).toBe('Current Chat');
+    expect(
+      payload.warnings.some((warning: string) =>
+        warning.includes('chatName not provided, fallback "Current Chat" was used')
+      )
+    ).toBe(true);
+  });
+
   it('enforces write-mode gating for apply requests and surfaces per-link create failures', async () => {
     const store = createStore();
     const userId = store.createUser({
