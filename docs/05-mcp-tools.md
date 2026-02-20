@@ -148,6 +148,7 @@ Hinweis:
 
 - Ziel ist immer `AI Chats > <AI Name> > <Chat Name>`.
 - Tagging wird über User-Chat-Control gesteuert (`AI Chat`-Tag und optionaler `AI Name`-Tag separat schaltbar).
+- Falls Link-Erstellung mit Tags durch ein Upstream-Tag-Validation-Problem fehlschlägt, wird einmal ohne Tags erneut versucht und als Warning + `summary.createdWithoutTags` ausgewiesen.
 
 New-Links-Routine Status:
 

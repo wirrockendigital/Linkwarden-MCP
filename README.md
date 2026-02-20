@@ -233,6 +233,7 @@ Der MCP ist jetzt auf deinen gewünschten Arbeitsmodus ausgelegt:
   - `linkwarden_capture_chat_links` speichert Links nach `AI Chats -> <AI Name> -> <Chat Name>`
   - Collection-Hierarchie wird bei Apply automatisch angelegt, wenn sie fehlt
   - Dedupe erfolgt innerhalb der Ziel-Collection über kanonische URLs
+  - Wenn Tag-Validierung beim Erstellen fehlschlägt, wird einmal ohne Tags erneut versucht; Ergebnis wird als Warning plus `summary.createdWithoutTags` ausgewiesen
   - Chat-Control steuert Tag-Verhalten pro User:
     - `chatCaptureTagName` (Default `AI Chat`)
     - `chatCaptureTagAiChatEnabled` (Default `true`)

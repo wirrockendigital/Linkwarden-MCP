@@ -48,6 +48,7 @@ interface FakeState {
   createTagCalls: string[];
   createLinkCalls: Array<{ url: string; collectionId: number; tagIds?: number[] }>;
   failCreateLinkForUrl?: string;
+  failCreateLinkWithTagsForUrl?: string;
 }
 
 // This helper creates one isolated SQLite store for each test case.
@@ -97,6 +98,7 @@ function createFakeClient(initial?: {
   linksByCollection?: Record<number, LinkItem[]>;
   tags?: LinkTag[];
   failCreateLinkForUrl?: string;
+  failCreateLinkWithTagsForUrl?: string;
 }): { client: FakeLinkwardenClient; state: FakeState } {
   const state: FakeState = {
     collections: (initial?.collections ?? []).map((collection) => ({ ...collection })),
@@ -114,7 +116,8 @@ function createFakeClient(initial?: {
     createCollectionCalls: [],
     createTagCalls: [],
     createLinkCalls: [],
-    failCreateLinkForUrl: initial?.failCreateLinkForUrl
+    failCreateLinkForUrl: initial?.failCreateLinkForUrl,
+    failCreateLinkWithTagsForUrl: initial?.failCreateLinkWithTagsForUrl
   };
 
   const client: FakeLinkwardenClient = {
@@ -161,15 +164,28 @@ function createFakeClient(initial?: {
       tagIds?: number[];
       archived?: boolean;
     }): Promise<LinkItem> {
-      if (state.failCreateLinkForUrl && input.url === state.failCreateLinkForUrl) {
-        throw new AppError(403, 'forbidden', 'Link create blocked by fake policy.');
-      }
       const collectionId = Number(input.collectionId);
       state.createLinkCalls.push({
         url: input.url,
         collectionId,
         tagIds: input.tagIds ? [...input.tagIds] : undefined
       });
+
+      if (state.failCreateLinkForUrl && input.url === state.failCreateLinkForUrl) {
+        throw new AppError(403, 'forbidden', 'Link create blocked by fake policy.');
+      }
+      if (
+        state.failCreateLinkWithTagsForUrl &&
+        input.url === state.failCreateLinkWithTagsForUrl &&
+        Array.isArray(input.tagIds) &&
+        input.tagIds.length > 0
+      ) {
+        throw new AppError(
+          400,
+          'linkwarden_api_error',
+          '{"response":"Error: Invalid input: expected object, received number [tags, 0]"}'
+        );
+      }
 
       const nextId =
         [...state.linksByCollection.values()].flat().length > 0
@@ -465,5 +481,44 @@ describe('capture chat links', () => {
     expect(payload.summary.failed).toBe(1);
     expect(payload.summary.created).toBe(1);
     expect(payload.failures).toHaveLength(1);
+  });
+
+  it('retries once without tags when create fails with tag validation and keeps link creation successful', async () => {
+    const store = createStore();
+    const userId = store.createUser({
+      username: 'capture-tag-fallback-user',
+      role: 'user',
+      passwordSalt: 'salt',
+      passwordHash: 'hash',
+      passwordKdf: 'scrypt',
+      passwordIterations: 16384,
+      writeModeEnabled: true
+    });
+
+    const fake = createFakeClient({
+      failCreateLinkWithTagsForUrl: 'https://example.com/retry'
+    });
+    activeClient = fake.client;
+
+    const result = await executeTool(
+      'linkwarden_capture_chat_links',
+      {
+        urls: ['https://example.com/retry'],
+        aiName: 'ChatGPT',
+        chatName: 'Retry',
+        dryRun: false
+      },
+      createContext(store, userId)
+    );
+
+    const payload = result.structuredContent as any;
+    expect(payload.ok).toBe(true);
+    expect(payload.summary.created).toBe(1);
+    expect(payload.summary.failed).toBe(0);
+    expect(payload.summary.createdWithoutTags).toBe(1);
+    expect(payload.warnings.some((warning: string) => warning.includes('created without tags'))).toBe(true);
+    expect(fake.state.createLinkCalls).toHaveLength(2);
+    expect(fake.state.createLinkCalls[0].tagIds).toEqual([1, 2]);
+    expect(fake.state.createLinkCalls[1].tagIds).toBeUndefined();
   });
 });

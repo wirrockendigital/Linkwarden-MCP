@@ -137,6 +137,74 @@ describe('linkwarden client', () => {
     expect(issuedPutUpdate).toBe(false);
   });
 
+  it('uses object-based tags payload for native POST /api/v1/links createLink', async () => {
+    // This mock verifies create-link payload shape and returns one minimal native link payload.
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/api/v1/tags') && init?.method === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            response: [
+              { id: 11, name: 'AI Chat' },
+              { id: 12, name: 'ChatGPT' }
+            ],
+            total: 2
+          })
+        };
+      }
+
+      if (url.includes('/api/v1/links') && init?.method === 'POST') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            response: {
+              id: 91,
+              name: 'Example',
+              url: 'https://example.com',
+              description: '',
+              tags: [
+                { id: 11, name: 'AI Chat' },
+                { id: 12, name: 'ChatGPT' }
+              ],
+              collection: { id: 5, name: 'Thread', parentId: null },
+              pinnedBy: [],
+              archived: false,
+              createdAt: '2026-02-20T10:00:00.000Z',
+              updatedAt: '2026-02-20T10:00:00.000Z'
+            }
+          })
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true })
+      };
+    });
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new LinkwardenClient('http://linkwarden:3000', runtimeConfig, 'token-value');
+    await client.createLink({
+      url: 'https://example.com',
+      collectionId: 5,
+      tagIds: [12, 11]
+    });
+
+    const createLinkCall = fetchMock.mock.calls.find((call) => {
+      const url = String(call[0]);
+      const options = call[1] as RequestInit | undefined;
+      return url.includes('/api/v1/links') && options?.method === 'POST';
+    });
+    const createLinkRequest = createLinkCall?.[1] as { body?: string } | undefined;
+    expect(createLinkRequest?.body).toContain('"tags":[{"id":11,"name":"AI Chat"},{"id":12,"name":"ChatGPT"}]');
+    expect(createLinkRequest?.body).not.toContain('"tags":[11,12]');
+  });
+
   it('uses native POST /api/v1/tags for createTag', async () => {
     // This mock verifies the native tag creation request shape.
     const fetchMock = vi.fn(async () => ({

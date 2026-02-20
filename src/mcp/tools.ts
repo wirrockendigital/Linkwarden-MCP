@@ -281,6 +281,44 @@ function normalizeAiNameTag(raw: string | undefined): string {
   return normalizeCollectionSegment(raw, 'ChatGPT', 80);
 }
 
+// This helper normalizes one create-link error into a stable readable message.
+function formatCreateLinkError(error: unknown): string {
+  if (error instanceof Error) {
+    const rawMessage = error.message.trim();
+    if (!rawMessage) {
+      return 'create link failed';
+    }
+
+    // This parsing extracts nested API response strings that may be wrapped as serialized JSON.
+    try {
+      const parsed = JSON.parse(rawMessage) as { response?: unknown; message?: unknown };
+      if (typeof parsed.response === 'string' && parsed.response.trim().length > 0) {
+        return parsed.response.trim();
+      }
+      if (typeof parsed.message === 'string' && parsed.message.trim().length > 0) {
+        return parsed.message.trim();
+      }
+    } catch {
+      // This branch intentionally falls back to the raw error message when JSON parsing is not applicable.
+    }
+
+    return rawMessage;
+  }
+
+  return 'create link failed';
+}
+
+// This helper classifies link-create validation failures that are specifically tied to the tags field.
+function isTagRelatedCreateError(error: unknown): boolean {
+  const normalizedMessage = formatCreateLinkError(error).toLocaleLowerCase();
+  return (
+    /\[tags(?:,\s*\d+)?\]/i.test(normalizedMessage) ||
+    /expected object,\s*received number.*tags/i.test(normalizedMessage) ||
+    /invalid input.*tags/i.test(normalizedMessage) ||
+    /validation.*tags/i.test(normalizedMessage)
+  );
+}
+
 // This helper trims wrapper and trailing punctuation artifacts from extracted URL candidates.
 function cleanExtractedUrlCandidate(raw: string): string {
   let value = raw.trim();
@@ -3536,6 +3574,7 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
             duplicatesWithinInput: normalizedCandidates.duplicatesWithinInput,
             duplicatesInTargetCollection: skippedExisting,
             toCreate: toCreateCandidates.length,
+            createdWithoutTags: 0,
             invalid: normalizedCandidates.invalidCount
           },
           paging: null,
@@ -3550,26 +3589,66 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
 
       const failures: Array<{ itemId: string; code: string; message: string; retryable: boolean }> = [];
       const createdLinks: Array<{ id: number; url: string; collectionId: number; tagIds: number[] }> = [];
+      const createdWithoutTagsLinks: Array<{ id: number; url: string; collectionId: number }> = [];
 
       for (const candidate of toCreateCandidates) {
+        // This payload keeps one shared base for first create attempt and optional fallback retry.
+        const createInputBase = {
+          url: candidate.originalUrl,
+          title: candidate.originalUrl,
+          collectionId: hierarchy.chatCollection.id
+        };
+        const requestedTagIds = tagResolution.tagIds.length > 0 ? tagResolution.tagIds : undefined;
+
         try {
           const created = await client.createLink({
-            url: candidate.originalUrl,
-            title: candidate.originalUrl,
-            collectionId: hierarchy.chatCollection.id,
-            tagIds: tagResolution.tagIds.length > 0 ? tagResolution.tagIds : undefined
+            ...createInputBase,
+            tagIds: requestedTagIds
           });
           createdLinks.push({
             id: created.id,
             url: created.url,
             collectionId: hierarchy.chatCollection.id,
-            tagIds: tagResolution.tagIds
+            tagIds: requestedTagIds ?? []
           });
         } catch (error) {
+          const firstErrorMessage = formatCreateLinkError(error);
+
+          // This retry keeps link ingestion available even when Linkwarden rejects tag shape or tag validation on create.
+          if (requestedTagIds && isTagRelatedCreateError(error)) {
+            try {
+              const retryCreated = await client.createLink(createInputBase);
+              createdLinks.push({
+                id: retryCreated.id,
+                url: retryCreated.url,
+                collectionId: hierarchy.chatCollection.id,
+                tagIds: []
+              });
+              createdWithoutTagsLinks.push({
+                id: retryCreated.id,
+                url: retryCreated.url,
+                collectionId: hierarchy.chatCollection.id
+              });
+              warnings.push(
+                `capture_chat_links: tag application failed for "${candidate.originalUrl}", link was created without tags.`
+              );
+              continue;
+            } catch (retryError) {
+              const retryErrorMessage = formatCreateLinkError(retryError);
+              failures.push({
+                itemId: candidate.originalUrl,
+                code: 'create_link_failed',
+                message: `${firstErrorMessage} | retry_without_tags_failed: ${retryErrorMessage}`,
+                retryable: true
+              });
+              continue;
+            }
+          }
+
           failures.push({
             itemId: candidate.originalUrl,
             code: 'create_link_failed',
-            message: error instanceof Error ? error.message : 'create link failed',
+            message: firstErrorMessage,
             retryable: true
           });
         }
@@ -3595,6 +3674,7 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
           tagIds: tagResolution.tagIds,
           detected: normalizedCandidates.normalized.length,
           created: createdLinks.length,
+          createdWithoutTags: createdWithoutTagsLinks.length,
           failed: failures.length
         }
       });
@@ -3615,7 +3695,8 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
           appliedTagIds: tagResolution.tagIds,
           createdTags: tagResolution.created,
           missingTags: tagResolution.missing,
-          createdLinks: createdLinks.slice(0, input.previewLimit)
+          createdLinks: createdLinks.slice(0, input.previewLimit),
+          createdWithoutTagsLinks: createdWithoutTagsLinks.slice(0, input.previewLimit)
         },
         summary: {
           dryRun: false,
@@ -3624,6 +3705,7 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
           duplicatesInTargetCollection: skippedExisting,
           toCreate: toCreateCandidates.length,
           created: createdLinks.length,
+          createdWithoutTags: createdWithoutTagsLinks.length,
           failed: failures.length,
           invalid: normalizedCandidates.invalidCount
         },

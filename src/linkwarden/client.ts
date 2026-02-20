@@ -897,6 +897,19 @@ export class LinkwardenClient {
 
   // This method creates one URL link and returns normalized bounded link output.
   public async createLink(input: CreateLinkInput): Promise<LinkItem> {
+    // This normalization keeps tag payload generation strict and deterministic for Linkwarden create requests.
+    const normalizedTagIds = Array.isArray(input.tagIds) ? input.tagIds.map((tagId) => Number(tagId)) : [];
+    const resolvedTags = normalizedTagIds.length > 0 ? await this.resolveTagPayload(normalizedTagIds) : [];
+
+    // This debug event only logs payload shape metadata and never includes secrets or full payload content.
+    this.log('debug', 'linkwarden_create_link_payload_shape', {
+      hasTags: resolvedTags.length > 0,
+      tagsCount: resolvedTags.length,
+      firstTagType: resolvedTags.length > 0 ? typeof resolvedTags[0] : 'none',
+      hasCollectionId: typeof input.collectionId === 'number',
+      hasArchivedFlag: typeof input.archived === 'boolean'
+    });
+
     const response = await this.request<any>('POST', '/api/v1/links', {
       body: {
         type: 'url',
@@ -904,7 +917,7 @@ export class LinkwardenClient {
         url: input.url,
         description: input.description ?? '',
         collectionId: input.collectionId,
-        tags: input.tagIds,
+        tags: resolvedTags,
         archived: input.archived
       }
     });
