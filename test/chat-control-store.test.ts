@@ -37,6 +37,9 @@ describe('chat control store', () => {
     const settings = store.getUserChatControlSettings(userId);
     expect(settings.archiveCollectionName).toBe('Archive');
     expect(settings.archiveCollectionParentId).toBeNull();
+    expect(settings.chatCaptureTagName).toBe('AI Chat');
+    expect(settings.chatCaptureTagAiChatEnabled).toBe(true);
+    expect(settings.chatCaptureTagAiNameEnabled).toBe(true);
   });
 
   it('stores per-user archive collection name and optional parent id', () => {
@@ -53,14 +56,23 @@ describe('chat control store', () => {
 
     const updated = store.setUserChatControlSettings(userId, {
       archiveCollectionName: 'Archive Team',
-      archiveCollectionParentId: 42
+      archiveCollectionParentId: 42,
+      chatCaptureTagName: 'My AI Chat',
+      chatCaptureTagAiChatEnabled: false,
+      chatCaptureTagAiNameEnabled: true
     });
 
     expect(updated.archiveCollectionName).toBe('Archive Team');
     expect(updated.archiveCollectionParentId).toBe(42);
+    expect(updated.chatCaptureTagName).toBe('My AI Chat');
+    expect(updated.chatCaptureTagAiChatEnabled).toBe(false);
+    expect(updated.chatCaptureTagAiNameEnabled).toBe(true);
 
     const persisted = store.getUserChatControlSettings(userId);
     expect(persisted.archiveCollectionName).toBe('Archive Team');
     expect(persisted.archiveCollectionParentId).toBe(42);
+    expect(persisted.chatCaptureTagName).toBe('My AI Chat');
+    expect(persisted.chatCaptureTagAiChatEnabled).toBe(false);
+    expect(persisted.chatCaptureTagAiNameEnabled).toBe(true);
   });
 });

@@ -72,6 +72,9 @@ Jeder User kann im Dashboard unter „Mein Chat-Control“ seine Archiv-Collecti
 
 - `Archiv-Collection-Name` (Default: `Archive`)
 - optional `Archiv Parent Collection ID`
+- `Chat-Link-Tag-Name` (Default: `AI Chat`)
+- `AI Chat-Tag setzen` (Default: aktiv)
+- `AI Name-Tag setzen` (Default: aktiv)
 
 Empfehlung für den Betrieb:
 
@@ -86,6 +89,15 @@ Verhalten bei Soft-Delete (`ARCHIVE_TAG`):
   - bei mehreren Root-Treffern die kleinste `id`
   - ohne Root-Treffer insgesamt die kleinste `id`
 - Das Tag `to-delete` wird bei Apply bei Bedarf automatisch angelegt und gesetzt.
+
+Verhalten bei `linkwarden_capture_chat_links`:
+
+- Ziel-Hierarchie: `AI Chats -> <AI Name> -> <Chat Name>`.
+- Fehlende Collections werden bei Apply automatisch angelegt.
+- Dedupe läuft innerhalb der Ziel-Collection (kanonische URL, keine Doppelanlagen).
+- Tagging pro User:
+  - statischer Tag aus `Chat-Link-Tag-Name` (wenn `AI Chat-Tag setzen` aktiv)
+  - dynamischer Tag aus `AI Name` (wenn `AI Name-Tag setzen` aktiv)
 
 ## Health und Readiness
 

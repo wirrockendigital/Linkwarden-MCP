@@ -139,7 +139,16 @@ const setChatControlSchema = z
         z.string().max(120).transform((value) => value || 'Archive')
       )
       .optional(),
-    archiveCollectionParentId: z.number().int().positive().nullable().optional()
+    archiveCollectionParentId: z.number().int().positive().nullable().optional(),
+    // This transform keeps empty user input compatible with the backend default chat capture tag name.
+    chatCaptureTagName: z
+      .preprocess(
+        (value) => (typeof value === 'string' ? value.trim() : value),
+        z.string().max(80).transform((value) => value || 'AI Chat')
+      )
+      .optional(),
+    chatCaptureTagAiChatEnabled: z.boolean().optional(),
+    chatCaptureTagAiNameEnabled: z.boolean().optional()
   })
   .refine((payload) => Object.keys(payload).length > 0, {
     message: 'At least one chat-control field must be updated.'
@@ -335,6 +344,437 @@ function sanitizeNextPath(value: unknown): string | null {
   return trimmed;
 }
 
+// This helper renders one early theme boot script to avoid flashes before CSS variables are applied.
+function renderThemeHead(): string {
+  return `<script>
+(() => {
+  const storageKey = 'lwmcp.themePreference';
+  const allowed = new Set(['system', 'light', 'dark']);
+  const media = typeof window.matchMedia === 'function'
+    ? window.matchMedia('(prefers-color-scheme: dark)')
+    : null;
+
+  const readPreference = () => {
+    try {
+      const raw = window.localStorage.getItem(storageKey);
+      return allowed.has(raw || '') ? raw : 'system';
+    } catch {
+      return 'system';
+    }
+  };
+
+  const writePreference = (preference) => {
+    if (!allowed.has(preference)) {
+      return;
+    }
+    try {
+      window.localStorage.setItem(storageKey, preference);
+    } catch {
+      // This no-op keeps theme switching functional even when localStorage is unavailable.
+    }
+  };
+
+  const resolveTheme = (preference) => {
+    if (preference === 'dark' || preference === 'light') {
+      return preference;
+    }
+    return media && media.matches ? 'dark' : 'light';
+  };
+
+  const applyResolvedTheme = (theme) => {
+    const normalized = theme === 'dark' ? 'dark' : 'light';
+    document.documentElement.dataset.theme = normalized;
+    document.documentElement.style.colorScheme = normalized;
+  };
+
+  const applyFromPreference = (preference) => {
+    applyResolvedTheme(resolveTheme(preference));
+  };
+
+  const syncSwitchers = () => {
+    const preference = readPreference();
+    document.querySelectorAll('[data-theme-switcher]').forEach((element) => {
+      if (element && element.tagName === 'SELECT') {
+        element.value = preference;
+      }
+    });
+  };
+
+  const bindSwitcher = (switcher) => {
+    if (!switcher || switcher.dataset.themeBound === '1') {
+      return;
+    }
+    switcher.dataset.themeBound = '1';
+    switcher.addEventListener('change', (event) => {
+      const nextPreference = event?.target?.value;
+      if (!allowed.has(nextPreference)) {
+        return;
+      }
+      writePreference(nextPreference);
+      applyFromPreference(nextPreference);
+      syncSwitchers();
+    });
+  };
+
+  const initSwitchers = () => {
+    document.querySelectorAll('[data-theme-switcher]').forEach((element) => {
+      if (element && element.tagName === 'SELECT') {
+        bindSwitcher(element);
+      }
+    });
+    syncSwitchers();
+  };
+
+  // This initial apply ensures the first paint already uses the persisted/system theme.
+  applyFromPreference(readPreference());
+  if (media && typeof media.addEventListener === 'function') {
+    media.addEventListener('change', () => {
+      if (readPreference() === 'system') {
+        applyFromPreference('system');
+        syncSwitchers();
+      }
+    });
+  } else if (media && typeof media.addListener === 'function') {
+    media.addListener(() => {
+      if (readPreference() === 'system') {
+        applyFromPreference('system');
+        syncSwitchers();
+      }
+    });
+  }
+
+  window.lwmcpTheme = {
+    initSwitchers,
+    readPreference,
+    applyFromPreference
+  };
+})();
+</script>`;
+}
+
+// This helper renders shared theme tokens and base component styles for every /admin page.
+function renderThemeStyles(): string {
+  return `<style>
+  :root {
+    --bg: #f4f5f7;
+    --surface: #ffffff;
+    --text: #111319;
+    --text-muted: #4b5563;
+    --border: #d1d5db;
+    --accent: #E94C16;
+    --accent-strong: #9e2c0a;
+    --accent-soft: #fde8df;
+    --focus-ring: rgba(233, 76, 22, 0.45);
+    --input-bg: #ffffff;
+    --pre-bg: #f5f7fb;
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #12161b;
+    --surface: #1b222b;
+    --text: #eef2f7;
+    --text-muted: #b8c3cf;
+    --border: #354252;
+    --accent: #E94C16;
+    --accent-strong: #bf3a0f;
+    --accent-soft: #3b241d;
+    --focus-ring: rgba(233, 76, 22, 0.55);
+    --input-bg: #1a2028;
+    --pre-bg: #151b22;
+  }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+    margin: 0;
+    padding: 0;
+  }
+
+  .page {
+    max-width: 980px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+  }
+
+  .page.page-narrow { max-width: 760px; }
+  .page.page-medium { max-width: 860px; }
+  .page-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  .theme-control {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-muted);
+    font-size: 0.95rem;
+    white-space: nowrap;
+  }
+
+  .theme-control label {
+    display: inline;
+    margin: 0;
+    font-weight: 600;
+  }
+
+  .theme-control select {
+    width: auto;
+    min-width: 9rem;
+    margin: 0;
+    padding: 0.42rem 0.55rem;
+    border-radius: 8px;
+  }
+
+  .card {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    padding: 1rem 1.25rem;
+    margin-bottom: 1rem;
+    color: var(--text);
+  }
+
+  label { display: block; font-weight: 600; margin-top: 0.8rem; }
+
+  input, select, textarea, button {
+    width: 100%;
+    padding: 0.6rem;
+    margin-top: 0.35rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--input-bg);
+    color: var(--text);
+  }
+
+  button {
+    cursor: pointer;
+    font-weight: 700;
+    background: var(--accent-strong);
+    border-color: var(--accent-strong);
+    color: #ffffff;
+    transition: filter 0.15s ease-in-out, transform 0.05s ease-in-out;
+  }
+
+  button:hover { filter: brightness(1.06); }
+  button:active { transform: translateY(1px); }
+
+  input:focus, select:focus, textarea:focus, button:focus {
+    outline: 3px solid var(--focus-ring);
+    outline-offset: 1px;
+  }
+
+  textarea { min-height: 120px; }
+  pre {
+    background: var(--pre-bg);
+    border-radius: 10px;
+    padding: 0.8rem;
+    overflow: auto;
+    border: 1px solid var(--border);
+  }
+
+  p { color: var(--text); }
+  h1, h2, h3 { color: var(--text); }
+
+  a {
+    color: var(--accent);
+  }
+
+  .tabs-shell {
+    margin-bottom: 1rem;
+    padding: 0.75rem;
+  }
+
+  .top-tabs,
+  .sub-tabs {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 0.2rem;
+  }
+
+  .top-tabs {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background: var(--surface);
+  }
+
+  .top-tab-btn,
+  .sub-tab-btn {
+    flex: 0 0 auto;
+    width: auto;
+    margin: 0;
+    padding: 0.5rem 0.85rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    font-weight: 700;
+  }
+
+  .top-tab-btn[aria-selected="true"],
+  .sub-tab-btn[aria-selected="true"] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+  }
+
+  .sub-tabs {
+    margin-top: 0.55rem;
+    border-top: 1px solid var(--border);
+    padding-top: 0.6rem;
+  }
+
+  .tab-panel-card[hidden] {
+    display: none !important;
+  }
+
+  .status-inline {
+    margin-top: 0.6rem;
+    font-size: 0.9rem;
+    color: var(--text-muted);
+  }
+
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+    gap: 0.6rem;
+    margin: 0.7rem 0 0.4rem;
+  }
+
+  .kpi-item {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.55rem 0.65rem;
+    background: var(--pre-bg);
+  }
+
+  .kpi-label {
+    display: block;
+    font-size: 0.76rem;
+    color: var(--text-muted);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .kpi-value {
+    display: block;
+    margin-top: 0.2rem;
+    font-size: 0.92rem;
+    font-weight: 700;
+    color: var(--text);
+  }
+
+  .form-block {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.7rem 0.8rem;
+    margin-top: 0.8rem;
+    background: var(--pre-bg);
+  }
+
+  .form-block h3 {
+    margin: 0;
+    font-size: 1rem;
+  }
+
+  .help-text {
+    margin: 0.35rem 0 0.15rem;
+    color: var(--text-muted);
+    font-size: 0.88rem;
+  }
+
+  .field-error {
+    margin: 0.28rem 0 0;
+    color: #b42318;
+    font-size: 0.86rem;
+    font-weight: 600;
+  }
+
+  :root[data-theme="dark"] .field-error {
+    color: #ff8a66;
+  }
+
+  .field-invalid {
+    border-color: #b42318 !important;
+  }
+
+  :root[data-theme="dark"] .field-invalid {
+    border-color: #ff8a66 !important;
+  }
+
+  .toast-stack {
+    position: fixed;
+    right: 1rem;
+    bottom: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    z-index: 1200;
+    max-width: min(94vw, 30rem);
+  }
+
+  .toast {
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 0.66rem 0.78rem;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
+    font-size: 0.92rem;
+  }
+
+  .toast.success { border-color: #1f883d; }
+  .toast.error { border-color: #b42318; }
+  .toast.info { border-color: var(--accent); }
+
+  .debug-details summary {
+    cursor: pointer;
+    font-weight: 700;
+    color: var(--accent);
+  }
+
+  .debug-details[open] summary {
+    margin-bottom: 0.6rem;
+  }
+
+  @media (max-width: 720px) {
+    .page-header {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+  }
+  </style>`;
+}
+
+// This helper renders one reusable theme switcher control for all /admin pages.
+function renderThemeSwitcher(): string {
+  return `<div class="theme-control">
+    <label for="themePreference">Darstellung</label>
+    <select id="themePreference" data-theme-switcher>
+      <option value="system">System</option>
+      <option value="light">Hell</option>
+      <option value="dark">Dunkel</option>
+    </select>
+  </div>`;
+}
+
+// This helper initializes switcher bindings after page-specific scripts are loaded.
+function renderThemeInitScript(): string {
+  return `
+if (window.lwmcpTheme && typeof window.lwmcpTheme.initSwitchers === 'function') {
+  window.lwmcpTheme.initSwitchers();
+}
+`;
+}
+
 // This helper sends the standard login page for initialized systems without session.
 function renderLoginPage(csrfToken: string, nextPath: string | null): string {
   return `<!doctype html>
@@ -343,18 +783,16 @@ function renderLoginPage(csrfToken: string, nextPath: string | null): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>linkwarden-mcp Login</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; margin: 2rem; max-width: 760px; }
-    .card { border: 1px solid #d9d9d9; border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
-    label { display:block; font-weight:600; margin-top:0.8rem; }
-    input, select, textarea, button { width:100%; padding:0.6rem; margin-top:0.35rem; border-radius:8px; border:1px solid #b8b8b8; }
-    button { cursor:pointer; font-weight:700; }
-    pre { background:#f8f8f8; border-radius:10px; padding:0.8rem; overflow:auto; }
-  </style>
+  ${renderThemeHead()}
+  ${renderThemeStyles()}
 </head>
 <body>
-  <h1>linkwarden-mcp</h1>
-  <div class="card">
+  <div class="page page-narrow">
+  <div class="page-header">
+    <h1>linkwarden-mcp</h1>
+    ${renderThemeSwitcher()}
+  </div>
+  <div class="card tab-panel-card" data-top-tab="administration" data-sub-tab="benutzer">
     <h2>Login</h2>
     <label for="username">Benutzername</label>
     <input id="username" autocomplete="username" />
@@ -362,7 +800,7 @@ function renderLoginPage(csrfToken: string, nextPath: string | null): string {
     <input id="password" type="password" autocomplete="current-password" />
     <button onclick="login()">Einloggen</button>
   </div>
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="governance" data-sub-tab="tagging-policy">
     <h3>Antwort</h3>
     <pre id="result">Warte auf Aktion ...</pre>
   </div>
@@ -392,7 +830,9 @@ async function login() {
     window.location.href = nextPath || '/admin';
   }
 }
+${renderThemeInitScript()}
 </script>
+  </div>
 </body>
 </html>`;
 }
@@ -405,19 +845,16 @@ function renderFirstRunPage(csrfToken: string): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>linkwarden-mcp First-Run Setup</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; margin: 2rem; max-width: 860px; }
-    .card { border: 1px solid #d9d9d9; border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
-    label { display:block; font-weight:600; margin-top:0.8rem; }
-    input, textarea, button { width:100%; padding:0.6rem; margin-top:0.35rem; border-radius:8px; border:1px solid #b8b8b8; }
-    button { cursor:pointer; font-weight:700; }
-    textarea { min-height: 140px; }
-    pre { background:#f8f8f8; border-radius:10px; padding:0.8rem; overflow:auto; }
-  </style>
+  ${renderThemeHead()}
+  ${renderThemeStyles()}
 </head>
 <body>
-  <h1>linkwarden-mcp First-Run Setup</h1>
-  <div class="card">
+  <div class="page page-medium">
+  <div class="page-header">
+    <h1>linkwarden-mcp First-Run Setup</h1>
+    ${renderThemeSwitcher()}
+  </div>
+  <div class="card tab-panel-card" data-top-tab="administration" data-sub-tab="admin-keys">
     <p>Richte hier den ersten Admin und das Linkwarden-Ziel ein.</p>
     <label for="masterPassphrase">Master-Passphrase</label>
     <input id="masterPassphrase" type="password" />
@@ -437,7 +874,7 @@ function renderFirstRunPage(csrfToken: string): string {
     <label><input id="issueAdminApiKey" type="checkbox" checked /> Initialen Admin-MCP-Key erzeugen (einmalig anzeigen)</label>
     <button onclick="initializeSetup()">Setup abschließen</button>
   </div>
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="integrationen" data-sub-tab="user-linkwarden-token">
     <h3>Antwort</h3>
     <pre id="result">Warte auf Aktion ...</pre>
   </div>
@@ -473,7 +910,9 @@ async function initializeSetup() {
     window.location.href = '/admin';
   }
 }
+${renderThemeInitScript()}
 </script>
+  </div>
 </body>
 </html>`;
 }
@@ -486,18 +925,16 @@ function renderUnlockPage(csrfToken: string): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>linkwarden-mcp Unlock</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; margin: 2rem; max-width: 760px; }
-    .card { border: 1px solid #d9d9d9; border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
-    label { display:block; font-weight:600; margin-top:0.8rem; }
-    input, button { width:100%; padding:0.6rem; margin-top:0.35rem; border-radius:8px; border:1px solid #b8b8b8; }
-    button { cursor:pointer; font-weight:700; }
-    pre { background:#f8f8f8; border-radius:10px; padding:0.8rem; overflow:auto; }
-  </style>
+  ${renderThemeHead()}
+  ${renderThemeStyles()}
 </head>
 <body>
-  <h1>linkwarden-mcp Unlock</h1>
-  <div class="card">
+  <div class="page page-narrow">
+  <div class="page-header">
+    <h1>linkwarden-mcp Unlock</h1>
+    ${renderThemeSwitcher()}
+  </div>
+  <div class="card tab-panel-card" data-top-tab="integrationen" data-sub-tab="linkwarden-ziel">
     <p>Der Server ist initialisiert, aber aktuell gesperrt. Normalerweise übernimmt Auto-Unlock das beim Start.</p>
     <label for="passphrase">Master-Passphrase</label>
     <input id="passphrase" type="password" />
@@ -528,131 +965,171 @@ async function unlockConfig() {
     window.location.href = '/admin';
   }
 }
+${renderThemeInitScript()}
 </script>
+  </div>
 </body>
 </html>`;
 }
 
 // This helper renders a shared dashboard shell used for admin and standard users.
-function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): string {
+export function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): string {
   const adminSections =
     principal.role === 'admin'
       ? `
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="administration" data-sub-tab="benutzer">
     <h2>Admin: Benutzer verwalten</h2>
     <button onclick="loadUsers()">Benutzer laden</button>
     <pre id="usersResult">Noch nicht geladen</pre>
-    <label for="newUsername">Neuer Benutzername</label>
-    <input id="newUsername" />
-    <label for="newPassword">Neues Passwort</label>
-    <input id="newPassword" type="password" />
-    <label for="newRole">Rolle</label>
-    <select id="newRole"><option value="user">user</option><option value="admin">admin</option></select>
-    <label><input id="newWriteMode" type="checkbox" /> Write-Mode aktiv</label>
-    <button onclick="createUser()">Benutzer anlegen</button>
-    <label for="toggleUserSelect">Benutzer für Aktiv/Deaktiv</label>
-    <select id="toggleUserSelect"></select>
-    <label><input id="toggleUserActive" type="checkbox" checked /> Aktiv</label>
-    <button onclick="setUserActive()">Aktiv-Status setzen</button>
-    <label for="writeModeUserSelect">Benutzer für Write-Mode</label>
-    <select id="writeModeUserSelect"></select>
-    <label><input id="writeModeForUser" type="checkbox" /> Write-Mode aktiv</label>
-    <button onclick="setUserWriteMode()">Write-Mode pro User setzen</button>
-    <label for="offlinePolicyUserSelect">Benutzer für 404-Policy</label>
-    <select id="offlinePolicyUserSelect"></select>
-    <label for="offlineDaysForUser">Offline-Tage bis Aktion</label>
-    <input id="offlineDaysForUser" type="number" min="1" max="365" value="14" />
-    <label for="offlineFailuresForUser">Min. aufeinanderfolgende Fehler</label>
-    <input id="offlineFailuresForUser" type="number" min="1" max="30" value="3" />
-    <label for="offlineActionForUser">Aktion bei dauerhaftem 404</label>
-    <select id="offlineActionForUser">
-      <option value="archive">archive</option>
-      <option value="delete">delete</option>
-      <option value="none">none</option>
-    </select>
-    <label for="offlineArchiveCollectionIdForUser">Archive Collection ID (nur bei archive)</label>
-    <input id="offlineArchiveCollectionIdForUser" type="number" min="1" />
-    <button onclick="setUserOfflinePolicy()">404-Policy pro User setzen</button>
+
+    <div class="form-block" data-form-section="benutzer-anlegen" data-form-section-label="Benutzer anlegen">
+      <h3>Anlegen</h3>
+      <p class="help-text">Erstellt einen neuen Benutzer mit initialer Rolle und optional aktivem Write-Mode.</p>
+      <label for="newUsername">Neuer Benutzername</label>
+      <input id="newUsername" />
+      <label for="newPassword">Neues Passwort</label>
+      <input id="newPassword" type="password" />
+      <label for="newRole">Rolle</label>
+      <select id="newRole"><option value="user">user</option><option value="admin">admin</option></select>
+      <label><input id="newWriteMode" type="checkbox" /> Write-Mode aktiv</label>
+      <button onclick="createUser()">Benutzer anlegen</button>
+    </div>
+
+    <div class="form-block" data-form-section="benutzer-status" data-form-section-label="Aktiv und Write-Mode">
+      <h3>Aktiv / Write-Mode</h3>
+      <p class="help-text">Steuert Login-Zugriff und Bearbeitungsrechte pro Benutzer.</p>
+      <label for="toggleUserSelect">Benutzer für Aktiv/Deaktiv</label>
+      <select id="toggleUserSelect"></select>
+      <label><input id="toggleUserActive" type="checkbox" checked /> Aktiv</label>
+      <button onclick="setUserActive()">Aktiv-Status setzen</button>
+      <label for="writeModeUserSelect">Benutzer für Write-Mode</label>
+      <select id="writeModeUserSelect"></select>
+      <label><input id="writeModeForUser" type="checkbox" /> Write-Mode aktiv</label>
+      <button onclick="setUserWriteMode()">Write-Mode pro User setzen</button>
+    </div>
+
+    <div class="form-block" data-form-section="benutzer-offline-policy" data-form-section-label="404-Policy">
+      <h3>404-Policy</h3>
+      <p class="help-text">Definiert, wann bei länger offline erreichbaren Links archiviert, gelöscht oder nichts getan wird.</p>
+      <label for="offlinePolicyUserSelect">Benutzer für 404-Policy</label>
+      <select id="offlinePolicyUserSelect"></select>
+      <label for="offlineDaysForUser">Offline-Tage bis Aktion</label>
+      <input id="offlineDaysForUser" type="number" min="1" max="365" value="14" />
+      <label for="offlineFailuresForUser">Min. aufeinanderfolgende Fehler</label>
+      <input id="offlineFailuresForUser" type="number" min="1" max="30" value="3" />
+      <label for="offlineActionForUser">Aktion bei dauerhaftem 404</label>
+      <select id="offlineActionForUser">
+        <option value="archive">archive</option>
+        <option value="delete">delete</option>
+        <option value="none">none</option>
+      </select>
+      <label for="offlineArchiveCollectionIdForUser">Archive Collection ID (nur bei archive)</label>
+      <input id="offlineArchiveCollectionIdForUser" type="number" min="1" />
+      <button onclick="setUserOfflinePolicy()">404-Policy pro User setzen</button>
+    </div>
   </div>
 
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="governance" data-sub-tab="tagging-policy">
     <h2>Admin: Governed Tagging Policy</h2>
     <button onclick="loadTaggingPolicy()">Tagging-Policy laden</button>
     <pre id="taggingPolicyResult">Noch nicht geladen</pre>
-    <label for="policyFetchMode">Globaler Fetch-Mode</label>
-    <select id="policyFetchMode">
-      <option value="never">never</option>
-      <option value="optional">optional</option>
-      <option value="always">always</option>
-    </select>
-    <label><input id="policyAllowUserFetchOverride" type="checkbox" /> User dürfen eigenen Fetch-Mode setzen</label>
-    <label for="policyInferenceProvider">AI Provider für Tag-Kontext</label>
-    <select id="policyInferenceProvider">
-      <option value="builtin">builtin (lokal, ohne externes LLM)</option>
-      <option value="perplexity">perplexity</option>
-      <option value="mistral">mistral</option>
-      <option value="huggingface">huggingface</option>
-    </select>
-    <label for="policyInferenceModel">AI Modell (optional; bei huggingface empfohlen/üblich erforderlich)</label>
-    <input id="policyInferenceModel" placeholder="z. B. sonar, mistral-small-latest, meta-llama/Llama-3.1-8B-Instruct" />
-    <label for="policyBlockedTags">Blockierte Tags (Komma-separiert)</label>
-    <input id="policyBlockedTags" placeholder="spam, tracking, misc" />
-    <label for="policySimilarityThreshold">Similarity Threshold (0-1)</label>
-    <input id="policySimilarityThreshold" type="number" min="0" max="1" step="0.01" value="0.88" />
-    <label for="policyFetchTimeoutMs">Fetch Timeout (ms)</label>
-    <input id="policyFetchTimeoutMs" type="number" min="500" max="20000" value="3000" />
-    <label for="policyFetchMaxBytes">Fetch Max Bytes</label>
-    <input id="policyFetchMaxBytes" type="number" min="8192" max="1048576" value="131072" />
-    <button onclick="setTaggingPolicy()">Tagging-Policy speichern</button>
-    <label for="taggingPreferenceUserSelect">Benutzer für Tagging-Preferences</label>
-    <select id="taggingPreferenceUserSelect"></select>
-    <label for="taggingStrictnessForUser">Strenge pro User</label>
-    <select id="taggingStrictnessForUser">
-      <option value="very_strict">very_strict</option>
-      <option value="medium">medium</option>
-      <option value="relaxed">relaxed</option>
-    </select>
-    <label for="fetchModeForUser">Fetch-Mode pro User</label>
-    <select id="fetchModeForUser">
-      <option value="never">never</option>
-      <option value="optional">optional</option>
-      <option value="always">always</option>
-    </select>
-    <label for="queryTimeZoneForUser">Query-Zeitzone pro User (IANA)</label>
-    <input id="queryTimeZoneForUser" placeholder="Europe/Berlin" />
-    <button onclick="setUserTaggingPreferences()">Tagging-Preferences pro User speichern</button>
+
+    <div class="form-block" data-form-section="tagging-global" data-form-section-label="Tagging global">
+      <h3>Global</h3>
+      <p class="help-text">Definiert die globale Tagging-Strategie für alle Benutzer.</p>
+      <label for="policyFetchMode">Globaler Fetch-Mode</label>
+      <select id="policyFetchMode">
+        <option value="never">never</option>
+        <option value="optional">optional</option>
+        <option value="always">always</option>
+      </select>
+      <label><input id="policyAllowUserFetchOverride" type="checkbox" /> User dürfen eigenen Fetch-Mode setzen</label>
+      <label for="policyBlockedTags">Blockierte Tags (Komma-separiert)</label>
+      <input id="policyBlockedTags" placeholder="spam, tracking, misc" />
+      <label for="policySimilarityThreshold">Similarity Threshold (0-1)</label>
+      <input id="policySimilarityThreshold" type="number" min="0" max="1" step="0.01" value="0.88" />
+      <label for="policyFetchTimeoutMs">Fetch Timeout (ms)</label>
+      <input id="policyFetchTimeoutMs" type="number" min="500" max="20000" value="3000" />
+      <label for="policyFetchMaxBytes">Fetch Max Bytes</label>
+      <input id="policyFetchMaxBytes" type="number" min="8192" max="1048576" value="131072" />
+    </div>
+
+    <div class="form-block" data-form-section="tagging-provider" data-form-section-label="Tagging Provider">
+      <h3>Provider</h3>
+      <p class="help-text">Steuert, welcher AI-Provider für Tag-Kontext verwendet wird.</p>
+      <label for="policyInferenceProvider">AI Provider für Tag-Kontext</label>
+      <select id="policyInferenceProvider">
+        <option value="builtin">builtin (lokal, ohne externes LLM)</option>
+        <option value="perplexity">perplexity</option>
+        <option value="mistral">mistral</option>
+        <option value="huggingface">huggingface</option>
+      </select>
+      <label for="policyInferenceModel">AI Modell (optional; bei huggingface empfohlen/üblich erforderlich)</label>
+      <input id="policyInferenceModel" placeholder="z. B. sonar, mistral-small-latest, meta-llama/Llama-3.1-8B-Instruct" />
+      <button onclick="setTaggingPolicy()">Tagging-Policy speichern</button>
+    </div>
+
+    <div class="form-block" data-form-section="tagging-user-preferences" data-form-section-label="Tagging Benutzerpräferenzen">
+      <h3>Benutzerpräferenzen</h3>
+      <p class="help-text">Setzt Tagging-Parameter gezielt für ausgewählte Benutzer.</p>
+      <label for="taggingPreferenceUserSelect">Benutzer für Tagging-Preferences</label>
+      <select id="taggingPreferenceUserSelect"></select>
+      <label for="taggingStrictnessForUser">Strenge pro User</label>
+      <select id="taggingStrictnessForUser">
+        <option value="very_strict">very_strict</option>
+        <option value="medium">medium</option>
+        <option value="relaxed">relaxed</option>
+      </select>
+      <label for="fetchModeForUser">Fetch-Mode pro User</label>
+      <select id="fetchModeForUser">
+        <option value="never">never</option>
+        <option value="optional">optional</option>
+        <option value="always">always</option>
+      </select>
+      <label for="queryTimeZoneForUser">Query-Zeitzone pro User (IANA)</label>
+      <input id="queryTimeZoneForUser" placeholder="Europe/Berlin" />
+      <button onclick="setUserTaggingPreferences()">Tagging-Preferences pro User speichern</button>
+    </div>
   </div>
 
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="administration" data-sub-tab="admin-keys">
     <h2>Admin: MCP API Keys -> AI</h2>
     <button onclick="loadAdminKeys()">Alle MCP API Keys laden</button>
     <pre id="adminKeysResult">Noch nicht geladen</pre>
-    <label for="apiKeyUserSelect">Benutzer für neuen MCP API Key</label>
-    <select id="apiKeyUserSelect"></select>
-    <label for="apiKeyLabel">Key Label</label>
-    <input id="apiKeyLabel" value="default" />
-    <button onclick="issueAdminKey()">API Key ausstellen</button>
-    <label for="revokeKeyId">Key ID zum Revoken</label>
-    <input id="revokeKeyId" />
-    <button onclick="revokeAdminKey()">API Key revoken</button>
+    <div class="form-block" data-form-section="admin-key-issue" data-form-section-label="Admin-Key ausstellen">
+      <label for="apiKeyUserSelect">Benutzer für neuen MCP API Key</label>
+      <select id="apiKeyUserSelect"></select>
+      <label for="apiKeyLabel">Key Label</label>
+      <input id="apiKeyLabel" value="default" />
+      <button onclick="issueAdminKey()">API Key ausstellen</button>
+    </div>
+    <div class="form-block" data-form-section="admin-key-revoke" data-form-section-label="Admin-Key revoken">
+      <label for="revokeKeyId">Key ID zum Revoken</label>
+      <input id="revokeKeyId" />
+      <button onclick="revokeAdminKey()">API Key revoken</button>
+    </div>
   </div>
 
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="integrationen" data-sub-tab="user-linkwarden-token">
     <h2>Admin: Linkwarden API Key -> MCP (pro User)</h2>
-    <label for="linkwardenTokenUserSelect">Benutzer</label>
-    <select id="linkwardenTokenUserSelect"></select>
-    <label for="linkwardenTokenValue">Linkwarden API Key</label>
-    <input id="linkwardenTokenValue" type="password" />
-    <button onclick="setUserLinkwardenToken()">Linkwarden API Key speichern</button>
+    <div class="form-block" data-form-section="user-linkwarden-token-set" data-form-section-label="User Linkwarden-Key">
+      <label for="linkwardenTokenUserSelect">Benutzer</label>
+      <select id="linkwardenTokenUserSelect"></select>
+      <label for="linkwardenTokenValue">Linkwarden API Key</label>
+      <input id="linkwardenTokenValue" type="password" />
+      <button onclick="setUserLinkwardenToken()">Linkwarden API Key speichern</button>
+    </div>
   </div>
 
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="integrationen" data-sub-tab="linkwarden-ziel">
     <h2>Admin: Linkwarden Ziel</h2>
     <button onclick="loadLinkwardenConfig()">Aktuelle Konfiguration laden</button>
     <pre id="linkwardenConfigResult">Noch nicht geladen</pre>
-    <label for="lwBaseUrl">Neue Base URL</label>
-    <input id="lwBaseUrl" placeholder="http://linkwarden:3000" />
-    <button onclick="updateLinkwardenConfig()">Linkwarden Konfiguration speichern</button>
+    <div class="form-block" data-form-section="linkwarden-ziel-update" data-form-section-label="Linkwarden Ziel">
+      <label for="lwBaseUrl">Neue Base URL</label>
+      <input id="lwBaseUrl" placeholder="http://linkwarden:3000" />
+      <button onclick="updateLinkwardenConfig()">Linkwarden Konfiguration speichern</button>
+    </div>
   </div>
       `
       : '';
@@ -663,111 +1140,1116 @@ function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): st
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>linkwarden-mcp Dashboard</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; margin: 2rem; max-width: 980px; }
-    .card { border: 1px solid #d9d9d9; border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
-    label { display:block; font-weight:600; margin-top:0.8rem; }
-    input, select, textarea, button { width:100%; padding:0.6rem; margin-top:0.35rem; border-radius:8px; border:1px solid #b8b8b8; }
-    button { cursor:pointer; font-weight:700; }
-    textarea { min-height: 120px; }
-    pre { background:#f8f8f8; border-radius:10px; padding:0.8rem; overflow:auto; }
-  </style>
+  ${renderThemeHead()}
+  ${renderThemeStyles()}
 </head>
 <body>
-  <h1>linkwarden-mcp Dashboard</h1>
-  <div class="card">
+  <div class="page">
+  <div class="page-header">
+    <h1>linkwarden-mcp Dashboard</h1>
+    ${renderThemeSwitcher()}
+  </div>
+  <div class="card tabs-shell">
+    <nav class="top-tabs" id="topTabsNav" role="tablist" aria-label="Hauptnavigation"></nav>
+    <nav class="sub-tabs" id="subTabsNav" role="tablist" aria-label="Unterbereiche"></nav>
+  </div>
+  <div class="card tab-panel-card" data-top-tab="uebersicht" data-sub-tab="status">
     <p>Angemeldet als <strong>${principal.username}</strong> (Rolle: <strong>${principal.role}</strong>)</p>
     <button onclick="logout()">Logout</button>
+    <div class="kpi-grid" id="overviewKpis">
+      <div class="kpi-item"><span class="kpi-label">Rolle</span><span class="kpi-value" id="kpiRole">${principal.role}</span></div>
+      <div class="kpi-item"><span class="kpi-label">Write-Mode</span><span class="kpi-value" id="kpiWriteMode">unbekannt</span></div>
+      <div class="kpi-item"><span class="kpi-label">Linkwarden-Token</span><span class="kpi-value" id="kpiToken">unbekannt</span></div>
+      <div class="kpi-item"><span class="kpi-label">Routine</span><span class="kpi-value" id="kpiRoutine">unbekannt</span></div>
+      <div class="kpi-item"><span class="kpi-label">Letzte Aktion</span><span class="kpi-value" id="kpiLastAction">Noch keine</span></div>
+    </div>
+    <p class="status-inline" id="statusOverview" aria-live="polite"></p>
+    <details class="debug-details" id="debugDrawer">
+      <summary>Antwortdetails anzeigen</summary>
+      <pre id="actionResult">Warte auf Aktion ...</pre>
+    </details>
   </div>
 
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="mein-konto" data-sub-tab="profil">
     <h2>Mein Profil</h2>
     <button onclick="loadMe()">Profil neu laden</button>
     <pre id="meResult">Noch nicht geladen</pre>
-    <label><input id="selfWriteMode" type="checkbox" /> Eigener Write-Mode aktiv</label>
-    <button onclick="setOwnWriteMode()">Meinen Write-Mode speichern</button>
+    <div class="form-block" data-form-section="profil-write-mode" data-form-section-label="Profil Write-Mode">
+      <label><input id="selfWriteMode" type="checkbox" /> Eigener Write-Mode aktiv</label>
+      <button onclick="setOwnWriteMode()">Meinen Write-Mode speichern</button>
+    </div>
   </div>
 
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="governance" data-sub-tab="mein-tagging">
     <h2>Mein Tagging</h2>
     <button onclick="loadOwnTaggingPreferences()">Tagging-Einstellungen laden</button>
     <pre id="ownTaggingPreferencesResult">Noch nicht geladen</pre>
-    <label for="selfTaggingStrictness">Tagging-Strenge</label>
-    <select id="selfTaggingStrictness">
-      <option value="very_strict">very_strict</option>
-      <option value="medium">medium</option>
-      <option value="relaxed">relaxed</option>
-    </select>
-    <label for="selfFetchMode">Fetch-Mode</label>
-    <select id="selfFetchMode">
-      <option value="never">never</option>
-      <option value="optional">optional</option>
-      <option value="always">always</option>
-    </select>
-    <label for="selfQueryTimeZone">Query-Zeitzone (IANA)</label>
-    <input id="selfQueryTimeZone" placeholder="Europe/Berlin" />
-    <button onclick="setOwnTaggingPreferences()">Meine Tagging-Einstellungen speichern</button>
+    <div class="form-block" data-form-section="mein-tagging-preferences" data-form-section-label="Mein Tagging">
+      <label for="selfTaggingStrictness">Tagging-Strenge</label>
+      <select id="selfTaggingStrictness">
+        <option value="very_strict">very_strict</option>
+        <option value="medium">medium</option>
+        <option value="relaxed">relaxed</option>
+      </select>
+      <label for="selfFetchMode">Fetch-Mode</label>
+      <select id="selfFetchMode">
+        <option value="never">never</option>
+        <option value="optional">optional</option>
+        <option value="always">always</option>
+      </select>
+      <label for="selfQueryTimeZone">Query-Zeitzone (IANA)</label>
+      <input id="selfQueryTimeZone" placeholder="Europe/Berlin" />
+      <button onclick="setOwnTaggingPreferences()">Meine Tagging-Einstellungen speichern</button>
+    </div>
   </div>
 
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="automationen" data-sub-tab="routine">
     <h2>Meine New-Links-Routine</h2>
     <button onclick="loadOwnNewLinksRoutine()">Routine-Status laden</button>
     <pre id="ownNewLinksRoutineResult">Noch nicht geladen</pre>
-    <label><input id="selfRoutineEnabled" type="checkbox" /> Routine aktiviert</label>
-    <label for="selfRoutineInterval">Intervall (Minuten)</label>
-    <input id="selfRoutineInterval" type="number" min="1" max="1440" value="15" />
-    <label for="selfRoutineBatchSize">Batch-Größe</label>
-    <input id="selfRoutineBatchSize" type="number" min="1" max="1000" value="200" />
-    <label><input id="selfRoutineModuleTagging" type="checkbox" checked /> Modul: governed_tagging</label>
-    <label><input id="selfRoutineModuleNormalize" type="checkbox" checked /> Modul: normalize_urls</label>
-    <label><input id="selfRoutineModuleDedupe" type="checkbox" checked /> Modul: dedupe</label>
-    <label><input id="selfRoutineRequestBackfill" type="checkbox" /> Backfill für Altbestand anfordern</label>
-    <label><input id="selfRoutineConfirmBackfill" type="checkbox" /> Backfill ausdrücklich bestätigen</label>
-    <button onclick="setOwnNewLinksRoutine()">Routine-Einstellungen speichern</button>
+    <div class="form-block" data-form-section="routine-settings" data-form-section-label="Routine-Einstellungen">
+      <label><input id="selfRoutineEnabled" type="checkbox" /> Routine aktiviert</label>
+      <label for="selfRoutineInterval">Intervall (Minuten)</label>
+      <input id="selfRoutineInterval" type="number" min="1" max="1440" value="15" />
+      <label for="selfRoutineBatchSize">Batch-Größe</label>
+      <input id="selfRoutineBatchSize" type="number" min="1" max="1000" value="200" />
+      <label><input id="selfRoutineModuleTagging" type="checkbox" checked /> Modul: governed_tagging</label>
+      <label><input id="selfRoutineModuleNormalize" type="checkbox" checked /> Modul: normalize_urls</label>
+      <label><input id="selfRoutineModuleDedupe" type="checkbox" checked /> Modul: dedupe</label>
+      <label><input id="selfRoutineRequestBackfill" type="checkbox" /> Backfill für Altbestand anfordern</label>
+      <label><input id="selfRoutineConfirmBackfill" type="checkbox" /> Backfill ausdrücklich bestätigen</label>
+      <button onclick="setOwnNewLinksRoutine()">Routine-Einstellungen speichern</button>
+    </div>
   </div>
 
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="automationen" data-sub-tab="chat-control">
     <h2>Mein Chat-Control</h2>
     <button onclick="loadOwnChatControl()">Chat-Control laden</button>
     <pre id="ownChatControlResult">Noch nicht geladen</pre>
-    <label for="selfArchiveCollectionName">Archiv-Collection-Name</label>
-    <input id="selfArchiveCollectionName" value="Archive" />
-    <label for="selfArchiveCollectionParentId">Archiv Parent Collection ID (optional)</label>
-    <input id="selfArchiveCollectionParentId" type="number" min="1" />
-    <button onclick="setOwnChatControl()">Chat-Control speichern</button>
+    <div class="form-block" data-form-section="chat-control-settings" data-form-section-label="Chat-Control">
+      <label for="selfArchiveCollectionName">Archiv-Collection-Name</label>
+      <input id="selfArchiveCollectionName" value="Archive" />
+      <label for="selfArchiveCollectionParentId">Archiv Parent Collection ID (optional)</label>
+      <input id="selfArchiveCollectionParentId" type="number" min="1" />
+      <label for="selfChatCaptureTagName">Chat-Link-Tag-Name</label>
+      <input id="selfChatCaptureTagName" value="AI Chat" />
+      <label><input id="selfChatCaptureTagAiChatEnabled" type="checkbox" checked /> AI Chat-Tag setzen</label>
+      <label><input id="selfChatCaptureTagAiNameEnabled" type="checkbox" checked /> AI Name-Tag setzen</label>
+      <button onclick="setOwnChatControl()">Chat-Control speichern</button>
+    </div>
   </div>
 
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="integrationen" data-sub-tab="linkwarden-token">
     <h2>Mein Linkwarden API Key -> MCP</h2>
     <p id="selfLinkwardenStatus">Status: unbekannt</p>
-    <label for="selfLinkwardenToken">Linkwarden API Key</label>
-    <input id="selfLinkwardenToken" type="password" />
-    <button onclick="setOwnLinkwardenToken()">Linkwarden API Key speichern</button>
+    <div class="form-block" data-form-section="linkwarden-token-set" data-form-section-label="Mein Linkwarden-Key">
+      <label for="selfLinkwardenToken">Linkwarden API Key</label>
+      <input id="selfLinkwardenToken" type="password" />
+      <button onclick="setOwnLinkwardenToken()">Linkwarden API Key speichern</button>
+    </div>
   </div>
 
-  <div class="card">
+  <div class="card tab-panel-card" data-top-tab="mein-konto" data-sub-tab="api-keys">
     <h2>Meine MCP API Keys -> AI</h2>
     <button onclick="loadOwnKeys()">Meine MCP API Keys laden</button>
     <pre id="ownKeysResult">Noch nicht geladen</pre>
-    <label for="ownKeyLabel">Key Label</label>
-    <input id="ownKeyLabel" value="default" />
-    <button onclick="issueOwnKey()">Eigenen API Key erzeugen</button>
-    <label for="ownRevokeKeyId">Key ID zum Revoken</label>
-    <input id="ownRevokeKeyId" />
-    <button onclick="revokeOwnKey()">Eigenen API Key revoken</button>
+    <div class="form-block" data-form-section="own-key-issue" data-form-section-label="Eigenen API-Key erzeugen">
+      <label for="ownKeyLabel">Key Label</label>
+      <input id="ownKeyLabel" value="default" />
+      <button onclick="issueOwnKey()">Eigenen API Key erzeugen</button>
+    </div>
+    <div class="form-block" data-form-section="own-key-revoke" data-form-section-label="Eigenen API-Key revoken">
+      <label for="ownRevokeKeyId">Key ID zum Revoken</label>
+      <input id="ownRevokeKeyId" />
+      <button onclick="revokeOwnKey()">Eigenen API Key revoken</button>
+    </div>
   </div>
 
   ${adminSections}
 
-  <div class="card">
-    <h2>Letzte Aktion</h2>
-    <pre id="actionResult">Warte auf Aktion ...</pre>
-  </div>
+  <div id="toastStack" class="toast-stack" aria-live="polite" aria-atomic="false"></div>
 
 <script>
 const csrfToken = ${JSON.stringify(csrfToken)};
 const isAdmin = ${JSON.stringify(principal.role === 'admin')};
+const currentRole = isAdmin ? 'admin' : 'user';
 let usersCache = [];
+
+/**
+ * This typedef declares the supported top-level tab keys for the admin dashboard shell.
+ * @typedef {'uebersicht'|'mein-konto'|'automationen'|'integrationen'|'governance'|'administration'} TabKey
+ */
+
+/**
+ * This typedef declares subtab keys as free-form strings constrained by per-tab registries below.
+ * @typedef {string} SubTabKey
+ */
+
+/**
+ * This typedef defines one role-aware top-level tab descriptor used by the tab renderer.
+ * @typedef {{ key: TabKey, label: string, adminOnly: boolean }} TabDefinition
+ */
+
+/**
+ * This typedef describes panel loading state used by lazy-loading and stale invalidation.
+ * @typedef {{ loadedPanels:Set<string>, stalePanels:Set<string>, inflightPanelLoads:Map<string, Promise<void>> }} LoadState
+ */
+
+/**
+ * This typedef describes deduplicated request state for inflight API calls.
+ * @typedef {{ inflightRequests:Map<string, Promise<{res:Response, json:any}>> }} RequestState
+ */
+
+const loadedPanels = new Set();
+const stalePanels = new Set();
+
+// This map tracks known form sections per panel and drives section-level dirty guards.
+const sectionRegistry = new Map();
+
+// This set tracks dirty form sections using keys composed from panel and section ids.
+const dirtySections = new Set();
+const debugDrawerStorageKey = 'lwmcp.debugDrawerOpen';
+
+/** @type {RequestState['inflightRequests']} */
+const inflightRequests = new Map();
+
+/** @type {LoadState['inflightPanelLoads']} */
+const inflightPanelLoads = new Map();
+let activeTopTab = 'uebersicht';
+let activeSubTab = 'status';
+const topNavFocusMode = 'tab-button';
+const subNavFocusMode = 'tab-button';
+
+/** @type {TabDefinition[]} */
+const topTabDefinitions = [
+  { key: 'uebersicht', label: 'Übersicht', adminOnly: false },
+  { key: 'mein-konto', label: 'Mein Konto', adminOnly: false },
+  { key: 'automationen', label: 'Automationen', adminOnly: false },
+  { key: 'integrationen', label: 'Integrationen', adminOnly: false },
+  { key: 'governance', label: 'Governance', adminOnly: false },
+  { key: 'administration', label: 'Administration', adminOnly: true }
+];
+
+// This registry documents allowed subtab keys for each top-level tab key.
+/** @type {Record<TabKey, Array<{ key: SubTabKey, label: string, adminOnly: boolean }>>} */
+const subTabDefinitions = {
+  'uebersicht': [{ key: 'status', label: 'Status', adminOnly: false }],
+  'mein-konto': [
+    { key: 'profil', label: 'Profil', adminOnly: false },
+    { key: 'api-keys', label: 'MCP API Keys', adminOnly: false }
+  ],
+  'automationen': [
+    { key: 'routine', label: 'New-Links-Routine', adminOnly: false },
+    { key: 'chat-control', label: 'Chat-Control', adminOnly: false }
+  ],
+  'integrationen': [
+    { key: 'linkwarden-token', label: 'Mein Linkwarden-Key', adminOnly: false },
+    { key: 'user-linkwarden-token', label: 'User Linkwarden-Keys', adminOnly: true },
+    { key: 'linkwarden-ziel', label: 'Linkwarden Ziel', adminOnly: true }
+  ],
+  'governance': [
+    { key: 'mein-tagging', label: 'Mein Tagging', adminOnly: false },
+    { key: 'tagging-policy', label: 'Tagging-Policy', adminOnly: true }
+  ],
+  'administration': [
+    { key: 'benutzer', label: 'Benutzer', adminOnly: true },
+    { key: 'admin-keys', label: 'Admin API Keys', adminOnly: true }
+  ]
+};
+
+const panelLoaders = {
+  'uebersicht:status': async () => {
+    await loadMe();
+    await loadOwnNewLinksRoutine();
+  },
+  'mein-konto:profil': async () => { await loadMe(); },
+  'mein-konto:api-keys': async () => { await loadOwnKeys(); },
+  'automationen:routine': async () => { await loadOwnNewLinksRoutine(); },
+  'automationen:chat-control': async () => { await loadOwnChatControl(); },
+  'integrationen:linkwarden-token': async () => { await loadMe(); },
+  'integrationen:user-linkwarden-token': async () => { await loadUsers(); },
+  'integrationen:linkwarden-ziel': async () => { await loadLinkwardenConfig(); },
+  'governance:mein-tagging': async () => { await loadOwnTaggingPreferences(); },
+  'governance:tagging-policy': async () => {
+    await loadTaggingPolicy();
+    await loadUsers();
+  },
+  'administration:benutzer': async () => { await loadUsers(); },
+  'administration:admin-keys': async () => {
+    await loadUsers();
+    await loadAdminKeys();
+  }
+};
+
+const mutationInvalidationMap = {
+  createUser: ['administration:*', 'integrationen:user-linkwarden-token', 'governance:tagging-policy'],
+  setUserActive: ['administration:*', 'integrationen:user-linkwarden-token', 'governance:tagging-policy'],
+  setUserWriteMode: ['administration:*', 'integrationen:user-linkwarden-token', 'governance:tagging-policy'],
+  setUserOfflinePolicy: ['administration:*', 'integrationen:user-linkwarden-token', 'governance:tagging-policy'],
+  setOwnWriteMode: ['mein-konto:profil', 'uebersicht:status'],
+  setOwnTaggingPreferences: ['governance:mein-tagging', 'uebersicht:status'],
+  setOwnNewLinksRoutine: ['automationen:routine', 'uebersicht:status'],
+  setOwnChatControl: ['automationen:chat-control'],
+  setOwnLinkwardenToken: ['integrationen:linkwarden-token', 'uebersicht:status'],
+  issueOwnKey: ['mein-konto:api-keys'],
+  revokeOwnKey: ['mein-konto:api-keys'],
+  issueAdminKey: ['administration:admin-keys'],
+  revokeAdminKey: ['administration:admin-keys'],
+  setUserLinkwardenToken: ['integrationen:user-linkwarden-token', 'administration:benutzer'],
+  setTaggingPolicy: ['governance:*'],
+  setUserTaggingPreferences: ['governance:*'],
+  updateLinkwardenConfig: ['integrationen:linkwarden-ziel']
+};
+
+// This helper creates a deterministic key for tab/subtab addressed panel state.
+function panelKey(topTab, subTab) {
+  return topTab + ':' + subTab;
+}
+
+// This helper composes one unique dirty-section key for a panel and local form section id.
+function sectionKey(topTab, subTab, sectionId) {
+  return panelKey(topTab, subTab) + '#' + sectionId;
+}
+
+// This helper normalizes section labels into deterministic, user-readable guard text.
+function normalizeSectionLabel(value, fallback) {
+  const normalized = String(value || '').trim();
+  if (normalized.length > 0) {
+    return normalized;
+  }
+  return String(fallback || 'Abschnitt');
+}
+
+// This helper registers one section descriptor for section-level dirty tracking.
+function registerSection(topTab, subTab, sectionId, sectionLabel) {
+  const key = panelKey(topTab, subTab);
+  if (!sectionRegistry.has(key)) {
+    sectionRegistry.set(key, []);
+  }
+  const sections = sectionRegistry.get(key);
+  const existing = sections.find((item) => item.id === sectionId);
+  const next = {
+    id: sectionId,
+    label: normalizeSectionLabel(sectionLabel, sectionId)
+  };
+  if (existing) {
+    existing.label = next.label;
+    return;
+  }
+  sections.push(next);
+}
+
+// This helper initializes section registry entries from data-form-section markers and panel defaults.
+function initializeSectionRegistry() {
+  sectionRegistry.clear();
+  const cards = document.querySelectorAll('.tab-panel-card');
+  cards.forEach((card) => {
+    const topTab = card.getAttribute('data-top-tab') || '';
+    const subTab = card.getAttribute('data-sub-tab') || '';
+    if (!topTab || !subTab) {
+      return;
+    }
+
+    const panelLabel = card.querySelector('h2')?.textContent || panelKey(topTab, subTab);
+    const defaultSectionId = (card.getAttribute('data-panel-default-section') || 'main').trim() || 'main';
+    const explicitSections = card.querySelectorAll('[data-form-section]');
+    if (explicitSections.length === 0) {
+      registerSection(topTab, subTab, defaultSectionId, panelLabel);
+      return;
+    }
+
+    explicitSections.forEach((section) => {
+      const sectionId = (section.getAttribute('data-form-section') || '').trim();
+      if (!sectionId) {
+        return;
+      }
+      const sectionLabel = section.getAttribute('data-form-section-label') || sectionId;
+      registerSection(topTab, subTab, sectionId, sectionLabel);
+    });
+  });
+}
+
+// This helper resolves the owning section for one input control using explicit markers and panel fallback.
+function resolveSectionFromControl(control) {
+  if (!control || typeof control.closest !== 'function') {
+    return null;
+  }
+
+  const panel = control.closest('.tab-panel-card');
+  if (!panel) {
+    return null;
+  }
+
+  const topTab = panel.getAttribute('data-top-tab') || '';
+  const subTab = panel.getAttribute('data-sub-tab') || '';
+  if (!topTab || !subTab) {
+    return null;
+  }
+
+  const sectionElement = control.closest('[data-form-section]');
+  const sectionId = sectionElement
+    ? (sectionElement.getAttribute('data-form-section') || '').trim()
+    : ((panel.getAttribute('data-panel-default-section') || 'main').trim() || 'main');
+  const defaultLabel = sectionId || 'main';
+  const sectionLabel = sectionElement
+    ? (sectionElement.getAttribute('data-form-section-label') || defaultLabel)
+    : (panel.querySelector('h2')?.textContent || defaultLabel);
+  const normalizedId = sectionId || 'main';
+  registerSection(topTab, subTab, normalizedId, sectionLabel);
+
+  return {
+    topTab,
+    subTab,
+    sectionId: normalizedId,
+    sectionLabel: normalizeSectionLabel(sectionLabel, normalizedId)
+  };
+}
+
+// This helper returns all dirty sections for one panel with labels for guard messaging.
+function getDirtySectionsForPanel(topTab, subTab) {
+  const key = panelKey(topTab, subTab);
+  const sections = Array.isArray(sectionRegistry.get(key)) ? sectionRegistry.get(key) : [];
+  return sections
+    .filter((section) => dirtySections.has(sectionKey(topTab, subTab, section.id)))
+    .map((section) => ({
+      id: section.id,
+      label: section.label
+    }));
+}
+
+// This helper clears dirty state for one section inside a panel after a successful targeted mutation.
+function clearDirtySection(topTab, subTab, sectionId) {
+  dirtySections.delete(sectionKey(topTab, subTab, sectionId));
+}
+
+// This helper clears dirty state for the default section in the currently active panel.
+function clearDirtyDefaultForActivePanel() {
+  const panel = document.getElementById(panelDomId(activeTopTab, activeSubTab));
+  const defaultSectionId = panel
+    ? ((panel.getAttribute('data-panel-default-section') || 'main').trim() || 'main')
+    : 'main';
+  clearDirtySection(activeTopTab, activeSubTab, defaultSectionId);
+}
+
+// This helper clears dirty sections selectively based on explicitly declared mutation section ids.
+function clearDirtySectionsForMutation(mutationSections) {
+  if (!Array.isArray(mutationSections) || mutationSections.length === 0) {
+    clearDirtyDefaultForActivePanel();
+    return;
+  }
+
+  mutationSections.forEach((sectionId) => {
+    const normalized = String(sectionId || '').trim();
+    if (normalized.length === 0) {
+      return;
+    }
+    clearDirtySection(activeTopTab, activeSubTab, normalized);
+  });
+}
+
+// This helper maps one top/subtab pair to a deterministic DOM id for ARIA bindings.
+function panelDomId(topTab, subTab) {
+  return 'panel-' + topTab + '-' + subTab;
+}
+
+// This helper builds one deterministic DOM id for top-level tab buttons.
+function topTabDomId(topTab) {
+  return 'tab-top-' + topTab;
+}
+
+// This helper builds one deterministic DOM id for sub-tab buttons.
+function subTabDomId(topTab, subTab) {
+  return 'tab-sub-' + topTab + '-' + subTab;
+}
+
+/**
+ * This helper centralizes role checks for top and subtab visibility.
+ * @param {{ adminOnly?: boolean }} tab
+ * @param {'admin'|'user'|string} role
+ * @returns {boolean}
+ */
+function isTabAllowedForRole(tab, role) {
+  return !tab.adminOnly || role === 'admin';
+}
+
+// This helper returns tab definitions allowed for the current principal role.
+function getAllowedTopTabs() {
+  return topTabDefinitions.filter((item) => isTabAllowedForRole(item, currentRole));
+}
+
+// This helper returns subtab definitions allowed for one top-level tab.
+function getAllowedSubTabs(topTab) {
+  const candidates = Array.isArray(subTabDefinitions[topTab]) ? subTabDefinitions[topTab] : [];
+  return candidates.filter((item) => isTabAllowedForRole(item, currentRole));
+}
+
+/**
+ * This helper parses tab state from hash format #tab=<top>&sub=<sub>.
+ * @returns {{ topTab: TabKey | string, subTab: SubTabKey }}
+ */
+function parseTabState() {
+  const raw = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+  const params = new URLSearchParams(raw);
+  return {
+    topTab: params.get('tab') || '',
+    subTab: params.get('sub') || ''
+  };
+}
+
+/**
+ * This helper serializes one tab state into the public hash deep-link contract.
+ * @param {TabKey | string} topTab
+ * @param {SubTabKey} subTab
+ * @returns {string}
+ */
+function serializeTabState(topTab, subTab) {
+  const params = new URLSearchParams();
+  params.set('tab', topTab);
+  params.set('sub', subTab);
+  return '#' + params.toString();
+}
+
+// This helper writes tab state to URL hash using push or replace semantics.
+function writeTabStateToHash(topTab, subTab, historyMode) {
+  if (historyMode === 'skip') {
+    return;
+  }
+
+  const nextHash = serializeTabState(topTab, subTab);
+  if (window.location.hash === nextHash) {
+    return;
+  }
+
+  if (historyMode === 'push') {
+    window.location.hash = nextHash;
+    return;
+  }
+
+  window.history.replaceState(null, '', nextHash);
+}
+
+// This helper ensures a requested tab/subtab pair is valid for the current role.
+function normalizeTabState(state) {
+  const requestedTop = state && typeof state === 'object' ? String(state.topTab || '') : '';
+  const requestedSub = state && typeof state === 'object' ? String(state.subTab || '') : '';
+  const allowedTopTabs = getAllowedTopTabs();
+  const fallbackTop = allowedTopTabs.length > 0 ? allowedTopTabs[0].key : 'uebersicht';
+  const safeTop = allowedTopTabs.some((item) => item.key === requestedTop) ? requestedTop : fallbackTop;
+  const allowedSubTabs = getAllowedSubTabs(safeTop);
+  const fallbackSub = allowedSubTabs.length > 0 ? allowedSubTabs[0].key : 'status';
+  const safeSub = allowedSubTabs.some((item) => item.key === requestedSub) ? requestedSub : fallbackSub;
+  return { topTab: safeTop, subTab: safeSub };
+}
+
+// This helper renders role-aware top-level tab buttons with ARIA selected state.
+function renderTopTabs() {
+  const container = document.getElementById('topTabsNav');
+  if (!container) {
+    return;
+  }
+  const allowedTopTabs = getAllowedTopTabs();
+  container.innerHTML = allowedTopTabs
+    .map((item) => {
+      const selected = item.key === activeTopTab;
+      const firstSubTab = getAllowedSubTabs(item.key)[0];
+      const controlledPanel = panelDomId(item.key, firstSubTab ? firstSubTab.key : 'status');
+      return '<button class="top-tab-btn" id="' + topTabDomId(item.key) + '" type="button" data-top-tab-btn="' + item.key + '" role="tab" aria-controls="' + controlledPanel + '" aria-selected="' + String(selected) + '" tabindex="' + String(selected ? 0 : -1) + '">' + item.label + '</button>';
+    })
+    .join('');
+}
+
+// This helper renders role-aware subtab buttons for the active top-level tab.
+function renderSubTabs() {
+  const container = document.getElementById('subTabsNav');
+  if (!container) {
+    return;
+  }
+  const allowedSubTabs = getAllowedSubTabs(activeTopTab);
+  container.innerHTML = allowedSubTabs
+    .map((item) => {
+      const selected = item.key === activeSubTab;
+      const controlledPanel = panelDomId(activeTopTab, item.key);
+      return '<button class="sub-tab-btn" id="' + subTabDomId(activeTopTab, item.key) + '" type="button" data-sub-tab-btn="' + item.key + '" role="tab" aria-controls="' + controlledPanel + '" aria-selected="' + String(selected) + '" tabindex="' + String(selected ? 0 : -1) + '">' + item.label + '</button>';
+    })
+    .join('');
+}
+
+// This helper configures panel ids and ARIA panel metadata from existing data attributes.
+function initializePanelA11y() {
+  const cards = document.querySelectorAll('.tab-panel-card');
+  cards.forEach((card) => {
+    const topTab = card.getAttribute('data-top-tab') || '';
+    const subTab = card.getAttribute('data-sub-tab') || '';
+    if (!topTab || !subTab) {
+      return;
+    }
+    if (!card.getAttribute('data-panel-default-section')) {
+      card.setAttribute('data-panel-default-section', 'main');
+    }
+    card.id = panelDomId(topTab, subTab);
+    card.setAttribute('role', 'tabpanel');
+    card.setAttribute('aria-labelledby', subTabDomId(topTab, subTab));
+  });
+}
+
+// This helper toggles panel visibility based on active top tab and subtab.
+function applyPanelVisibility() {
+  const cards = document.querySelectorAll('.tab-panel-card');
+  cards.forEach((card) => {
+    const topTab = card.getAttribute('data-top-tab') || '';
+    const subTab = card.getAttribute('data-sub-tab') || '';
+    const visible = topTab === activeTopTab && subTab === activeSubTab;
+    card.hidden = !visible;
+    card.setAttribute('aria-hidden', String(!visible));
+    if (visible) {
+      card.setAttribute('aria-labelledby', subTabDomId(activeTopTab, activeSubTab));
+    } else if (topTab) {
+      card.setAttribute('aria-labelledby', topTabDomId(topTab));
+    }
+  });
+}
+
+// This helper marks one form section as dirty when inputs inside that section are edited.
+function markDirtyFromInput(event) {
+  const target = event.target;
+  const meta = resolveSectionFromControl(target);
+  if (!meta) {
+    return;
+  }
+  dirtySections.add(sectionKey(meta.topTab, meta.subTab, meta.sectionId));
+}
+
+// This helper adds dirty tracking listeners to all editable controls inside tabbed panels.
+function initDirtyTracking() {
+  const controls = document.querySelectorAll('.tab-panel-card input, .tab-panel-card select, .tab-panel-card textarea');
+  controls.forEach((control) => {
+    control.addEventListener('input', markDirtyFromInput);
+    control.addEventListener('change', markDirtyFromInput);
+  });
+}
+
+// This helper renders one toast message with optional custom timeout behavior.
+function showToast(type, message, options = {}) {
+  const stack = document.getElementById('toastStack');
+  if (!stack) {
+    return;
+  }
+  const toast = document.createElement('div');
+  toast.className = 'toast ' + type;
+  toast.textContent = message;
+  stack.appendChild(toast);
+  const durationMs = Number(options.durationMs);
+  const autoDismissMs = Number.isFinite(durationMs) ? durationMs : (type === 'error' ? 0 : 3500);
+  if (autoDismissMs > 0) {
+    setTimeout(() => {
+      toast.remove();
+    }, autoDismissMs);
+  }
+}
+
+// This helper writes one compact status line under the overview session card.
+function setOverviewStatus(message) {
+  const element = document.getElementById('statusOverview');
+  if (!element) {
+    return;
+  }
+  element.textContent = message;
+  const kpiLastAction = document.getElementById('kpiLastAction');
+  if (kpiLastAction) {
+    kpiLastAction.textContent = message;
+  }
+}
+
+// This helper updates one overview KPI value by element id when the target exists.
+function setKpiValue(id, value) {
+  const element = document.getElementById(id);
+  if (!element) {
+    return;
+  }
+  element.textContent = String(value);
+}
+
+// This helper writes one formatted payload into the debug drawer and optionally opens it.
+function openDebugDrawer(payload, options = {}) {
+  const pre = document.getElementById('actionResult');
+  if (!pre) {
+    return;
+  }
+  pre.textContent = JSON.stringify(payload, null, 2);
+  if (options.autoOpenOnError) {
+    const drawer = document.getElementById('debugDrawer');
+    if (drawer && typeof drawer.open !== 'undefined') {
+      drawer.open = true;
+      try {
+        window.sessionStorage.setItem(debugDrawerStorageKey, '1');
+      } catch {
+        // This no-op keeps debug rendering stable when sessionStorage is unavailable.
+      }
+    }
+  }
+}
+
+// This helper restores debug drawer visibility preference and keeps it synced in sessionStorage.
+function initDebugDrawerState() {
+  const drawer = document.getElementById('debugDrawer');
+  if (!drawer) {
+    return;
+  }
+
+  try {
+    drawer.open = window.sessionStorage.getItem(debugDrawerStorageKey) === '1';
+  } catch {
+    // This no-op keeps drawer behavior stable when sessionStorage is unavailable.
+  }
+
+  drawer.addEventListener('toggle', () => {
+    try {
+      if (drawer.open) {
+        window.sessionStorage.setItem(debugDrawerStorageKey, '1');
+      } else {
+        window.sessionStorage.removeItem(debugDrawerStorageKey);
+      }
+    } catch {
+      // This no-op keeps drawer toggling stable when sessionStorage is unavailable.
+    }
+  });
+}
+
+// This helper removes previous inline field validation hints before applying new ones.
+function clearFieldErrors() {
+  document.querySelectorAll('.field-error').forEach((node) => node.remove());
+  document.querySelectorAll('.field-invalid').forEach((node) => node.classList.remove('field-invalid'));
+}
+
+// This helper normalizes field names for robust zod-to-dom matching.
+function normalizeFieldName(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// This helper resolves a likely form control for one zod field error key.
+function findControlForField(fieldName) {
+  const controls = Array.from(document.querySelectorAll('input[id], select[id], textarea[id]'));
+  const normalizedField = normalizeFieldName(fieldName);
+  if (!normalizedField) {
+    return null;
+  }
+
+  const exact = controls.find((control) => normalizeFieldName(control.id) === normalizedField);
+  if (exact) {
+    return exact;
+  }
+
+  const suffix = normalizedField.split(/(?:dot|_)/).pop() || normalizedField;
+  return controls.find((control) => {
+    const normalizedId = normalizeFieldName(control.id);
+    return normalizedId.endsWith(suffix) || suffix.endsWith(normalizedId);
+  }) || null;
+}
+
+// This helper attaches one inline validation message directly behind a field.
+function showFieldError(control, message) {
+  if (!control || typeof control.insertAdjacentElement !== 'function') {
+    return;
+  }
+  control.classList.add('field-invalid');
+  const error = document.createElement('p');
+  error.className = 'field-error';
+  error.textContent = String(message);
+  control.insertAdjacentElement('afterend', error);
+}
+
+// This helper renders zod-style fieldErrors inline while keeping toast-level feedback.
+function applyFieldErrors(details) {
+  const fieldErrors = details && typeof details === 'object' ? details.fieldErrors : null;
+  if (!fieldErrors || typeof fieldErrors !== 'object') {
+    return 0;
+  }
+
+  let count = 0;
+  Object.entries(fieldErrors).forEach(([field, messages]) => {
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return;
+    }
+    const control = findControlForField(field);
+    if (!control) {
+      return;
+    }
+    showFieldError(control, messages[0]);
+    count += 1;
+  });
+  return count;
+}
+
+// This helper serializes nested values deterministically to build stable request dedupe keys.
+function stableSerialize(value) {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return '[' + value.map((entry) => stableSerialize(entry)).join(',') + ']';
+  }
+
+  const keys = Object.keys(value).sort();
+  return '{' + keys.map((key) => JSON.stringify(key) + ':' + stableSerialize(value[key])).join(',') + '}';
+}
+
+// This helper normalizes request bodies so semantically identical JSON payloads dedupe correctly.
+function normalizeBodyForRequestKey(body) {
+  if (body == null) {
+    return '';
+  }
+
+  if (typeof body === 'string') {
+    const trimmed = body.trim();
+    if (trimmed.length === 0) {
+      return '';
+    }
+    try {
+      return stableSerialize(JSON.parse(trimmed));
+    } catch {
+      return trimmed;
+    }
+  }
+
+  if (body instanceof URLSearchParams) {
+    return body.toString();
+  }
+
+  return stableSerialize(body);
+}
+
+// This helper builds one deterministic request key used for inflight request dedupe.
+function buildRequestKey(url, options) {
+  const method = String(options?.method || 'GET').toUpperCase();
+  const bodyKey = normalizeBodyForRequestKey(options?.body);
+  return method + ' ' + String(url) + ' ' + bodyKey;
+}
+
+// This helper deduplicates inflight HTTP requests with identical method/url/body signatures.
+async function requestJson(url, options = {}) {
+  const key = buildRequestKey(url, options);
+  if (inflightRequests.has(key)) {
+    return inflightRequests.get(key);
+  }
+
+  const promise = (async () => {
+    const res = await fetch(url, options);
+    let json = {};
+    try {
+      json = await res.json();
+    } catch {
+      json = {};
+    }
+    return { res, json };
+  })();
+
+  inflightRequests.set(key, promise);
+  try {
+    return await promise;
+  } finally {
+    inflightRequests.delete(key);
+  }
+}
+
+// This helper resolves invalidation targets from explicit panel keys and wildcard groups.
+function resolveInvalidationTargets(actionKey) {
+  const targets = mutationInvalidationMap[actionKey];
+  if (!Array.isArray(targets)) {
+    return [];
+  }
+
+  const knownPanels = Object.keys(panelLoaders);
+  const resolved = new Set();
+  targets.forEach((target) => {
+    if (target.endsWith(':*')) {
+      const prefix = target.slice(0, -1);
+      knownPanels.forEach((panel) => {
+        if (panel.startsWith(prefix)) {
+          resolved.add(panel);
+        }
+      });
+      return;
+    }
+
+    if (knownPanels.includes(target)) {
+      resolved.add(target);
+    }
+  });
+
+  return Array.from(resolved);
+}
+
+// This helper marks panel caches stale and refreshes the active panel immediately when affected.
+async function invalidateAfterMutation(actionKey) {
+  if (!actionKey) {
+    return;
+  }
+
+  const panelTargets = resolveInvalidationTargets(actionKey);
+  if (panelTargets.length === 0) {
+    showToast('info', 'Keine Panel-Aktualisierung erforderlich.', { durationMs: 2200 });
+    return;
+  }
+  panelTargets.forEach((target) => stalePanels.add(target));
+  const activeKey = panelKey(activeTopTab, activeSubTab);
+  if (stalePanels.has(activeKey)) {
+    await ensurePanelLoaded(activeTopTab, activeSubTab, { force: true });
+  }
+}
+
+/**
+ * This helper loads one panel lazily with inflight dedupe and stale-aware refresh behavior.
+ * @param {TabKey | string} topTab
+ * @param {SubTabKey} subTab
+ * @param {{ force?: boolean }} [options]
+ * @returns {Promise<void>}
+ */
+async function ensurePanelLoaded(topTab, subTab, options = {}) {
+  const key = panelKey(topTab, subTab);
+  const force = Boolean(options.force);
+  const needsLoad = force || !loadedPanels.has(key) || stalePanels.has(key);
+  if (!needsLoad) {
+    return;
+  }
+
+  if (inflightPanelLoads.has(key)) {
+    await inflightPanelLoads.get(key);
+    return;
+  }
+
+  const loader = panelLoaders[key];
+  const loadPromise = (async () => {
+    if (typeof loader === 'function') {
+      await loader();
+    }
+    loadedPanels.add(key);
+    stalePanels.delete(key);
+  })();
+
+  inflightPanelLoads.set(key, loadPromise);
+  try {
+    await loadPromise;
+  } finally {
+    inflightPanelLoads.delete(key);
+  }
+}
+
+// This helper focuses either the active tab button or the first control in the active panel.
+function focusAfterTabChange(focusMode) {
+  const normalizedFocusMode = focusMode || 'tab-button';
+  if (normalizedFocusMode === 'none') {
+    return;
+  }
+
+  if (normalizedFocusMode === 'first-input') {
+    const panel = document.getElementById(panelDomId(activeTopTab, activeSubTab));
+    const control = panel
+      ? panel.querySelector('input, select, textarea, button')
+      : null;
+    if (control && typeof control.focus === 'function') {
+      control.focus();
+      return;
+    }
+  }
+
+  const activeSubButton = document.getElementById(subTabDomId(activeTopTab, activeSubTab));
+  if (activeSubButton && typeof activeSubButton.focus === 'function') {
+    activeSubButton.focus();
+    return;
+  }
+
+  const activeTopButton = document.getElementById(topTabDomId(activeTopTab));
+  if (activeTopButton && typeof activeTopButton.focus === 'function') {
+    activeTopButton.focus();
+  }
+}
+
+/**
+ * This helper activates one panel, applies guards, syncs hash state, and triggers lazy loading.
+ * @param {{ topTab?: TabKey | string, subTab?: SubTabKey } | null | undefined} state
+ * @param {{ skipGuard?: boolean, historyMode?: 'push'|'replace'|'skip', focusMode?: 'tab-button'|'first-input'|'none', notifyNoChange?: boolean }} [options]
+ * @returns {Promise<{ changed: boolean, blocked: boolean, normalized: { topTab: string, subTab: string } }>}
+ */
+async function applyTabState(state, options = {}) {
+  const normalized = normalizeTabState(state);
+  const current = panelKey(activeTopTab, activeSubTab);
+  const next = panelKey(normalized.topTab, normalized.subTab);
+  if (!options.skipGuard && current !== next) {
+    const dirtyInCurrentPanel = getDirtySectionsForPanel(activeTopTab, activeSubTab);
+    if (dirtyInCurrentPanel.length > 0) {
+      const uniqueLabels = Array.from(new Set(dirtyInCurrentPanel.map((section) => section.label)));
+      const sectionHint = uniqueLabels.join(', ');
+      const proceed = window.confirm(
+        'Du hast ungespeicherte Änderungen in: ' + sectionHint + '. Trotzdem Tab wechseln?'
+      );
+      if (!proceed) {
+        return {
+          changed: false,
+          blocked: true,
+          normalized
+        };
+      }
+    }
+  }
+
+  if (current === next && options.notifyNoChange) {
+    showToast('info', 'Tab ist bereits aktiv.', { durationMs: 2000 });
+  }
+
+  activeTopTab = normalized.topTab;
+  activeSubTab = normalized.subTab;
+  renderTopTabs();
+  renderSubTabs();
+  applyPanelVisibility();
+  await ensurePanelLoaded(activeTopTab, activeSubTab);
+  writeTabStateToHash(activeTopTab, activeSubTab, options.historyMode || 'replace');
+  focusAfterTabChange(options.focusMode || 'tab-button');
+
+  return {
+    changed: current !== next,
+    blocked: false,
+    normalized
+  };
+}
+
+// This helper handles keyboard navigation for tablists (Arrow/Home/End/Enter/Space).
+function bindKeyboardNavigation(container, selector, resolveStateFromButton, focusMode) {
+  if (!container) {
+    return;
+  }
+
+  container.addEventListener('keydown', async (event) => {
+    const target = event.target && typeof event.target.closest === 'function'
+      ? event.target.closest(selector)
+      : null;
+    if (!target) {
+      return;
+    }
+
+    const buttons = Array.from(container.querySelectorAll(selector));
+    if (buttons.length === 0) {
+      return;
+    }
+
+    const currentIndex = buttons.indexOf(target);
+    if (currentIndex < 0) {
+      return;
+    }
+
+    const key = String(event.key || '');
+    let nextIndex = currentIndex;
+    let shouldActivate = false;
+
+    if (key === 'ArrowRight') {
+      nextIndex = (currentIndex + 1) % buttons.length;
+      shouldActivate = true;
+    } else if (key === 'ArrowLeft') {
+      nextIndex = (currentIndex - 1 + buttons.length) % buttons.length;
+      shouldActivate = true;
+    } else if (key === 'Home') {
+      nextIndex = 0;
+      shouldActivate = true;
+    } else if (key === 'End') {
+      nextIndex = buttons.length - 1;
+      shouldActivate = true;
+    } else if (key === 'Enter' || key === ' ' || key === 'Spacebar') {
+      shouldActivate = true;
+    } else {
+      return;
+    }
+
+    event.preventDefault();
+    const nextButton = buttons[nextIndex];
+    if (!shouldActivate || !nextButton) {
+      return;
+    }
+
+    const nextState = resolveStateFromButton(nextButton);
+    await applyTabState(nextState, { historyMode: 'push', focusMode: focusMode || 'tab-button', notifyNoChange: true });
+  });
+}
+
+// This helper wires tab navigation click handlers for both top tabs and subtabs.
+function bindTabNavigation() {
+  const topNav = document.getElementById('topTabsNav');
+  if (topNav) {
+    topNav.addEventListener('click', async (event) => {
+      const target = event.target?.closest ? event.target.closest('[data-top-tab-btn]') : null;
+      if (!target) {
+        return;
+      }
+      const topTab = target.getAttribute('data-top-tab-btn') || '';
+      const subTabs = getAllowedSubTabs(topTab);
+      const defaultSubTab = subTabs.length > 0 ? subTabs[0].key : 'status';
+      await applyTabState(
+        {
+          topTab,
+          subTab: defaultSubTab
+        },
+        { historyMode: 'push', focusMode: topNavFocusMode, notifyNoChange: true }
+      );
+    });
+    bindKeyboardNavigation(topNav, '[data-top-tab-btn]', (button) => {
+      const topTab = button.getAttribute('data-top-tab-btn') || '';
+      const subTabs = getAllowedSubTabs(topTab);
+      return {
+        topTab,
+        subTab: subTabs.length > 0 ? subTabs[0].key : 'status'
+      };
+    }, topNavFocusMode);
+  }
+
+  const subNav = document.getElementById('subTabsNav');
+  if (subNav) {
+    subNav.addEventListener('click', async (event) => {
+      const target = event.target?.closest ? event.target.closest('[data-sub-tab-btn]') : null;
+      if (!target) {
+        return;
+      }
+      const subTab = target.getAttribute('data-sub-tab-btn') || '';
+      await applyTabState(
+        {
+          topTab: activeTopTab,
+          subTab
+        },
+        { historyMode: 'push', focusMode: subNavFocusMode, notifyNoChange: true }
+      );
+    });
+    bindKeyboardNavigation(subNav, '[data-sub-tab-btn]', (button) => ({
+      topTab: activeTopTab,
+      subTab: button.getAttribute('data-sub-tab-btn') || ''
+    }), subNavFocusMode);
+  }
+}
+
+// This helper synchronizes UI state from URL hash while preserving deterministic fallback behavior.
+async function syncTabStateFromLocation() {
+  const requested = parseTabState();
+  const outcome = await applyTabState(requested, { historyMode: 'skip', focusMode: 'none' });
+  if (outcome.blocked) {
+    writeTabStateToHash(activeTopTab, activeSubTab, 'replace');
+    return;
+  }
+
+  const normalizedHash = serializeTabState(outcome.normalized.topTab, outcome.normalized.subTab);
+  const requestedHash = serializeTabState(requested.topTab, requested.subTab);
+  if (normalizedHash !== requestedHash) {
+    writeTabStateToHash(outcome.normalized.topTab, outcome.normalized.subTab, 'replace');
+  }
+}
+
+// This helper initializes A11y metadata and tab state wiring for click/hash/history flows.
+async function initTabState() {
+  initializePanelA11y();
+  await syncTabStateFromLocation();
+  window.addEventListener('hashchange', async () => {
+    await syncTabStateFromLocation();
+  });
+  window.addEventListener('popstate', async () => {
+    await syncTabStateFromLocation();
+  });
+}
 
 function updateUserSelect(selectId) {
   const select = document.getElementById(selectId);
@@ -875,7 +2357,11 @@ function applyRoutineSettingsToForm(settings) {
 }
 
 async function api(url, options = {}) {
-  const merged = {
+  clearFieldErrors();
+  const mutationAction = options.mutationAction || '';
+  const mutationSections = Array.isArray(options.mutationSections) ? options.mutationSections : [];
+  const successMessage = options.successMessage || 'Aktion erfolgreich gespeichert.';
+  const requestOptions = {
     ...options,
     headers: {
       'content-type': 'application/json',
@@ -883,13 +2369,27 @@ async function api(url, options = {}) {
       ...(options.headers || {})
     }
   };
+  delete requestOptions.mutationAction;
+  delete requestOptions.mutationSections;
+  delete requestOptions.successMessage;
 
-  const res = await fetch(url, merged);
-  const json = await res.json();
-  document.getElementById('actionResult').textContent = JSON.stringify(json, null, 2);
+  const { res, json } = await requestJson(url, requestOptions);
+  openDebugDrawer(json, { autoOpenOnError: !res.ok });
   if (!res.ok) {
-    throw new Error(json?.error?.message || 'API Fehler');
+    applyFieldErrors(json?.error?.details ?? null);
+    const message = json?.error?.message || 'API Fehler';
+    showToast('error', message);
+    setOverviewStatus('Fehler: ' + message);
+    throw new Error(message);
   }
+
+  showToast('success', successMessage, { durationMs: 3200 });
+  const successStatus = 'Letzte erfolgreiche Aktion: ' + new Date().toLocaleTimeString('de-DE');
+  setOverviewStatus(successStatus);
+  if (mutationAction || mutationSections.length > 0) {
+    clearDirtySectionsForMutation(mutationSections);
+  }
+  await invalidateAfterMutation(mutationAction);
   return json;
 }
 
@@ -899,8 +2399,7 @@ async function logout() {
 }
 
 async function loadMe() {
-  const res = await fetch('/admin/auth/me');
-  const json = await res.json();
+  const { res, json } = await requestJson('/admin/auth/me');
   document.getElementById('meResult').textContent = JSON.stringify(json, null, 2);
   if (res.ok) {
     document.getElementById('selfWriteMode').checked = Boolean(json?.me?.settings?.writeModeEnabled);
@@ -921,20 +2420,23 @@ async function loadMe() {
     );
     const status = json?.me?.linkwardenTokenConfigured ? 'Status: konfiguriert' : 'Status: fehlt';
     document.getElementById('selfLinkwardenStatus').textContent = status;
+    setKpiValue('kpiRole', json?.me?.role || currentRole);
+    setKpiValue('kpiWriteMode', json?.me?.settings?.writeModeEnabled ? 'aktiv' : 'aus');
+    setKpiValue('kpiToken', json?.me?.linkwardenTokenConfigured ? 'konfiguriert' : 'fehlt');
   }
 }
 
 async function setOwnWriteMode() {
   await api('/admin/ui/user/write-mode', {
     method: 'POST',
-    body: JSON.stringify({ writeModeEnabled: document.getElementById('selfWriteMode').checked })
+    body: JSON.stringify({ writeModeEnabled: document.getElementById('selfWriteMode').checked }),
+    mutationAction: 'setOwnWriteMode',
+    mutationSections: ['profil-write-mode']
   });
-  await loadMe();
 }
 
 async function loadOwnTaggingPreferences() {
-  const res = await fetch('/admin/ui/user/tagging-preferences');
-  const json = await res.json();
+  const { res, json } = await requestJson('/admin/ui/user/tagging-preferences');
   document.getElementById('ownTaggingPreferencesResult').textContent = JSON.stringify(json, null, 2);
   if (res.ok) {
     document.getElementById('selfTaggingStrictness').value = String(json?.preferences?.taggingStrictness ?? 'very_strict');
@@ -950,23 +2452,23 @@ async function setOwnTaggingPreferences() {
       taggingStrictness: document.getElementById('selfTaggingStrictness').value,
       fetchMode: document.getElementById('selfFetchMode').value,
       queryTimeZone: readOptionalTimeZoneInput('selfQueryTimeZone')
-    })
+    }),
+    mutationAction: 'setOwnTaggingPreferences',
+    mutationSections: ['mein-tagging-preferences']
   });
-  await loadOwnTaggingPreferences();
 }
 
 async function loadOwnNewLinksRoutine() {
-  const res = await fetch('/admin/ui/user/new-links-routine');
-  const json = await res.json();
+  const { res, json } = await requestJson('/admin/ui/user/new-links-routine');
   document.getElementById('ownNewLinksRoutineResult').textContent = JSON.stringify(json, null, 2);
   if (res.ok) {
     applyRoutineSettingsToForm(json?.status?.settings ?? {});
+    setKpiValue('kpiRoutine', json?.status?.settings?.enabled ? 'aktiv' : 'aus');
   }
 }
 
 async function loadOwnChatControl() {
-  const res = await fetch('/admin/ui/user/chat-control');
-  const json = await res.json();
+  const { res, json } = await requestJson('/admin/ui/user/chat-control');
   document.getElementById('ownChatControlResult').textContent = JSON.stringify(json, null, 2);
   if (res.ok) {
     document.getElementById('selfArchiveCollectionName').value = String(
@@ -976,23 +2478,30 @@ async function loadOwnChatControl() {
       json?.chatControl?.archiveCollectionParentId != null
         ? String(json.chatControl.archiveCollectionParentId)
         : '';
+    document.getElementById('selfChatCaptureTagName').value = String(
+      json?.chatControl?.chatCaptureTagName ?? 'AI Chat'
+    );
+    document.getElementById('selfChatCaptureTagAiChatEnabled').checked =
+      json?.chatControl?.chatCaptureTagAiChatEnabled !== false;
+    document.getElementById('selfChatCaptureTagAiNameEnabled').checked =
+      json?.chatControl?.chatCaptureTagAiNameEnabled !== false;
   }
 }
 
 async function setOwnNewLinksRoutine() {
+  clearFieldErrors();
   const modules = readRoutineModules();
   if (modules.length === 0) {
-    // This guard surfaces validation feedback in the shared action panel without throwing an uncaught browser error.
-    document.getElementById('actionResult').textContent = JSON.stringify(
-      {
-        ok: false,
-        error: {
-          message: 'Mindestens ein Routine-Modul muss aktiviert sein.'
-        }
-      },
-      null,
-      2
-    );
+    // This guard surfaces routine-module validation as inline and toast feedback without a backend round-trip.
+    showFieldError(document.getElementById('selfRoutineModuleTagging'), 'Mindestens ein Routine-Modul muss aktiviert sein.');
+    showToast('error', 'Mindestens ein Routine-Modul muss aktiviert sein.');
+    openDebugDrawer({
+      ok: false,
+      error: {
+        message: 'Mindestens ein Routine-Modul muss aktiviert sein.'
+      }
+    }, { autoOpenOnError: true });
+    setOverviewStatus('Fehler: Mindestens ein Routine-Modul muss aktiviert sein.');
     return;
   }
 
@@ -1005,63 +2514,70 @@ async function setOwnNewLinksRoutine() {
       modules,
       requestBackfill: document.getElementById('selfRoutineRequestBackfill').checked,
       confirmBackfill: document.getElementById('selfRoutineConfirmBackfill').checked
-    })
+    }),
+    mutationAction: 'setOwnNewLinksRoutine',
+    mutationSections: ['routine-settings']
   });
 
   document.getElementById('selfRoutineRequestBackfill').checked = false;
   document.getElementById('selfRoutineConfirmBackfill').checked = false;
-  await loadOwnNewLinksRoutine();
 }
 
 async function setOwnChatControl() {
   const archiveCollectionName = document.getElementById('selfArchiveCollectionName').value.trim();
   const archiveCollectionParentIdRaw = document.getElementById('selfArchiveCollectionParentId').value.trim();
+  const chatCaptureTagName = document.getElementById('selfChatCaptureTagName').value.trim();
   await api('/admin/ui/user/chat-control', {
     method: 'POST',
     body: JSON.stringify({
       archiveCollectionName,
       archiveCollectionParentId:
-        archiveCollectionParentIdRaw.length > 0 ? Number(archiveCollectionParentIdRaw) : null
-    })
+        archiveCollectionParentIdRaw.length > 0 ? Number(archiveCollectionParentIdRaw) : null,
+      chatCaptureTagName,
+      chatCaptureTagAiChatEnabled: document.getElementById('selfChatCaptureTagAiChatEnabled').checked,
+      chatCaptureTagAiNameEnabled: document.getElementById('selfChatCaptureTagAiNameEnabled').checked
+    }),
+    mutationAction: 'setOwnChatControl',
+    mutationSections: ['chat-control-settings']
   });
-  await loadOwnChatControl();
 }
 
 async function setOwnLinkwardenToken() {
   await api('/admin/ui/user/linkwarden-token', {
     method: 'POST',
-    body: JSON.stringify({ token: document.getElementById('selfLinkwardenToken').value })
+    body: JSON.stringify({ token: document.getElementById('selfLinkwardenToken').value }),
+    mutationAction: 'setOwnLinkwardenToken',
+    mutationSections: ['linkwarden-token-set']
   });
   document.getElementById('selfLinkwardenToken').value = '';
-  await loadMe();
 }
 
 async function loadOwnKeys() {
-  const res = await fetch('/admin/ui/user/api-keys');
-  const json = await res.json();
+  const { json } = await requestJson('/admin/ui/user/api-keys');
   document.getElementById('ownKeysResult').textContent = JSON.stringify(json, null, 2);
 }
 
 async function issueOwnKey() {
   await api('/admin/ui/user/api-keys', {
     method: 'POST',
-    body: JSON.stringify({ label: document.getElementById('ownKeyLabel').value })
+    body: JSON.stringify({ label: document.getElementById('ownKeyLabel').value }),
+    mutationAction: 'issueOwnKey',
+    mutationSections: ['own-key-issue']
   });
-  await loadOwnKeys();
 }
 
 async function revokeOwnKey() {
   const keyId = document.getElementById('ownRevokeKeyId').value;
   await api('/admin/ui/user/api-keys/' + encodeURIComponent(keyId) + '/revoke', {
     method: 'POST',
-    body: '{}'
+    body: '{}',
+    mutationAction: 'revokeOwnKey',
+    mutationSections: ['own-key-revoke']
   });
-  await loadOwnKeys();
 }
 
 async function loadUsers() {
-  const res = await fetch('/admin/ui/admin/users');
-  const json = await res.json();
+  const { res, json } = await requestJson('/admin/ui/admin/users');
   document.getElementById('usersResult').textContent = JSON.stringify(json, null, 2);
   if (res.ok) {
     usersCache = Array.isArray(json.users) ? json.users : [];
@@ -1077,27 +2593,30 @@ async function createUser() {
       password: document.getElementById('newPassword').value,
       role: document.getElementById('newRole').value,
       writeModeEnabled: document.getElementById('newWriteMode').checked
-    })
+    }),
+    mutationAction: 'createUser',
+    mutationSections: ['benutzer-anlegen']
   });
-  await loadUsers();
 }
 
 async function setUserActive() {
   const userId = document.getElementById('toggleUserSelect').value;
   await api('/admin/ui/admin/users/' + encodeURIComponent(userId) + '/active', {
     method: 'POST',
-    body: JSON.stringify({ active: document.getElementById('toggleUserActive').checked })
+    body: JSON.stringify({ active: document.getElementById('toggleUserActive').checked }),
+    mutationAction: 'setUserActive',
+    mutationSections: ['benutzer-status']
   });
-  await loadUsers();
 }
 
 async function setUserWriteMode() {
   const userId = document.getElementById('writeModeUserSelect').value;
   await api('/admin/ui/admin/users/' + encodeURIComponent(userId) + '/write-mode', {
     method: 'POST',
-    body: JSON.stringify({ writeModeEnabled: document.getElementById('writeModeForUser').checked })
+    body: JSON.stringify({ writeModeEnabled: document.getElementById('writeModeForUser').checked }),
+    mutationAction: 'setUserWriteMode',
+    mutationSections: ['benutzer-status']
   });
-  await loadUsers();
 }
 
 async function setUserOfflinePolicy() {
@@ -1113,14 +2632,14 @@ async function setUserOfflinePolicy() {
       minConsecutiveFailures: Number(document.getElementById('offlineFailuresForUser').value),
       action,
       archiveCollectionId: action === 'archive' ? archiveCollectionId : null
-    })
+    }),
+    mutationAction: 'setUserOfflinePolicy',
+    mutationSections: ['benutzer-offline-policy']
   });
-  await loadUsers();
 }
 
 async function loadTaggingPolicy() {
-  const res = await fetch('/admin/ui/admin/tagging-policy');
-  const json = await res.json();
+  const { res, json } = await requestJson('/admin/ui/admin/tagging-policy');
   document.getElementById('taggingPolicyResult').textContent = JSON.stringify(json, null, 2);
   if (res.ok) {
     const policy = json?.policy ?? {};
@@ -1154,10 +2673,10 @@ async function setTaggingPolicy() {
       similarityThreshold: Number(document.getElementById('policySimilarityThreshold').value),
       fetchTimeoutMs: Number(document.getElementById('policyFetchTimeoutMs').value),
       fetchMaxBytes: Number(document.getElementById('policyFetchMaxBytes').value)
-    })
+    }),
+    mutationAction: 'setTaggingPolicy',
+    mutationSections: ['tagging-global', 'tagging-provider']
   });
-  await loadTaggingPolicy();
-  await loadUsers();
 }
 
 async function setUserTaggingPreferences() {
@@ -1168,14 +2687,14 @@ async function setUserTaggingPreferences() {
       taggingStrictness: document.getElementById('taggingStrictnessForUser').value,
       fetchMode: document.getElementById('fetchModeForUser').value,
       queryTimeZone: readOptionalTimeZoneInput('queryTimeZoneForUser')
-    })
+    }),
+    mutationAction: 'setUserTaggingPreferences',
+    mutationSections: ['tagging-user-preferences']
   });
-  await loadUsers();
 }
 
 async function loadAdminKeys() {
-  const res = await fetch('/admin/ui/admin/api-keys');
-  const json = await res.json();
+  const { json } = await requestJson('/admin/ui/admin/api-keys');
   document.getElementById('adminKeysResult').textContent = JSON.stringify(json, null, 2);
 }
 
@@ -1185,23 +2704,24 @@ async function issueAdminKey() {
     body: JSON.stringify({
       userId: Number(document.getElementById('apiKeyUserSelect').value),
       label: document.getElementById('apiKeyLabel').value
-    })
+    }),
+    mutationAction: 'issueAdminKey',
+    mutationSections: ['admin-key-issue']
   });
-  await loadAdminKeys();
 }
 
 async function revokeAdminKey() {
   const keyId = document.getElementById('revokeKeyId').value;
   await api('/admin/ui/admin/api-keys/' + encodeURIComponent(keyId) + '/revoke', {
     method: 'POST',
-    body: '{}'
+    body: '{}',
+    mutationAction: 'revokeAdminKey',
+    mutationSections: ['admin-key-revoke']
   });
-  await loadAdminKeys();
 }
 
 async function loadLinkwardenConfig() {
-  const res = await fetch('/admin/ui/admin/linkwarden');
-  const json = await res.json();
+  const { json } = await requestJson('/admin/ui/admin/linkwarden');
   document.getElementById('linkwardenConfigResult').textContent = JSON.stringify(json, null, 2);
 }
 
@@ -1215,27 +2735,28 @@ async function updateLinkwardenConfig() {
 
   await api('/admin/ui/admin/linkwarden', {
     method: 'POST',
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    mutationAction: 'updateLinkwardenConfig',
+    mutationSections: ['linkwarden-ziel-update']
   });
-
-  await loadLinkwardenConfig();
 }
 
 async function setUserLinkwardenToken() {
   const userId = Number(document.getElementById('linkwardenTokenUserSelect').value);
   await api('/admin/ui/admin/users/' + encodeURIComponent(userId) + '/linkwarden-token', {
     method: 'POST',
-    body: JSON.stringify({ token: document.getElementById('linkwardenTokenValue').value })
+    body: JSON.stringify({ token: document.getElementById('linkwardenTokenValue').value }),
+    mutationAction: 'setUserLinkwardenToken',
+    mutationSections: ['user-linkwarden-token-set']
   });
   document.getElementById('linkwardenTokenValue').value = '';
-  await loadUsers();
 }
 
-loadMe();
-loadOwnTaggingPreferences();
-loadOwnNewLinksRoutine();
-loadOwnChatControl();
-loadOwnKeys();
+${renderThemeInitScript()}
+initializeSectionRegistry();
+initDebugDrawerState();
+bindTabNavigation();
+initDirtyTracking();
 if (isAdmin) {
   const offlinePolicySelect = document.getElementById('offlinePolicyUserSelect');
   if (offlinePolicySelect) {
@@ -1245,10 +2766,10 @@ if (isAdmin) {
   if (taggingPreferenceSelect) {
     taggingPreferenceSelect.addEventListener('change', syncTaggingPreferencesFromSelectedUser);
   }
-  loadTaggingPolicy();
-  loadUsers();
 }
+initTabState();
 </script>
+  </div>
 </body>
 </html>`;
 }
@@ -2133,7 +3654,10 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     logUiInfo(request, 'ui_user_get_chat_control', {
       userId: principal.userId,
       archiveCollectionName: chatControl.archiveCollectionName,
-      archiveCollectionParentId: chatControl.archiveCollectionParentId
+      archiveCollectionParentId: chatControl.archiveCollectionParentId,
+      chatCaptureTagName: chatControl.chatCaptureTagName,
+      chatCaptureTagAiChatEnabled: chatControl.chatCaptureTagAiChatEnabled,
+      chatCaptureTagAiNameEnabled: chatControl.chatCaptureTagAiNameEnabled
     });
 
     reply.send({
@@ -2156,13 +3680,19 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
 
     const chatControl = db.setUserChatControlSettings(principal.userId, {
       archiveCollectionName: parsed.data.archiveCollectionName,
-      archiveCollectionParentId: parsed.data.archiveCollectionParentId
+      archiveCollectionParentId: parsed.data.archiveCollectionParentId,
+      chatCaptureTagName: parsed.data.chatCaptureTagName,
+      chatCaptureTagAiChatEnabled: parsed.data.chatCaptureTagAiChatEnabled,
+      chatCaptureTagAiNameEnabled: parsed.data.chatCaptureTagAiNameEnabled
     });
 
     logUiInfo(request, 'ui_user_set_chat_control_success', {
       userId: principal.userId,
       archiveCollectionName: chatControl.archiveCollectionName,
-      archiveCollectionParentId: chatControl.archiveCollectionParentId
+      archiveCollectionParentId: chatControl.archiveCollectionParentId,
+      chatCaptureTagName: chatControl.chatCaptureTagName,
+      chatCaptureTagAiChatEnabled: chatControl.chatCaptureTagAiChatEnabled,
+      chatCaptureTagAiNameEnabled: chatControl.chatCaptureTagAiNameEnabled
     });
 
     reply.send({

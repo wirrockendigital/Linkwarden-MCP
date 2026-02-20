@@ -34,6 +34,7 @@ import {
   aggregateLinksSchema,
   applyRuleSchema,
   assignTagsSchema,
+  captureChatLinksSchema,
   createCollectionSchema,
   createRuleSchema,
   createSavedQuerySchema,
@@ -100,6 +101,14 @@ interface QuerySlice {
 interface CanonicalDuplicateGroup {
   canonicalUrl: string;
   links: LinkItem[];
+}
+
+interface ResolvedHierarchicalCollection {
+  rootCollection: LinkCollection | null;
+  aiCollection: LinkCollection | null;
+  chatCollection: LinkCollection | null;
+  createdCollections: LinkCollection[];
+  wouldCreate: Array<{ level: 'root' | 'ai' | 'chat'; name: string; parentId: number | null }>;
 }
 
 // This type carries resolved ids and user-facing warnings for name-based selector filters.
@@ -256,6 +265,162 @@ function extractDomain(url: string): string {
   } catch {
     return 'invalid-url';
   }
+}
+
+// This helper normalizes one collection segment string with deterministic length and fallback handling.
+function normalizeCollectionSegment(raw: string | undefined, fallback: string, maxLength: number): string {
+  const compact = (raw ?? '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .slice(0, maxLength);
+  return compact.length > 0 ? compact : fallback;
+}
+
+// This helper normalizes one AI name into a deterministic tag label.
+function normalizeAiNameTag(raw: string | undefined): string {
+  return normalizeCollectionSegment(raw, 'ChatGPT', 80);
+}
+
+// This helper trims wrapper and trailing punctuation artifacts from extracted URL candidates.
+function cleanExtractedUrlCandidate(raw: string): string {
+  let value = raw.trim();
+  value = value.replace(/^[<("'[{]+/, '');
+  value = value.replace(/[>"'\]}]+$/, '');
+  value = value.replace(/[.,;!?]+$/, '');
+  return value.trim();
+}
+
+// This helper extracts URL candidates from plain chat text including markdown links and raw URLs.
+function extractUrlsFromChatText(chatText: string): string[] {
+  const values: string[] = [];
+  const markdownLinkPattern = /\[[^\]]+]\((https?:\/\/[^)\s]+)\)/gi;
+  for (const match of chatText.matchAll(markdownLinkPattern)) {
+    if (match[1]) {
+      values.push(match[1]);
+    }
+  }
+
+  const rawUrlPattern = /\bhttps?:\/\/[^\s<>"']+/gi;
+  for (const match of chatText.matchAll(rawUrlPattern)) {
+    if (match[0]) {
+      values.push(match[0]);
+    }
+  }
+
+  return values;
+}
+
+// This helper validates and canonicalizes chat URL candidates while collecting deterministic warnings.
+function normalizeChatUrlCandidates(urls: string[]): {
+  normalized: Array<{ originalUrl: string; canonicalUrl: string }>;
+  warnings: string[];
+  invalidCount: number;
+  duplicatesWithinInput: number;
+} {
+  const warnings: string[] = [];
+  const canonicalMap = new Map<string, { originalUrl: string; canonicalUrl: string }>();
+  let invalidCount = 0;
+  let duplicatesWithinInput = 0;
+
+  for (const raw of urls) {
+    const cleaned = cleanExtractedUrlCandidate(raw);
+    if (!cleaned) {
+      continue;
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(cleaned);
+    } catch {
+      invalidCount += 1;
+      warnings.push(`capture_chat_links: invalid URL skipped "${cleaned}".`);
+      continue;
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      invalidCount += 1;
+      warnings.push(`capture_chat_links: unsupported URL protocol skipped "${cleaned}".`);
+      continue;
+    }
+
+    const canonicalUrl = canonicalizeUrl(parsed.toString());
+    if (canonicalMap.has(canonicalUrl)) {
+      duplicatesWithinInput += 1;
+      continue;
+    }
+
+    canonicalMap.set(canonicalUrl, {
+      originalUrl: parsed.toString(),
+      canonicalUrl
+    });
+  }
+
+  return {
+    normalized: [...canonicalMap.values()],
+    warnings,
+    invalidCount,
+    duplicatesWithinInput
+  };
+}
+
+// This helper chooses one deterministic exact collection match by smallest id.
+function pickExactCollectionMatchByParent(
+  collections: LinkCollection[],
+  name: string,
+  parentId: number | null
+): LinkCollection | null {
+  const matches = collections
+    .filter((collection) => collection.name.trim() === name && collection.parentId === parentId)
+    .sort((left, right) => left.id - right.id);
+  return matches[0] ?? null;
+}
+
+// This helper resolves (and optionally creates) one deterministic AI chat collection hierarchy.
+async function resolveChatCollectionHierarchy(
+  client: LinkwardenClient,
+  aiName: string,
+  chatName: string,
+  allowCreate: boolean
+): Promise<ResolvedHierarchicalCollection> {
+  const allCollections = await client.listAllCollections();
+  const createdCollections: LinkCollection[] = [];
+  const wouldCreate: Array<{ level: 'root' | 'ai' | 'chat'; name: string; parentId: number | null }> = [];
+
+  const ensureCollection = async (
+    level: 'root' | 'ai' | 'chat',
+    name: string,
+    parentId: number | null
+  ): Promise<LinkCollection | null> => {
+    const existing = pickExactCollectionMatchByParent(allCollections, name, parentId);
+    if (existing) {
+      return existing;
+    }
+
+    if (!allowCreate) {
+      wouldCreate.push({ level, name, parentId });
+      return null;
+    }
+
+    const created = await client.createCollection({
+      name,
+      parentId
+    });
+    allCollections.push(created);
+    createdCollections.push(created);
+    return created;
+  };
+
+  const rootCollection = await ensureCollection('root', 'AI Chats', null);
+  const aiCollection = rootCollection ? await ensureCollection('ai', aiName, rootCollection.id) : null;
+  const chatCollection = aiCollection ? await ensureCollection('chat', chatName, aiCollection.id) : null;
+
+  return {
+    rootCollection,
+    aiCollection,
+    chatCollection,
+    createdCollections,
+    wouldCreate
+  };
 }
 
 // This helper checks whether the principal can execute one specific tool based on configured tool scopes.
@@ -3259,6 +3424,217 @@ async function handleRunRulesNow(args: unknown, context: ToolRuntimeContext): Pr
   }
 }
 
+// This function handles link capture from AI chats into deterministic AI Chats > <AI Name> > <Chat Name> collections.
+async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  const input = captureChatLinksSchema.parse(args);
+  if (!input.dryRun) {
+    assertWriteAccess(context);
+  }
+
+  const client = getClient(context);
+  const aiCollectionName = normalizeCollectionSegment(input.aiName, 'ChatGPT', 120);
+  const chatCollectionName = normalizeCollectionSegment(input.chatName, 'Current Chat', 160);
+  const aiNameTag = normalizeAiNameTag(input.aiName);
+
+  return withIdempotency(
+    context,
+    'linkwarden_capture_chat_links',
+    input.idempotencyKey,
+    {
+      urls: input.urls ?? [],
+      chatText: input.chatText ?? '',
+      aiName: aiCollectionName,
+      chatName: chatCollectionName,
+      dryRun: input.dryRun
+    },
+    async () => {
+      const extractedUrls = input.chatText ? extractUrlsFromChatText(input.chatText) : [];
+      const allInputUrls = [...(input.urls ?? []), ...extractedUrls];
+      const normalizedCandidates = normalizeChatUrlCandidates(allInputUrls);
+      const hierarchy = await resolveChatCollectionHierarchy(client, aiCollectionName, chatCollectionName, !input.dryRun);
+      const warnings = [...normalizedCandidates.warnings];
+
+      for (const pending of hierarchy.wouldCreate) {
+        warnings.push(
+          `capture_chat_links: missing ${pending.level} collection "${pending.name}" would be created on apply.`
+        );
+      }
+
+      if (hierarchy.chatCollection) {
+        assertCollectionScopeAccess(context, hierarchy.chatCollection.id);
+      }
+
+      const chatControl = context.db.getUserChatControlSettings(context.principal.userId);
+      const configuredStaticTagName = normalizeCollectionSegment(chatControl.chatCaptureTagName, 'AI Chat', 80);
+      const desiredTagNames: string[] = [];
+      if (chatControl.chatCaptureTagAiChatEnabled) {
+        desiredTagNames.push(configuredStaticTagName);
+      }
+      if (chatControl.chatCaptureTagAiNameEnabled) {
+        desiredTagNames.push(aiNameTag);
+      }
+
+      // This deduplication guarantees deterministic tag payloads even when names overlap case-insensitively.
+      const appliedTagNames: string[] = [];
+      const seenTagNames = new Set<string>();
+      for (const tagName of desiredTagNames) {
+        const normalized = normalizeTagName(tagName);
+        if (normalized.length === 0 || seenTagNames.has(normalized)) {
+          continue;
+        }
+        seenTagNames.add(normalized);
+        appliedTagNames.push(tagName);
+      }
+
+      const tagResolution =
+        appliedTagNames.length > 0
+          ? await resolveTagIdsByName(client, appliedTagNames, true, input.dryRun)
+          : { tagIds: [], created: [], missing: [] };
+
+      if (tagResolution.missing.length > 0) {
+        warnings.push(`capture_chat_links: missing tags in dry-run: ${tagResolution.missing.join(', ')}.`);
+      }
+
+      let existingCanonicalUrls = new Set<string>();
+      if (hierarchy.chatCollection) {
+        const existingLinks = await client.listLinksByCollection(hierarchy.chatCollection.id);
+        existingCanonicalUrls = new Set(existingLinks.map((link) => canonicalizeUrl(link.url)));
+      }
+
+      const toCreateCandidates: Array<{ originalUrl: string; canonicalUrl: string }> = [];
+      let skippedExisting = 0;
+      for (const candidate of normalizedCandidates.normalized) {
+        if (existingCanonicalUrls.has(candidate.canonicalUrl)) {
+          skippedExisting += 1;
+          continue;
+        }
+        toCreateCandidates.push(candidate);
+      }
+
+      if (input.dryRun) {
+        return {
+          ok: true,
+          data: {
+            aiName: aiCollectionName,
+            chatName: chatCollectionName,
+            hierarchy,
+            tagConfig: {
+              chatCaptureTagName: configuredStaticTagName,
+              chatCaptureTagAiChatEnabled: chatControl.chatCaptureTagAiChatEnabled,
+              chatCaptureTagAiNameEnabled: chatControl.chatCaptureTagAiNameEnabled,
+              aiNameTag
+            },
+            appliedTagNames,
+            appliedTagIds: tagResolution.tagIds,
+            createdTags: tagResolution.created,
+            missingTags: tagResolution.missing,
+            preview: toCreateCandidates.slice(0, input.previewLimit).map((item) => item.originalUrl)
+          },
+          summary: {
+            dryRun: true,
+            detected: normalizedCandidates.normalized.length,
+            duplicatesWithinInput: normalizedCandidates.duplicatesWithinInput,
+            duplicatesInTargetCollection: skippedExisting,
+            toCreate: toCreateCandidates.length,
+            invalid: normalizedCandidates.invalidCount
+          },
+          paging: null,
+          warnings,
+          failures: []
+        };
+      }
+
+      if (!hierarchy.chatCollection) {
+        throw new AppError(409, 'chat_collection_missing', 'Chat collection could not be resolved during apply.');
+      }
+
+      const failures: Array<{ itemId: string; code: string; message: string; retryable: boolean }> = [];
+      const createdLinks: Array<{ id: number; url: string; collectionId: number; tagIds: number[] }> = [];
+
+      for (const candidate of toCreateCandidates) {
+        try {
+          const created = await client.createLink({
+            url: candidate.originalUrl,
+            title: candidate.originalUrl,
+            collectionId: hierarchy.chatCollection.id,
+            tagIds: tagResolution.tagIds.length > 0 ? tagResolution.tagIds : undefined
+          });
+          createdLinks.push({
+            id: created.id,
+            url: created.url,
+            collectionId: hierarchy.chatCollection.id,
+            tagIds: tagResolution.tagIds
+          });
+        } catch (error) {
+          failures.push({
+            itemId: candidate.originalUrl,
+            code: 'create_link_failed',
+            message: error instanceof Error ? error.message : 'create link failed',
+            retryable: true
+          });
+        }
+      }
+
+      context.db.insertAudit({
+        actor: context.actor,
+        toolName: 'linkwarden_capture_chat_links',
+        targetType: 'link',
+        targetIds: createdLinks.map((link) => link.id),
+        beforeSummary: 'chat link capture apply requested',
+        afterSummary: 'chat link capture apply finished',
+        outcome: failures.length === 0 ? 'success' : 'failed',
+        details: {
+          userId: context.principal.userId,
+          aiName: aiCollectionName,
+          chatName: chatCollectionName,
+          rootCollectionId: hierarchy.rootCollection?.id ?? null,
+          aiCollectionId: hierarchy.aiCollection?.id ?? null,
+          chatCollectionId: hierarchy.chatCollection?.id ?? null,
+          createdCollectionIds: hierarchy.createdCollections.map((collection) => collection.id),
+          tagNames: appliedTagNames,
+          tagIds: tagResolution.tagIds,
+          detected: normalizedCandidates.normalized.length,
+          created: createdLinks.length,
+          failed: failures.length
+        }
+      });
+
+      return {
+        ok: true,
+        data: {
+          aiName: aiCollectionName,
+          chatName: chatCollectionName,
+          hierarchy,
+          tagConfig: {
+            chatCaptureTagName: configuredStaticTagName,
+            chatCaptureTagAiChatEnabled: chatControl.chatCaptureTagAiChatEnabled,
+            chatCaptureTagAiNameEnabled: chatControl.chatCaptureTagAiNameEnabled,
+            aiNameTag
+          },
+          appliedTagNames,
+          appliedTagIds: tagResolution.tagIds,
+          createdTags: tagResolution.created,
+          missingTags: tagResolution.missing,
+          createdLinks: createdLinks.slice(0, input.previewLimit)
+        },
+        summary: {
+          dryRun: false,
+          detected: normalizedCandidates.normalized.length,
+          duplicatesWithinInput: normalizedCandidates.duplicatesWithinInput,
+          duplicatesInTargetCollection: skippedExisting,
+          toCreate: toCreateCandidates.length,
+          created: createdLinks.length,
+          failed: failures.length,
+          invalid: normalizedCandidates.invalidCount
+        },
+        paging: null,
+        warnings,
+        failures
+      };
+    }
+  );
+}
+
 // This function handles linkwarden_get_new_links_routine_status and returns schedule, settings, and backlog warnings.
 async function handleGetNewLinksRoutineStatus(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   getNewLinksRoutineStatusSchema.parse(args);
@@ -3515,6 +3891,7 @@ const toolHandlers: Record<string, (args: unknown, context: ToolRuntimeContext) 
   linkwarden_test_rule: handleTestRule,
   linkwarden_apply_rule: handleApplyRule,
   linkwarden_run_rules_now: handleRunRulesNow,
+  linkwarden_capture_chat_links: handleCaptureChatLinks,
   linkwarden_get_new_links_routine_status: handleGetNewLinksRoutineStatus,
   linkwarden_run_new_links_routine_now: handleRunNewLinksRoutineNow,
   linkwarden_list_rules: handleListRules,

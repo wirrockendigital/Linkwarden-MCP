@@ -25,6 +25,7 @@
 - `linkwarden_test_rule`
 - `linkwarden_apply_rule`
 - `linkwarden_run_rules_now`
+- `linkwarden_capture_chat_links`
 - `linkwarden_get_new_links_routine_status`
 - `linkwarden_run_new_links_routine_now`
 - `linkwarden_list_rules`
@@ -136,6 +137,17 @@ Regel testen:
 ```text
 Nutze linkwarden_test_rule mit id "rule-id"
 ```
+
+AI-Chat-Links erfassen und dedupliziert speichern:
+
+```text
+Nutze linkwarden_capture_chat_links mit chatText "<chat transcript>" aiName "ChatGPT" chatName "Meeting 2026-02-20" dryRun false
+```
+
+Hinweis:
+
+- Ziel ist immer `AI Chats > <AI Name> > <Chat Name>`.
+- Tagging wird über User-Chat-Control gesteuert (`AI Chat`-Tag und optionaler `AI Name`-Tag separat schaltbar).
 
 New-Links-Routine Status:
 

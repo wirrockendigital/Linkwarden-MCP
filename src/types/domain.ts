@@ -226,6 +226,9 @@ export interface UserChatControlSettings {
   userId: number;
   archiveCollectionName: string;
   archiveCollectionParentId: number | null;
+  chatCaptureTagName: string;
+  chatCaptureTagAiChatEnabled: boolean;
+  chatCaptureTagAiNameEnabled: boolean;
   updatedAt: string;
 }
 

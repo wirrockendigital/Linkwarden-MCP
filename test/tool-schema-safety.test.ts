@@ -5,6 +5,7 @@ import {
   aggregateLinksSchema,
   assignTagsSchema,
   buildToolList,
+  captureChatLinksSchema,
   createRuleSchema,
   createSavedQuerySchema,
   deleteLinksSchema,
@@ -125,6 +126,24 @@ describe('tool schema safety (alpha)', () => {
     expect(runNewLinksRoutineNowSchema.parse({})).toEqual({});
   });
 
+  it('validates chat-link capture schema defaults and flexible input contract', () => {
+    const withUrls = captureChatLinksSchema.parse({
+      urls: ['https://example.com/a']
+    });
+    expect(withUrls.aiName).toBe('ChatGPT');
+    expect(withUrls.chatName).toBe('Current Chat');
+    expect(withUrls.dryRun).toBe(false);
+    expect(withUrls.previewLimit).toBe(50);
+
+    const withChatText = captureChatLinksSchema.parse({
+      chatText: 'Hier ist ein Link: https://example.com/b'
+    });
+    expect(withChatText.aiName).toBe('ChatGPT');
+    expect(withChatText.chatName).toBe('Current Chat');
+
+    expect(() => captureChatLinksSchema.parse({ aiName: 'ChatGPT' })).toThrow();
+  });
+
   it('validates aggregate and saved-query schemas with stable defaults', () => {
     const aggregate = aggregateLinksSchema.parse({});
     expect(aggregate.groupBy).toBe('collection');
@@ -140,13 +159,14 @@ describe('tool schema safety (alpha)', () => {
 
   it('lists only alpha tool names (no legacy search/fetch/reorg names)', () => {
     const names = buildToolList().map((tool) => tool.name);
-    expect(names).toHaveLength(32);
+    expect(names).toHaveLength(33);
     expect(names).toContain('linkwarden_query_links');
     expect(names).toContain('linkwarden_governed_tag_links');
     expect(names).toContain('linkwarden_mutate_links');
     expect(names).toContain('linkwarden_delete_links');
     expect(names).toContain('linkwarden_create_rule');
     expect(names).toContain('linkwarden_run_rules_now');
+    expect(names).toContain('linkwarden_capture_chat_links');
     expect(names).toContain('linkwarden_get_new_links_routine_status');
     expect(names).toContain('linkwarden_run_new_links_routine_now');
     expect(names).toContain('linkwarden_create_saved_query');

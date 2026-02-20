@@ -259,6 +259,9 @@ interface UserChatControlRow {
   user_id: number;
   archive_collection_name: string;
   archive_collection_parent_id: number | null;
+  chat_capture_tag_name: string;
+  chat_capture_tag_ai_chat_enabled: number;
+  chat_capture_tag_ai_name_enabled: number;
   updated_at: string;
 }
 
@@ -393,6 +396,9 @@ export class SqliteStore {
         user_id INTEGER PRIMARY KEY,
         archive_collection_name TEXT NOT NULL DEFAULT 'Archive',
         archive_collection_parent_id INTEGER,
+        chat_capture_tag_name TEXT NOT NULL DEFAULT 'AI Chat',
+        chat_capture_tag_ai_chat_enabled INTEGER NOT NULL DEFAULT 1,
+        chat_capture_tag_ai_name_enabled INTEGER NOT NULL DEFAULT 1,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
       );
@@ -970,6 +976,21 @@ export class SqliteStore {
       this.db.exec('ALTER TABLE user_chat_control ADD COLUMN archive_collection_parent_id INTEGER;');
     }
 
+    // This migration adds the configurable static chat-capture tag default used by link capture workflows.
+    if (!hasColumn('chat_capture_tag_name')) {
+      this.db.exec("ALTER TABLE user_chat_control ADD COLUMN chat_capture_tag_name TEXT NOT NULL DEFAULT 'AI Chat';");
+    }
+
+    // This migration adds the toggle for applying the static AI Chat tag during chat-link capture.
+    if (!hasColumn('chat_capture_tag_ai_chat_enabled')) {
+      this.db.exec('ALTER TABLE user_chat_control ADD COLUMN chat_capture_tag_ai_chat_enabled INTEGER NOT NULL DEFAULT 1;');
+    }
+
+    // This migration adds the toggle for applying the dynamic AI Name tag during chat-link capture.
+    if (!hasColumn('chat_capture_tag_ai_name_enabled')) {
+      this.db.exec('ALTER TABLE user_chat_control ADD COLUMN chat_capture_tag_ai_name_enabled INTEGER NOT NULL DEFAULT 1;');
+    }
+
     if (!hasColumn('updated_at')) {
       this.db.exec("ALTER TABLE user_chat_control ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z';");
     }
@@ -1122,8 +1143,16 @@ export class SqliteStore {
       this.db
         .prepare(
           `
-          INSERT INTO user_chat_control (user_id, archive_collection_name, archive_collection_parent_id, updated_at)
-          VALUES (?, 'Archive', NULL, ?)
+          INSERT INTO user_chat_control (
+            user_id,
+            archive_collection_name,
+            archive_collection_parent_id,
+            chat_capture_tag_name,
+            chat_capture_tag_ai_chat_enabled,
+            chat_capture_tag_ai_name_enabled,
+            updated_at
+          )
+          VALUES (?, 'Archive', NULL, 'AI Chat', 1, 1, ?)
           ON CONFLICT(user_id) DO NOTHING
         `
         )
@@ -1364,9 +1393,12 @@ export class SqliteStore {
           user_id,
           archive_collection_name,
           archive_collection_parent_id,
+          chat_capture_tag_name,
+          chat_capture_tag_ai_chat_enabled,
+          chat_capture_tag_ai_name_enabled,
           updated_at
         )
-        VALUES (?, 'Archive', NULL, ?)
+        VALUES (?, 'Archive', NULL, 'AI Chat', 1, 1, ?)
         ON CONFLICT(user_id) DO NOTHING
       `
       )
@@ -1385,6 +1417,9 @@ export class SqliteStore {
           user_id,
           archive_collection_name,
           archive_collection_parent_id,
+          chat_capture_tag_name,
+          chat_capture_tag_ai_chat_enabled,
+          chat_capture_tag_ai_name_enabled,
           updated_at
         FROM user_chat_control
         WHERE user_id = ?
@@ -1397,10 +1432,14 @@ export class SqliteStore {
     }
 
     const normalizedName = row.archive_collection_name.trim().slice(0, 120) || 'Archive';
+    const normalizedChatCaptureTagName = row.chat_capture_tag_name.trim().slice(0, 80) || 'AI Chat';
     return {
       userId: row.user_id,
       archiveCollectionName: normalizedName,
       archiveCollectionParentId: row.archive_collection_parent_id,
+      chatCaptureTagName: normalizedChatCaptureTagName,
+      chatCaptureTagAiChatEnabled: row.chat_capture_tag_ai_chat_enabled === 1,
+      chatCaptureTagAiNameEnabled: row.chat_capture_tag_ai_name_enabled === 1,
       updatedAt: row.updated_at
     };
   }
@@ -1411,6 +1450,9 @@ export class SqliteStore {
     payload: {
       archiveCollectionName?: string;
       archiveCollectionParentId?: number | null;
+      chatCaptureTagName?: string;
+      chatCaptureTagAiChatEnabled?: boolean;
+      chatCaptureTagAiNameEnabled?: boolean;
     }
   ): UserChatControlSettings {
     const now = new Date().toISOString();
@@ -1425,6 +1467,18 @@ export class SqliteStore {
       payload.archiveCollectionParentId === undefined
         ? existing.archiveCollectionParentId
         : payload.archiveCollectionParentId;
+    const nextChatCaptureTagName =
+      typeof payload.chatCaptureTagName === 'string'
+        ? payload.chatCaptureTagName.trim().slice(0, 80) || 'AI Chat'
+        : existing.chatCaptureTagName;
+    const nextChatCaptureTagAiChatEnabled =
+      payload.chatCaptureTagAiChatEnabled === undefined
+        ? existing.chatCaptureTagAiChatEnabled
+        : payload.chatCaptureTagAiChatEnabled;
+    const nextChatCaptureTagAiNameEnabled =
+      payload.chatCaptureTagAiNameEnabled === undefined
+        ? existing.chatCaptureTagAiNameEnabled
+        : payload.chatCaptureTagAiNameEnabled;
 
     this.db
       .prepare(
@@ -1433,11 +1487,22 @@ export class SqliteStore {
         SET
           archive_collection_name = ?,
           archive_collection_parent_id = ?,
+          chat_capture_tag_name = ?,
+          chat_capture_tag_ai_chat_enabled = ?,
+          chat_capture_tag_ai_name_enabled = ?,
           updated_at = ?
         WHERE user_id = ?
       `
       )
-      .run(nextArchiveCollectionName, nextArchiveCollectionParentId, now, userId);
+      .run(
+        nextArchiveCollectionName,
+        nextArchiveCollectionParentId,
+        nextChatCaptureTagName,
+        nextChatCaptureTagAiChatEnabled ? 1 : 0,
+        nextChatCaptureTagAiNameEnabled ? 1 : 0,
+        now,
+        userId
+      );
 
     return this.getUserChatControlSettings(userId);
   }

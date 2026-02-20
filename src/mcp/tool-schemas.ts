@@ -283,6 +283,21 @@ export const getNewLinksRoutineStatusSchema = z.object({});
 
 export const runNewLinksRoutineNowSchema = z.object({});
 
+// This schema captures one chat-link capture request with optional URL extraction from chat text.
+export const captureChatLinksSchema = z
+  .object({
+    urls: z.array(z.string().url()).min(1).max(500).optional(),
+    chatText: z.string().max(200_000).optional(),
+    aiName: z.string().trim().min(1).max(120).default('ChatGPT'),
+    chatName: z.string().trim().min(1).max(160).default('Current Chat'),
+    dryRun: z.boolean().default(false),
+    previewLimit: z.number().int().min(1).max(200).default(50),
+    idempotencyKey: z.string().trim().min(8).max(128).optional()
+  })
+  .refine((value) => Boolean(value.chatText) || Boolean(value.urls && value.urls.length > 0), {
+    message: 'Either urls or chatText must be provided.'
+  });
+
 export const listRulesSchema = z.object({
   enabledOnly: z.boolean().default(false)
 });
@@ -340,6 +355,7 @@ export const toolSchemas = {
   linkwarden_test_rule: testRuleSchema,
   linkwarden_apply_rule: applyRuleSchema,
   linkwarden_run_rules_now: runRulesNowSchema,
+  linkwarden_capture_chat_links: captureChatLinksSchema,
   linkwarden_get_new_links_routine_status: getNewLinksRoutineStatusSchema,
   linkwarden_run_new_links_routine_now: runNewLinksRoutineNowSchema,
   linkwarden_list_rules: listRulesSchema,
@@ -381,6 +397,11 @@ export function buildToolList(): McpTool[] {
     { name: 'linkwarden_test_rule', description: 'Test one rule in read-only preview mode.' },
     { name: 'linkwarden_apply_rule', description: 'Apply one rule immediately in dry-run or write mode.' },
     { name: 'linkwarden_run_rules_now', description: 'Run all or selected rules now with per-user locking.' },
+    {
+      name: 'linkwarden_capture_chat_links',
+      description:
+        'Capture links from AI chat text or URL lists into AI Chats > <AI Name> > <Chat Name> with deterministic dedupe.'
+    },
     {
       name: 'linkwarden_get_new_links_routine_status',
       description: 'Return user-specific status, schedule, and warnings for automatic processing of newly created links.'

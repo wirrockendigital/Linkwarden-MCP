@@ -138,6 +138,14 @@ curl -X POST http://192.168.123.220:8080/admin/setup/unlock \
 
 ## Admin- und User-Oberfläche (`GET /admin`)
 
+Die `/admin`-UI ist als role-aware Tab-Navigation aufgebaut:
+
+- Zwei Ebenen (Top-Tab + Sub-Tab) mit stabilen Deep-Links über `#tab=<top>&sub=<sub>`
+- Lazy-Loading pro Panel mit Cache + gezielter Revalidierung nach Mutationen
+- Einheitliches Feedback über Toasts, Inline-Feldfehler und optionalen Debug-Drawer (JSON)
+- Systemweites Theme mit `System | Hell | Dunkel` und Persistenz im Browser
+- Keyboard/A11y-Unterstützung für Tab-Navigation (`Arrow`, `Home/End`, `Enter/Space`)
+
 ### Admin kann
 
 - Benutzer anlegen/deaktivieren
@@ -151,7 +159,7 @@ curl -X POST http://192.168.123.220:8080/admin/setup/unlock \
 
 - Eigene Daten sehen
 - Eigenen Write-Mode ein/ausschalten
-- Eigenes Chat-Control für Archiv-Collection-Name und optionalen Parent setzen
+- Eigenes Chat-Control für Archiv-Collection und Chat-Capture-Tags setzen
 - Eigenen Linkwarden API Key -> MCP setzen
 - Eigene API-Keys erstellen/revoken
 
@@ -221,6 +229,14 @@ Der MCP ist jetzt auf deinen gewünschten Arbeitsmodus ausgelegt:
   - Wenn die Collection fehlt, wird sie bei Apply automatisch angelegt
   - Bei mehreren Treffern mit gleichem Namen wird deterministisch gewählt: zuerst Root-Collection, sonst kleinste ID
   - Tag `to-delete` wird im Apply-Pfad bei Bedarf automatisch angelegt und gesetzt
+- AI-Chat-Link-Capture:
+  - `linkwarden_capture_chat_links` speichert Links nach `AI Chats -> <AI Name> -> <Chat Name>`
+  - Collection-Hierarchie wird bei Apply automatisch angelegt, wenn sie fehlt
+  - Dedupe erfolgt innerhalb der Ziel-Collection über kanonische URLs
+  - Chat-Control steuert Tag-Verhalten pro User:
+    - `chatCaptureTagName` (Default `AI Chat`)
+    - `chatCaptureTagAiChatEnabled` (Default `true`)
+    - `chatCaptureTagAiNameEnabled` (Default `true`)
 - Gespeicherte Queries:
   - `linkwarden_create_saved_query`, `linkwarden_list_saved_queries`, `linkwarden_run_saved_query`
 - Audit und Undo:
@@ -235,6 +251,10 @@ Beispiel für Rule-Flow:
 - `Nutze linkwarden_create_rule mit name "Archive 404" selector {...} action {type:"move-to-collection", collectionId:778}`.
 - `Nutze linkwarden_test_rule mit id "<rule-id>"`.
 - `Nutze linkwarden_apply_rule mit id "<rule-id>" dryRun false`.
+
+Beispiel für AI-Chat-Link-Capture:
+
+- `Nutze linkwarden_capture_chat_links mit chatText "<aktueller Chattext>" aiName "ChatGPT" chatName "Prompt Engineering" dryRun false`.
 
 Hinweis zu „proaktiv“:
 
