@@ -1296,20 +1296,92 @@ async function handleMutateLinks(args: unknown, context: ToolRuntimeContext): Pr
   );
 }
 
+interface ArchiveCollectionResolution {
+  collection: LinkCollection | null;
+  created: boolean;
+  wouldCreate: boolean;
+  strategy: 'explicit_id' | 'existing_name_match' | 'created_new';
+  archiveCollectionName: string;
+}
+
+// This helper selects one deterministic archive collection when multiple exact-name matches exist.
+function pickArchiveCollectionByPriority(collections: LinkCollection[]): LinkCollection {
+  const roots = collections.filter((collection) => collection.parentId === null);
+  const sortedRoots = [...roots].sort((left, right) => left.id - right.id);
+  if (sortedRoots.length > 0) {
+    return sortedRoots[0];
+  }
+
+  const sortedAll = [...collections].sort((left, right) => left.id - right.id);
+  return sortedAll[0];
+}
+
+// This helper resolves archive preferences from persisted per-user chat-control settings.
+function resolveArchivePreferences(context: ToolRuntimeContext): { archiveCollectionName: string; archiveCollectionParentId: number | null } {
+  const chatControl = context.db.getUserChatControlSettings(context.principal.userId);
+  return {
+    archiveCollectionName: chatControl.archiveCollectionName.trim() || 'Archive',
+    archiveCollectionParentId: chatControl.archiveCollectionParentId
+  };
+}
+
 // This helper resolves or creates the archive collection used by soft-delete workflows.
-async function resolveArchiveCollection(client: LinkwardenClient, explicitCollectionId?: number): Promise<LinkCollection> {
-  if (typeof explicitCollectionId === 'number') {
-    return client.getCollection(explicitCollectionId);
+async function resolveArchiveCollection(
+  client: LinkwardenClient,
+  context: ToolRuntimeContext,
+  input: {
+    explicitCollectionId?: number;
+    allowCreate: boolean;
   }
+): Promise<ArchiveCollectionResolution> {
+  if (typeof input.explicitCollectionId === 'number') {
+    const explicitCollection = await client.getCollection(input.explicitCollectionId);
+    return {
+      collection: explicitCollection,
+      created: false,
+      wouldCreate: false,
+      strategy: 'explicit_id',
+      archiveCollectionName: explicitCollection.name
+    };
+  }
+
+  const preferences = resolveArchivePreferences(context);
+  // This match remains exact (trimmed) so per-user archive names stay deterministic and explicit.
+  const archiveCollectionNameExact = preferences.archiveCollectionName;
   const collections = await client.listAllCollections();
-  const existing = collections.find((collection) => collection.name.toLocaleLowerCase() === 'archiv');
-  if (existing) {
-    return existing;
+  const exactMatches = collections.filter(
+    (collection) => collection.name.trim() === archiveCollectionNameExact
+  );
+  if (exactMatches.length > 0) {
+    return {
+      collection: pickArchiveCollectionByPriority(exactMatches),
+      created: false,
+      wouldCreate: false,
+      strategy: 'existing_name_match',
+      archiveCollectionName: preferences.archiveCollectionName
+    };
   }
-  return client.createCollection({
-    name: 'Archiv',
-    parentId: null
-  });
+
+  if (!input.allowCreate) {
+    return {
+      collection: null,
+      created: false,
+      wouldCreate: true,
+      strategy: 'created_new',
+      archiveCollectionName: preferences.archiveCollectionName
+    };
+  }
+
+  return {
+    collection: await client.createCollection({
+      name: preferences.archiveCollectionName,
+      parentId: preferences.archiveCollectionParentId ?? null
+    }),
+    created: true,
+    wouldCreate: false,
+    strategy: 'created_new',
+    archiveCollectionName: preferences.archiveCollectionName
+  };
 }
 
 // This function handles linkwarden_delete_links with soft/hard mode semantics and deterministic previews.
@@ -1321,8 +1393,14 @@ async function handleDeleteLinks(args: unknown, context: ToolRuntimeContext): Pr
   const client = getClient(context);
   const resolved = await resolveLinks(context, input.selector, input.ids);
 
-  const archiveCollection =
-    input.mode === 'soft' ? await resolveArchiveCollection(client, input.archiveCollectionId) : null;
+  const archiveResolution =
+    input.mode === 'soft'
+      ? await resolveArchiveCollection(client, context, {
+          explicitCollectionId: input.archiveCollectionId,
+          allowCreate: !input.dryRun
+        })
+      : null;
+  const archiveCollection = archiveResolution?.collection ?? null;
   if (archiveCollection) {
     assertCollectionScopeAccess(context, archiveCollection.id);
   }
@@ -1362,10 +1440,22 @@ async function handleDeleteLinks(args: unknown, context: ToolRuntimeContext): Pr
   });
 
   if (input.dryRun) {
+    const warnings =
+      input.mode === 'soft' && archiveResolution?.wouldCreate
+        ? [`archive_collection_missing: "${archiveResolution.archiveCollectionName}" would be created on apply.`]
+        : [];
     return ok(
       {
         operationId: null,
         archiveCollection,
+        archiveCollectionResolution: archiveResolution
+          ? {
+              created: archiveResolution.created,
+              wouldCreate: archiveResolution.wouldCreate,
+              strategy: archiveResolution.strategy,
+              archiveCollectionName: archiveResolution.archiveCollectionName
+            }
+          : null,
         preview: preview.slice(0, input.previewLimit)
       },
       {
@@ -1373,7 +1463,8 @@ async function handleDeleteLinks(args: unknown, context: ToolRuntimeContext): Pr
           total: preview.length,
           mode: input.mode,
           applied: 0
-        }
+        },
+        warnings
       }
     );
   }
@@ -1391,7 +1482,10 @@ async function handleDeleteLinks(args: unknown, context: ToolRuntimeContext): Pr
     async () => {
       const operationId = beginOperation(context, 'linkwarden_delete_links', {
         total: preview.length,
-        mode: input.mode
+        mode: input.mode,
+        archiveCollectionCreated: Boolean(archiveResolution?.created),
+        archiveCollectionId: archiveCollection?.id ?? null,
+        archiveCollectionResolutionStrategy: archiveResolution?.strategy ?? null
       });
       const operationItems: Array<{ itemType: string; itemId: number; before: Record<string, unknown>; after: Record<string, unknown> }> =
         [];
@@ -1445,7 +1539,10 @@ async function handleDeleteLinks(args: unknown, context: ToolRuntimeContext): Pr
           userId: context.principal.userId,
           operationId,
           applied,
-          failures: failures.length
+          failures: failures.length,
+          archiveCollectionId: archiveCollection?.id ?? null,
+          archiveCollectionCreated: Boolean(archiveResolution?.created),
+          archiveCollectionResolutionStrategy: archiveResolution?.strategy ?? null
         }
       });
 
@@ -1454,6 +1551,14 @@ async function handleDeleteLinks(args: unknown, context: ToolRuntimeContext): Pr
         data: {
           operationId,
           archiveCollection,
+          archiveCollectionResolution: archiveResolution
+            ? {
+                created: archiveResolution.created,
+                wouldCreate: archiveResolution.wouldCreate,
+                strategy: archiveResolution.strategy,
+                archiveCollectionName: archiveResolution.archiveCollectionName
+              }
+            : null,
           preview: preview.slice(0, input.previewLimit)
         },
         summary: {
@@ -2646,8 +2751,17 @@ function resolveKeepId(group: { linkIds: number[]; keepId?: number }, strategy: 
 async function handleMergeDuplicates(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = mergeDuplicatesSchema.parse(args);
   const client = getClient(context);
-  const archiveCollection =
-    input.deleteMode === 'soft' ? await resolveArchiveCollection(client, input.archiveCollectionId) : null;
+  const archiveResolution =
+    input.deleteMode === 'soft'
+      ? await resolveArchiveCollection(client, context, {
+          explicitCollectionId: input.archiveCollectionId,
+          allowCreate: !input.dryRun
+        })
+      : null;
+  const archiveCollection = archiveResolution?.collection ?? null;
+  if (archiveCollection) {
+    assertCollectionScopeAccess(context, archiveCollection.id);
+  }
   const markTag =
     input.deleteMode === 'soft' ? await resolveTagIdsByName(client, [input.markTagName], true, input.dryRun) : null;
   const markTagId = markTag?.tagIds[0];
@@ -2677,15 +2791,28 @@ async function handleMergeDuplicates(args: unknown, context: ToolRuntimeContext)
   }
 
   if (input.dryRun) {
+    const warnings =
+      input.deleteMode === 'soft' && archiveResolution?.wouldCreate
+        ? [`archive_collection_missing: "${archiveResolution.archiveCollectionName}" would be created on apply.`]
+        : [];
     return ok(
       {
-        preview: groupPreview
+        preview: groupPreview,
+        archiveCollectionResolution: archiveResolution
+          ? {
+              created: archiveResolution.created,
+              wouldCreate: archiveResolution.wouldCreate,
+              strategy: archiveResolution.strategy,
+              archiveCollectionName: archiveResolution.archiveCollectionName
+            }
+          : null
       },
       {
         summary: {
           groups: groupPreview.length,
           deleteMode: input.deleteMode
-        }
+        },
+        warnings
       }
     );
   }
@@ -2703,7 +2830,10 @@ async function handleMergeDuplicates(args: unknown, context: ToolRuntimeContext)
     async () => {
       const operationId = beginOperation(context, 'linkwarden_merge_duplicates', {
         groups: groupPreview.length,
-        deleteMode: input.deleteMode
+        deleteMode: input.deleteMode,
+        archiveCollectionCreated: Boolean(archiveResolution?.created),
+        archiveCollectionId: archiveCollection?.id ?? null,
+        archiveCollectionResolutionStrategy: archiveResolution?.strategy ?? null
       });
       const failures: Array<{ itemId: number; code: string; message: string; retryable: boolean }> = [];
       const operationItems: Array<{ itemType: string; itemId: number; before: Record<string, unknown>; after: Record<string, unknown> }> =
@@ -2798,7 +2928,10 @@ async function handleMergeDuplicates(args: unknown, context: ToolRuntimeContext)
           userId: context.principal.userId,
           operationId,
           applied,
-          failures: failures.length
+          failures: failures.length,
+          archiveCollectionId: archiveCollection?.id ?? null,
+          archiveCollectionCreated: Boolean(archiveResolution?.created),
+          archiveCollectionResolutionStrategy: archiveResolution?.strategy ?? null
         }
       });
 
@@ -2806,6 +2939,14 @@ async function handleMergeDuplicates(args: unknown, context: ToolRuntimeContext)
         ok: true,
         data: {
           operationId,
+          archiveCollectionResolution: archiveResolution
+            ? {
+                created: archiveResolution.created,
+                wouldCreate: archiveResolution.wouldCreate,
+                strategy: archiveResolution.strategy,
+                archiveCollectionName: archiveResolution.archiveCollectionName
+              }
+            : null,
           preview: groupPreview
         },
         summary: {

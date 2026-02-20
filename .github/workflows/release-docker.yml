@@ -1,8 +1,10 @@
-# This workflow builds and publishes container images when a version tag is pushed.
+# This workflow builds and publishes container images on every push and on version tags.
 name: release-docker
 
 on:
   push:
+    branches:
+      - '**'
     tags:
       - 'v*'
 
@@ -11,8 +13,8 @@ permissions:
   packages: write
 
 concurrency:
-  group: release-docker-${{ github.ref }}
-  cancel-in-progress: false
+  group: release-docker-${{ github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   publish-ghcr:
@@ -41,7 +43,10 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/linkwarden-mcp
           tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
             type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
@@ -81,7 +86,10 @@ jobs:
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/linkwarden-mcp
           tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
             type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}

@@ -50,6 +50,17 @@ Hinweis:
 - Zugriff intern über Container-IP bleibt `192.168.123.220:8080`; extern bevorzugt weiterhin über DSM Reverse Proxy.
 - Der Container läuft als konfigurierbarer User über `MCP_RUN_UID`/`MCP_RUN_GID`.
 
+## Lokale Quality-Gates bei instabiler Toolchain/DNS
+
+Wenn lokale `npm install`/`tsc`/`vitest` durch DNS- oder Toolchain-Probleme auf dem Host instabil sind, kannst du die Checks isoliert in Docker ausführen:
+
+- `npm run lint:docker`
+- `npm run build:docker`
+- `npm run test:docker`
+- `npm run qa:docker` (führt `lint + build + test` aus)
+
+Die Commands nutzen `tools/run-in-docker.sh` und laufen in einem Node-20-Container mit sauberem Temp-Workspace.
+
 Wichtige Env-Werte in `linkwarden-mcp.env`:
 
 - `MCP_DOCKER_NETWORK=allmydocker-net`
@@ -140,6 +151,7 @@ curl -X POST http://192.168.123.220:8080/admin/setup/unlock \
 
 - Eigene Daten sehen
 - Eigenen Write-Mode ein/ausschalten
+- Eigenes Chat-Control für Archiv-Collection-Name und optionalen Parent setzen
 - Eigenen Linkwarden API Key -> MCP setzen
 - Eigene API-Keys erstellen/revoken
 
@@ -203,6 +215,12 @@ Der MCP ist jetzt auf deinen gewünschten Arbeitsmodus ausgelegt:
   - `linkwarden_get_new_links_routine_status`
   - `linkwarden_run_new_links_routine_now`
   - User-Backend unter `/admin/ui/user/new-links-routine` für `enabled`, `intervalMinutes`, `modules`, `batchSize`, Backfill-Anfrage/-Bestätigung
+- Soft-Delete/ARCHIVE_TAG mit pro-User Archiv-Collection:
+  - Backend-Einstellung unter `/admin/ui/user/chat-control` für `archiveCollectionName` und optional `archiveCollectionParentId`
+  - Standardname ist `Archive`
+  - Wenn die Collection fehlt, wird sie bei Apply automatisch angelegt
+  - Bei mehreren Treffern mit gleichem Namen wird deterministisch gewählt: zuerst Root-Collection, sonst kleinste ID
+  - Tag `to-delete` wird im Apply-Pfad bei Bedarf automatisch angelegt und gesetzt
 - Gespeicherte Queries:
   - `linkwarden_create_saved_query`, `linkwarden_list_saved_queries`, `linkwarden_run_saved_query`
 - Audit und Undo:
@@ -228,9 +246,10 @@ Hinweis zu „proaktiv“:
 
 Ab jetzt gilt:
 
-- jedes neue Git-Tag im Format `vX.Y.Z` triggert automatisch einen Build
+- jeder `git push` (Branch-Push) triggert automatisch einen Build und Push nach GHCR + Docker Hub
+- zusätzlich werden bei Git-Tags im Format `vX.Y.Z` Semver-Tags veröffentlicht
 - das GitHub-Action-Workflow-File liegt unter `.github/workflows/release-docker.yml`
-- bei Tag-Push wird automatisch zu
+- es wird automatisch zu
   - `ghcr.io/<github-owner>/linkwarden-mcp`
   - `docker.io/<dockerhub-user>/linkwarden-mcp`
   gepusht
@@ -238,7 +257,13 @@ Ab jetzt gilt:
   - `GHCR_USERNAME`, `GHCR_TOKEN`
   - `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`
 
-Beispiel für neues Release:
+Beispiel für Branch-Push:
+
+```bash
+git push origin main
+```
+
+Beispiel für Tag-Release:
 
 ```bash
 git tag v0.2.9

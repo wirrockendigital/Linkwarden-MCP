@@ -221,6 +221,14 @@ export interface UserSettings {
   updatedAt: string;
 }
 
+// This model stores per-user chat control settings used by backend-managed archive routing defaults.
+export interface UserChatControlSettings {
+  userId: number;
+  archiveCollectionName: string;
+  archiveCollectionParentId: number | null;
+  updatedAt: string;
+}
+
 // This union keeps per-user tagging strictness presets explicit and validation-friendly.
 export type TaggingStrictness = 'very_strict' | 'medium' | 'relaxed';
 

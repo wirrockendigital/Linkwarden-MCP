@@ -66,6 +66,27 @@ curl -X POST http://192.168.123.220:8080/setup/unlock \
 3. Eigenen Linkwarden API Key -> MCP setzen
 4. Eigene MCP API-Keys verwalten
 
+## Archiv-Collection pro User (Chat-Control)
+
+Jeder User kann im Dashboard unter „Mein Chat-Control“ seine Archiv-Collection steuern:
+
+- `Archiv-Collection-Name` (Default: `Archive`)
+- optional `Archiv Parent Collection ID`
+
+Empfehlung für den Betrieb:
+
+- Nutze eine konsistente Namenskonvention, z. B. `Archive` für Standard-Archive oder `Archive Team` je Team.
+- Setze `Archiv Parent Collection ID`, wenn Archiv-Collections gezielt unter einer festen Ober-Collection angelegt werden sollen.
+
+Verhalten bei Soft-Delete (`ARCHIVE_TAG`):
+
+- Existiert keine passende Collection mit exakt diesem Namen, legt das Backend sie automatisch an.
+- Bei mehreren Treffern wird deterministisch gewählt:
+  - zuerst Root-Collection (`parentId = null`)
+  - bei mehreren Root-Treffern die kleinste `id`
+  - ohne Root-Treffer insgesamt die kleinste `id`
+- Das Tag `to-delete` wird bei Apply bei Bedarf automatisch angelegt und gesetzt.
+
 ## Health und Readiness
 
 - `GET /health` -> Prozess lebt

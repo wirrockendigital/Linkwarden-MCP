@@ -130,6 +130,21 @@ const setNewLinksRoutineSchema = z
     message: 'At least one new-links routine field must be updated.'
   });
 
+const setChatControlSchema = z
+  .object({
+    // This transform keeps empty user input compatible with the backend default archive collection name.
+    archiveCollectionName: z
+      .preprocess(
+        (value) => (typeof value === 'string' ? value.trim() : value),
+        z.string().max(120).transform((value) => value || 'Archive')
+      )
+      .optional(),
+    archiveCollectionParentId: z.number().int().positive().nullable().optional()
+  })
+  .refine((payload) => Object.keys(payload).length > 0, {
+    message: 'At least one chat-control field must be updated.'
+  });
+
 const createApiKeySchema = z.object({
   userId: z.number().int().positive(),
   label: z.string().min(2).max(100).default('default')
@@ -712,6 +727,17 @@ function renderDashboardPage(principal: SessionPrincipal, csrfToken: string): st
   </div>
 
   <div class="card">
+    <h2>Mein Chat-Control</h2>
+    <button onclick="loadOwnChatControl()">Chat-Control laden</button>
+    <pre id="ownChatControlResult">Noch nicht geladen</pre>
+    <label for="selfArchiveCollectionName">Archiv-Collection-Name</label>
+    <input id="selfArchiveCollectionName" value="Archive" />
+    <label for="selfArchiveCollectionParentId">Archiv Parent Collection ID (optional)</label>
+    <input id="selfArchiveCollectionParentId" type="number" min="1" />
+    <button onclick="setOwnChatControl()">Chat-Control speichern</button>
+  </div>
+
+  <div class="card">
     <h2>Mein Linkwarden API Key -> MCP</h2>
     <p id="selfLinkwardenStatus">Status: unbekannt</p>
     <label for="selfLinkwardenToken">Linkwarden API Key</label>
@@ -938,6 +964,21 @@ async function loadOwnNewLinksRoutine() {
   }
 }
 
+async function loadOwnChatControl() {
+  const res = await fetch('/admin/ui/user/chat-control');
+  const json = await res.json();
+  document.getElementById('ownChatControlResult').textContent = JSON.stringify(json, null, 2);
+  if (res.ok) {
+    document.getElementById('selfArchiveCollectionName').value = String(
+      json?.chatControl?.archiveCollectionName ?? 'Archive'
+    );
+    document.getElementById('selfArchiveCollectionParentId').value =
+      json?.chatControl?.archiveCollectionParentId != null
+        ? String(json.chatControl.archiveCollectionParentId)
+        : '';
+  }
+}
+
 async function setOwnNewLinksRoutine() {
   const modules = readRoutineModules();
   if (modules.length === 0) {
@@ -970,6 +1011,20 @@ async function setOwnNewLinksRoutine() {
   document.getElementById('selfRoutineRequestBackfill').checked = false;
   document.getElementById('selfRoutineConfirmBackfill').checked = false;
   await loadOwnNewLinksRoutine();
+}
+
+async function setOwnChatControl() {
+  const archiveCollectionName = document.getElementById('selfArchiveCollectionName').value.trim();
+  const archiveCollectionParentIdRaw = document.getElementById('selfArchiveCollectionParentId').value.trim();
+  await api('/admin/ui/user/chat-control', {
+    method: 'POST',
+    body: JSON.stringify({
+      archiveCollectionName,
+      archiveCollectionParentId:
+        archiveCollectionParentIdRaw.length > 0 ? Number(archiveCollectionParentIdRaw) : null
+    })
+  });
+  await loadOwnChatControl();
 }
 
 async function setOwnLinkwardenToken() {
@@ -1179,6 +1234,7 @@ async function setUserLinkwardenToken() {
 loadMe();
 loadOwnTaggingPreferences();
 loadOwnNewLinksRoutine();
+loadOwnChatControl();
 loadOwnKeys();
 if (isAdmin) {
   const offlinePolicySelect = document.getElementById('offlinePolicyUserSelect');
@@ -2067,6 +2123,51 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       ok: true,
       settings,
       status
+    });
+  });
+
+  fastify.get('/admin/ui/user/chat-control', async (request, reply) => {
+    const principal = requireSession(request, db);
+    const chatControl = db.getUserChatControlSettings(principal.userId);
+
+    logUiInfo(request, 'ui_user_get_chat_control', {
+      userId: principal.userId,
+      archiveCollectionName: chatControl.archiveCollectionName,
+      archiveCollectionParentId: chatControl.archiveCollectionParentId
+    });
+
+    reply.send({
+      ok: true,
+      chatControl
+    });
+  });
+
+  fastify.post('/admin/ui/user/chat-control', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+
+    const parsed = setChatControlSchema.safeParse(request.body);
+    if (!parsed.success) {
+      logUiWarn(request, 'ui_user_set_chat_control_validation_failed', {
+        details: parsed.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid chat-control payload.', parsed.error.flatten());
+    }
+
+    const chatControl = db.setUserChatControlSettings(principal.userId, {
+      archiveCollectionName: parsed.data.archiveCollectionName,
+      archiveCollectionParentId: parsed.data.archiveCollectionParentId
+    });
+
+    logUiInfo(request, 'ui_user_set_chat_control_success', {
+      userId: principal.userId,
+      archiveCollectionName: chatControl.archiveCollectionName,
+      archiveCollectionParentId: chatControl.archiveCollectionParentId
+    });
+
+    reply.send({
+      ok: true,
+      chatControl
     });
   });
 

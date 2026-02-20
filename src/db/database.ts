@@ -36,6 +36,7 @@ import type {
   SessionPrincipal,
   StoredPlan,
   UserRole,
+  UserChatControlSettings,
   UserSettings
 } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
@@ -254,6 +255,13 @@ interface NewLinksRoutineUserRow {
   role: string;
 }
 
+interface UserChatControlRow {
+  user_id: number;
+  archive_collection_name: string;
+  archive_collection_parent_id: number | null;
+  updated_at: string;
+}
+
 // This constant defines the allowed strictness presets for deterministic DB validation and API parsing.
 const ALLOWED_TAGGING_STRICTNESS: TaggingStrictness[] = ['very_strict', 'medium', 'relaxed'];
 
@@ -377,6 +385,14 @@ export class SqliteStore {
         offline_min_consecutive_failures INTEGER NOT NULL DEFAULT 3,
         offline_action TEXT NOT NULL DEFAULT 'archive' CHECK (offline_action IN ('archive', 'delete', 'none')),
         offline_archive_collection_id INTEGER,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS user_chat_control (
+        user_id INTEGER PRIMARY KEY,
+        archive_collection_name TEXT NOT NULL DEFAULT 'Archive',
+        archive_collection_parent_id INTEGER,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
       );
@@ -742,6 +758,7 @@ export class SqliteStore {
 
     this.migrateUsersTableIfNeeded();
     this.migrateUserSettingsTableIfNeeded();
+    this.migrateUserChatControlTableIfNeeded();
     this.migrateApiKeyScopesIfNeeded();
   }
 
@@ -932,6 +949,32 @@ export class SqliteStore {
     }
   }
 
+  // This migration upgrades user_chat_control to include archive defaults for backend-driven delete alternatives.
+  private migrateUserChatControlTableIfNeeded(): void {
+    const columns = this.db
+      .prepare('PRAGMA table_info(user_chat_control)')
+      .all() as Array<{ name: string }>;
+
+    // This branch exits when the table is unavailable in very old schemas and is created by initializeSchema.
+    if (columns.length === 0) {
+      return;
+    }
+
+    const hasColumn = (name: string): boolean => columns.some((column) => column.name === name);
+
+    if (!hasColumn('archive_collection_name')) {
+      this.db.exec("ALTER TABLE user_chat_control ADD COLUMN archive_collection_name TEXT NOT NULL DEFAULT 'Archive';");
+    }
+
+    if (!hasColumn('archive_collection_parent_id')) {
+      this.db.exec('ALTER TABLE user_chat_control ADD COLUMN archive_collection_parent_id INTEGER;');
+    }
+
+    if (!hasColumn('updated_at')) {
+      this.db.exec("ALTER TABLE user_chat_control ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z';");
+    }
+  }
+
   // This migration upgrades api_keys with optional tool and collection scope columns for fine-grained MCP authorization.
   private migrateApiKeyScopesIfNeeded(): void {
     const columns = this.db
@@ -1076,6 +1119,15 @@ export class SqliteStore {
       this.db
         .prepare('INSERT INTO user_settings (user_id, write_mode_enabled, updated_at) VALUES (?, ?, ?)')
         .run(userId, input.writeModeEnabled ? 1 : 0, now);
+      this.db
+        .prepare(
+          `
+          INSERT INTO user_chat_control (user_id, archive_collection_name, archive_collection_parent_id, updated_at)
+          VALUES (?, 'Archive', NULL, ?)
+          ON CONFLICT(user_id) DO NOTHING
+        `
+        )
+        .run(userId, now);
 
       return userId;
     });
@@ -1301,6 +1353,93 @@ export class SqliteStore {
       `
       )
       .run(userId, enabled ? 1 : 0, now);
+  }
+
+  // This helper ensures one default chat-control row exists for every user.
+  private ensureUserChatControlSettingsRow(userId: number): void {
+    this.db
+      .prepare(
+        `
+        INSERT INTO user_chat_control (
+          user_id,
+          archive_collection_name,
+          archive_collection_parent_id,
+          updated_at
+        )
+        VALUES (?, 'Archive', NULL, ?)
+        ON CONFLICT(user_id) DO NOTHING
+      `
+      )
+      .run(userId, new Date().toISOString());
+  }
+
+  // This method returns one normalized user chat-control document including archive routing defaults.
+  public getUserChatControlSettings(userId: number): UserChatControlSettings {
+    this.getUserById(userId);
+    this.ensureUserChatControlSettingsRow(userId);
+
+    const row = this.db
+      .prepare(
+        `
+        SELECT
+          user_id,
+          archive_collection_name,
+          archive_collection_parent_id,
+          updated_at
+        FROM user_chat_control
+        WHERE user_id = ?
+      `
+      )
+      .get(userId) as UserChatControlRow | undefined;
+
+    if (!row) {
+      throw new AppError(404, 'user_chat_control_not_found', `No chat-control settings found for user ${userId}.`);
+    }
+
+    const normalizedName = row.archive_collection_name.trim().slice(0, 120) || 'Archive';
+    return {
+      userId: row.user_id,
+      archiveCollectionName: normalizedName,
+      archiveCollectionParentId: row.archive_collection_parent_id,
+      updatedAt: row.updated_at
+    };
+  }
+
+  // This method updates one user's archive-routing defaults used by backend delete alternatives.
+  public setUserChatControlSettings(
+    userId: number,
+    payload: {
+      archiveCollectionName?: string;
+      archiveCollectionParentId?: number | null;
+    }
+  ): UserChatControlSettings {
+    const now = new Date().toISOString();
+    this.getUserById(userId);
+    const existing = this.getUserChatControlSettings(userId);
+
+    const nextArchiveCollectionName =
+      typeof payload.archiveCollectionName === 'string'
+        ? payload.archiveCollectionName.trim().slice(0, 120) || 'Archive'
+        : existing.archiveCollectionName;
+    const nextArchiveCollectionParentId =
+      payload.archiveCollectionParentId === undefined
+        ? existing.archiveCollectionParentId
+        : payload.archiveCollectionParentId;
+
+    this.db
+      .prepare(
+        `
+        UPDATE user_chat_control
+        SET
+          archive_collection_name = ?,
+          archive_collection_parent_id = ?,
+          updated_at = ?
+        WHERE user_id = ?
+      `
+      )
+      .run(nextArchiveCollectionName, nextArchiveCollectionParentId, now, userId);
+
+    return this.getUserChatControlSettings(userId);
   }
 
   // This method updates per-user offline maintenance policy settings used by monitor and maintenance tools.

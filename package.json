@@ -9,11 +9,15 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:docker": "./tools/run-in-docker.sh build",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "lint": "eslint .",
+    "lint:docker": "./tools/run-in-docker.sh lint",
     "format": "prettier --write .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:docker": "./tools/run-in-docker.sh test",
+    "qa:docker": "./tools/run-in-docker.sh qa"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.0",
