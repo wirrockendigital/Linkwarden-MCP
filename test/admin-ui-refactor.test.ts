@@ -19,6 +19,7 @@ describe('admin ui ia refactor contracts', () => {
 
     expect(html).toContain('id="topTabsNav" role="tablist"');
     expect(html).toContain('id="subTabsNav" role="tablist"');
+    expect(html).toContain('data-top-tab="uebersicht" data-sub-tab="ai-log"');
     expect(html).toContain('function parseTabState()');
     expect(html).toContain('function serializeTabState(topTab, subTab)');
     expect(html).toContain("params.set('tab', topTab)");
@@ -100,6 +101,9 @@ describe('admin ui ia refactor contracts', () => {
       'setOwnTaggingPreferences',
       'setOwnNewLinksRoutine',
       'setOwnChatControl',
+      'loadAiLog',
+      'undoSelectedAiLogChanges',
+      'undoSelectedAiLogOperations',
       'setOwnLinkwardenToken',
       'issueOwnKey',
       'revokeOwnKey'

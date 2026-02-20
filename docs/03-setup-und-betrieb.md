@@ -99,6 +99,46 @@ Verhalten bei `linkwarden_capture_chat_links`:
   - statischer Tag aus `Chat-Link-Tag-Name` (wenn `AI Chat-Tag setzen` aktiv)
   - dynamischer Tag aus `AI Name` (wenn `AI Name-Tag setzen` aktiv)
 
+## AI-Aktivitätslog im User-Backend
+
+Im Tab `Übersicht -> AI-Log` siehst du alle MCP/AI-Write-Änderungen deiner Links mit Zeitstempel.
+
+Enthaltene Änderungsdaten:
+
+- Aktionstyp (z. B. `create_link`, `normalize_url`, `tag_add`, `move_collection`)
+- Link-Metadaten (`linkId`, Titel)
+- Collection-Änderung (`von -> nach`)
+- Tag-Deltas (`+/-`)
+- URL-Vorher/Nachher inkl. Markierung für Tracking-Kürzung
+- Undo-Status (`pending`, `applied`, `conflict`, `failed`)
+
+Filtermöglichkeiten:
+
+- Volltext (`URL`, Titel, Collection, Tag)
+- Datumsbereich (`von/bis`)
+- Aktionstyp und Tool
+- Link-ID
+- Collection von / nach
+- Tag enthält
+- Tracking gekürzt (ja/nein)
+- Undo-Status
+
+Undo-Modi im Log:
+
+- Ausgewählte Änderungen rückgängig machen
+- Ausgewählte Operationen rückgängig machen
+
+Hinweise:
+
+- Undo ist nur mit aktivem Write-Mode erlaubt.
+- Bei Konflikten (neuere offene Änderung auf demselben Link) wird der betroffene Eintrag als `conflict` markiert und nicht still überschrieben.
+
+Retention pro User:
+
+- Einstellbar auf `30`, `90`, `180`, `365` Tage
+- Default ist `180` Tage
+- Alte Logeinträge werden nutzerbezogen beim Zugriff/Schreiben opportunistisch bereinigt
+
 ## Health und Readiness
 
 - `GET /health` -> Prozess lebt

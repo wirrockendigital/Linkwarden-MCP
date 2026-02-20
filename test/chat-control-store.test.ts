@@ -40,6 +40,7 @@ describe('chat control store', () => {
     expect(settings.chatCaptureTagName).toBe('AI Chat');
     expect(settings.chatCaptureTagAiChatEnabled).toBe(true);
     expect(settings.chatCaptureTagAiNameEnabled).toBe(true);
+    expect(settings.aiActivityRetentionDays).toBe(180);
   });
 
   it('stores per-user archive collection name and optional parent id', () => {
@@ -59,7 +60,8 @@ describe('chat control store', () => {
       archiveCollectionParentId: 42,
       chatCaptureTagName: 'My AI Chat',
       chatCaptureTagAiChatEnabled: false,
-      chatCaptureTagAiNameEnabled: true
+      chatCaptureTagAiNameEnabled: true,
+      aiActivityRetentionDays: 365
     });
 
     expect(updated.archiveCollectionName).toBe('Archive Team');
@@ -67,6 +69,7 @@ describe('chat control store', () => {
     expect(updated.chatCaptureTagName).toBe('My AI Chat');
     expect(updated.chatCaptureTagAiChatEnabled).toBe(false);
     expect(updated.chatCaptureTagAiNameEnabled).toBe(true);
+    expect(updated.aiActivityRetentionDays).toBe(365);
 
     const persisted = store.getUserChatControlSettings(userId);
     expect(persisted.archiveCollectionName).toBe('Archive Team');
@@ -74,5 +77,6 @@ describe('chat control store', () => {
     expect(persisted.chatCaptureTagName).toBe('My AI Chat');
     expect(persisted.chatCaptureTagAiChatEnabled).toBe(false);
     expect(persisted.chatCaptureTagAiNameEnabled).toBe(true);
+    expect(persisted.aiActivityRetentionDays).toBe(365);
   });
 });

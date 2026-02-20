@@ -229,6 +229,7 @@ export interface UserChatControlSettings {
   chatCaptureTagName: string;
   chatCaptureTagAiChatEnabled: boolean;
   chatCaptureTagAiNameEnabled: boolean;
+  aiActivityRetentionDays: 30 | 90 | 180 | 365;
   updatedAt: string;
 }
 
@@ -432,4 +433,89 @@ export interface OperationItemRecord {
   before: Record<string, unknown>;
   after: Record<string, unknown>;
   undoStatus: 'pending' | 'applied' | 'failed';
+}
+
+// This union defines the normalized action classes used by AI change-log rows.
+export type AiChangeActionType =
+  | 'create_link'
+  | 'update_link'
+  | 'delete_link'
+  | 'move_collection'
+  | 'tag_add'
+  | 'tag_remove'
+  | 'normalize_url'
+  | 'archive'
+  | 'unarchive'
+  | 'merge';
+
+// This union defines AI change-log undo status values shown in user-facing history.
+export type AiChangeUndoStatus = 'pending' | 'applied' | 'conflict' | 'failed';
+
+// This model stores one persisted AI write-change row used by /admin AI log filtering and undo flows.
+export interface AiChangeLogRecord {
+  id: number;
+  userId: number;
+  operationId: string;
+  operationItemId: number;
+  toolName: string;
+  actionType: AiChangeActionType;
+  linkId: number | null;
+  linkTitle: string | null;
+  urlBefore: string | null;
+  urlAfter: string | null;
+  trackingTrimmed: boolean;
+  collectionFromId: number | null;
+  collectionFromName: string | null;
+  collectionToId: number | null;
+  collectionToName: string | null;
+  tagsAdded: string[];
+  tagsRemoved: string[];
+  changedAt: string;
+  undoStatus: AiChangeUndoStatus;
+  undoneAt: string | null;
+  undoOperationId: string | null;
+  meta: Record<string, unknown> | null;
+}
+
+// This model defines filter options accepted by AI change-log list queries.
+export interface AiChangeLogFilters {
+  q?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  actionTypes?: AiChangeActionType[];
+  toolNames?: string[];
+  linkId?: number;
+  collectionFromId?: number;
+  collectionToId?: number;
+  tagName?: string;
+  trackingTrimmed?: boolean;
+  undoStatus?: AiChangeUndoStatus;
+}
+
+// This model stores one compact facets payload for filter dropdown population in the AI log UI.
+export interface AiChangeLogFacets {
+  actionTypes: AiChangeActionType[];
+  toolNames: string[];
+  collectionFrom: Array<{ id: number; name: string }>;
+  collectionTo: Array<{ id: number; name: string }>;
+  tags: string[];
+  minChangedAt: string | null;
+  maxChangedAt: string | null;
+}
+
+// This model defines one explicit UI undo request contract for selective or operation-wide rollback.
+export interface UndoAiChangesRequest {
+  mode: 'changes' | 'operations';
+  changeIds?: number[];
+  operationIds?: string[];
+}
+
+// This model defines structured undo results returned by the AI log undo API.
+export interface UndoAiChangesResult {
+  requested: number;
+  undone: number;
+  conflicts: number;
+  failed: number;
+  warnings: string[];
+  operationIdsAffected: string[];
 }

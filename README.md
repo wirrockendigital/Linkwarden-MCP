@@ -160,6 +160,7 @@ Die `/admin`-UI ist als role-aware Tab-Navigation aufgebaut:
 - Eigene Daten sehen
 - Eigenen Write-Mode ein/ausschalten
 - Eigenes Chat-Control für Archiv-Collection und Chat-Capture-Tags setzen
+- Eigenen AI-Aktivitätslog nutzen (Filter + Bulk-Undo)
 - Eigenen Linkwarden API Key -> MCP setzen
 - Eigene API-Keys erstellen/revoken
 
@@ -240,6 +241,14 @@ Der MCP ist jetzt auf deinen gewünschten Arbeitsmodus ausgelegt:
     - `chatCaptureTagName` (Default `AI Chat`)
     - `chatCaptureTagAiChatEnabled` (Default `true`)
     - `chatCaptureTagAiNameEnabled` (Default `true`)
+- AI-Aktivitätslog im User-Backend:
+  - Neuer Tab `Übersicht -> AI-Log` für MCP/AI-Write-Änderungen an Links inkl. Datum, Vorher/Nachher, Collection-Wechsel, Tag-Deltas und Tracking-URL-Kürzung
+  - Umfangreiche Filter: Suchtext, Datumsbereich, Aktionstyp, Tool, Link-ID, Collection von/nach, Tagname, Tracking gekürzt, Undo-Status
+  - Undo direkt aus dem Log:
+    - selektiv über ausgewählte Änderungen
+    - komplett über ausgewählte Operationen
+  - Undo erfordert weiterhin aktivierten Write-Mode
+  - Retention pro User konfigurierbar: `30 | 90 | 180 | 365` Tage (Default `180`)
 - Gespeicherte Queries:
   - `linkwarden_create_saved_query`, `linkwarden_list_saved_queries`, `linkwarden_run_saved_query`
 - Audit und Undo:

@@ -12,6 +12,7 @@ import {
   runNewLinksRoutineNow
 } from '../services/new-links-routine.js';
 import type {
+  AiChangeActionType,
   AuthenticatedPrincipal,
   FetchMode,
   GlobalTaggingPolicy,
@@ -1138,6 +1139,169 @@ function snapshotForUndo(link: LinkItem): Record<string, unknown> {
   };
 }
 
+// This helper reads optional snapshot string values and normalizes empty values to null.
+function readSnapshotString(snapshot: Record<string, unknown>, key: string): string | null {
+  const raw = snapshot[key];
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const normalized = raw.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+// This helper reads optional snapshot numeric identifiers as nullable positive integers.
+function readSnapshotId(snapshot: Record<string, unknown>, key: string): number | null {
+  const raw = snapshot[key];
+  const numeric = Number(raw);
+  if (!Number.isInteger(numeric) || numeric <= 0) {
+    return null;
+  }
+  return numeric;
+}
+
+// This helper reads one deterministic snapshot tag-id array while discarding invalid values.
+function readSnapshotTagIds(snapshot: Record<string, unknown>): number[] {
+  const raw = snapshot.tagIds;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return normalizeTagIds(raw.map((value) => Number(value)));
+}
+
+// This helper resolves one human-readable tag name from cache and falls back to an id marker.
+function resolveTagNameById(tagId: number, byTagId: Map<number, string>): string {
+  const resolved = byTagId.get(tagId);
+  if (typeof resolved === 'string' && resolved.trim().length > 0) {
+    return resolved.trim();
+  }
+  return `tag:${tagId}`;
+}
+
+// This helper classifies one operation-item delta into a stable AI change action type.
+function inferAiChangeActionType(input: {
+  toolName: string;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+  tagsAddedCount: number;
+  tagsRemovedCount: number;
+  collectionChanged: boolean;
+  urlChanged: boolean;
+}): AiChangeActionType {
+  const beforeDeleted = input.before.deleted === true;
+  const afterDeleted = input.after.deleted === true;
+  if (beforeDeleted && !afterDeleted) {
+    return 'create_link';
+  }
+  if (!beforeDeleted && afterDeleted) {
+    return 'delete_link';
+  }
+
+  if (input.toolName === 'linkwarden_normalize_urls' && input.urlChanged) {
+    return 'normalize_url';
+  }
+  if (input.toolName === 'linkwarden_merge_duplicates') {
+    return 'merge';
+  }
+  if (input.collectionChanged) {
+    return 'move_collection';
+  }
+  if (input.tagsAddedCount > 0 && input.tagsRemovedCount === 0) {
+    return 'tag_add';
+  }
+  if (input.tagsRemovedCount > 0 && input.tagsAddedCount === 0) {
+    return 'tag_remove';
+  }
+
+  const beforeArchived = input.before.archived === true;
+  const afterArchived = input.after.archived === true;
+  if (!beforeArchived && afterArchived) {
+    return 'archive';
+  }
+  if (beforeArchived && !afterArchived) {
+    return 'unarchive';
+  }
+  return 'update_link';
+}
+
+// This helper records normalized AI change-log entries derived from operation-item before/after snapshots.
+async function appendAiChangeLogForOperation(
+  context: ToolRuntimeContext,
+  client: LinkwardenClient,
+  toolName: string,
+  operationId: string,
+  operationItems: Array<{ itemType: string; itemId: number; before: Record<string, unknown>; after: Record<string, unknown> }>
+): Promise<void> {
+  if (operationItems.length === 0) {
+    return;
+  }
+
+  const [collections, tags] = await Promise.all([client.listAllCollections(), client.listAllTags()]);
+  const collectionNameById = new Map<number, string>();
+  const tagNameById = new Map<number, string>();
+  for (const collection of collections) {
+    collectionNameById.set(collection.id, collection.name);
+  }
+  for (const tag of tags) {
+    tagNameById.set(tag.id, tag.name);
+  }
+
+  const entries = operationItems.map((item) => {
+    const before = item.before;
+    const after = item.after;
+    const beforeUrl = readSnapshotString(before, 'url');
+    const afterUrl = readSnapshotString(after, 'url');
+    const beforeCollectionId = readSnapshotId(before, 'collectionId');
+    const afterCollectionId = readSnapshotId(after, 'collectionId');
+    const beforeTagIds = readSnapshotTagIds(before);
+    const afterTagIds = readSnapshotTagIds(after);
+    const beforeTagSet = new Set(beforeTagIds);
+    const afterTagSet = new Set(afterTagIds);
+    const tagsAddedIds = afterTagIds.filter((tagId) => !beforeTagSet.has(tagId));
+    const tagsRemovedIds = beforeTagIds.filter((tagId) => !afterTagSet.has(tagId));
+    const tagsAdded = tagsAddedIds.map((tagId) => resolveTagNameById(tagId, tagNameById));
+    const tagsRemoved = tagsRemovedIds.map((tagId) => resolveTagNameById(tagId, tagNameById));
+    const collectionChanged = beforeCollectionId !== afterCollectionId;
+    const urlChanged = beforeUrl !== afterUrl;
+    const actionType = inferAiChangeActionType({
+      toolName,
+      before,
+      after,
+      tagsAddedCount: tagsAdded.length,
+      tagsRemovedCount: tagsRemoved.length,
+      collectionChanged,
+      urlChanged
+    });
+
+    return {
+      operationItemId: item.itemId,
+      actionType,
+      linkId: Number.isInteger(item.itemId) && item.itemId > 0 ? item.itemId : null,
+      linkTitle: readSnapshotString(after, 'title') ?? readSnapshotString(before, 'title'),
+      urlBefore: beforeUrl,
+      urlAfter: afterUrl,
+      trackingTrimmed: actionType === 'normalize_url' && urlChanged,
+      collectionFromId: beforeCollectionId,
+      collectionFromName: beforeCollectionId ? (collectionNameById.get(beforeCollectionId) ?? null) : null,
+      collectionToId: afterCollectionId,
+      collectionToName: afterCollectionId ? (collectionNameById.get(afterCollectionId) ?? null) : null,
+      tagsAdded,
+      tagsRemoved,
+      undoStatus: 'pending' as const,
+      meta: {
+        itemType: item.itemType,
+        deleteMode: typeof after.deleteMode === 'string' ? after.deleteMode : null
+      }
+    };
+  });
+
+  context.db.appendAiChangeLogEntries({
+    userId: context.principal.userId,
+    operationId,
+    toolName,
+    entries
+  });
+}
+
 // This helper generates one deterministic query page response from a persisted query snapshot.
 function readQuerySlice(
   snapshotId: string,
@@ -1503,6 +1667,21 @@ async function handleMutateLinks(args: unknown, context: ToolRuntimeContext): Pr
       }
 
       context.db.insertOperationItems(operationId, operationItems);
+      try {
+        // This call persists user-facing AI change-log rows for selective undo and dashboard filtering.
+        await appendAiChangeLogForOperation(context, client, 'linkwarden_mutate_links', operationId, operationItems);
+      } catch (error) {
+        // This warning keeps successful mutations non-blocking when auxiliary log persistence fails unexpectedly.
+        context.logger.warn(
+          {
+            event: 'ai_change_log_append_failed',
+            toolName: 'linkwarden_mutate_links',
+            operationId,
+            error: errorForLog(error)
+          },
+          'ai_change_log_append_failed'
+        );
+      }
       context.db.insertAudit({
         actor: context.actor,
         toolName: 'linkwarden_mutate_links',
@@ -1768,6 +1947,21 @@ async function handleDeleteLinks(args: unknown, context: ToolRuntimeContext): Pr
       }
 
       context.db.insertOperationItems(operationId, operationItems);
+      try {
+        // This call persists user-facing AI change-log rows for delete workflows and undo tracing.
+        await appendAiChangeLogForOperation(context, client, 'linkwarden_delete_links', operationId, operationItems);
+      } catch (error) {
+        // This warning keeps delete apply behavior non-blocking when auxiliary log persistence fails unexpectedly.
+        context.logger.warn(
+          {
+            event: 'ai_change_log_append_failed',
+            toolName: 'linkwarden_delete_links',
+            operationId,
+            error: errorForLog(error)
+          },
+          'ai_change_log_append_failed'
+        );
+      }
       context.db.insertAudit({
         actor: context.actor,
         toolName: 'linkwarden_delete_links',
@@ -2086,6 +2280,21 @@ async function handleAssignTags(args: unknown, context: ToolRuntimeContext): Pro
       }
 
       context.db.insertOperationItems(operationId, operationItems);
+      try {
+        // This call persists user-facing AI change-log rows for explicit tag assignment workflows.
+        await appendAiChangeLogForOperation(context, client, 'linkwarden_assign_tags', operationId, operationItems);
+      } catch (error) {
+        // This warning keeps tag assignment behavior non-blocking when auxiliary log persistence fails unexpectedly.
+        context.logger.warn(
+          {
+            event: 'ai_change_log_append_failed',
+            toolName: 'linkwarden_assign_tags',
+            operationId,
+            error: errorForLog(error)
+          },
+          'ai_change_log_append_failed'
+        );
+      }
       context.db.insertAudit({
         actor: context.actor,
         toolName: 'linkwarden_assign_tags',
@@ -2779,6 +2988,21 @@ async function handleGovernedTagLinks(args: unknown, context: ToolRuntimeContext
       }
 
       context.db.insertOperationItems(operationId, operationItems);
+      try {
+        // This call persists user-facing AI change-log rows for governed tagging mutations.
+        await appendAiChangeLogForOperation(context, client, 'linkwarden_governed_tag_links', operationId, operationItems);
+      } catch (error) {
+        // This warning keeps governed tagging behavior non-blocking when auxiliary log persistence fails unexpectedly.
+        context.logger.warn(
+          {
+            event: 'ai_change_log_append_failed',
+            toolName: 'linkwarden_governed_tag_links',
+            operationId,
+            error: errorForLog(error)
+          },
+          'ai_change_log_append_failed'
+        );
+      }
       context.db.insertAudit({
         actor: context.actor,
         toolName: 'linkwarden_governed_tag_links',
@@ -2924,6 +3148,21 @@ async function handleNormalizeUrls(args: unknown, context: ToolRuntimeContext): 
       }
 
       context.db.insertOperationItems(operationId, operationItems);
+      try {
+        // This call persists user-facing AI change-log rows for URL normalization workflows.
+        await appendAiChangeLogForOperation(context, client, 'linkwarden_normalize_urls', operationId, operationItems);
+      } catch (error) {
+        // This warning keeps URL normalization behavior non-blocking when auxiliary log persistence fails unexpectedly.
+        context.logger.warn(
+          {
+            event: 'ai_change_log_append_failed',
+            toolName: 'linkwarden_normalize_urls',
+            operationId,
+            error: errorForLog(error)
+          },
+          'ai_change_log_append_failed'
+        );
+      }
       context.db.insertAudit({
         actor: context.actor,
         toolName: 'linkwarden_normalize_urls',
@@ -3157,6 +3396,21 @@ async function handleMergeDuplicates(args: unknown, context: ToolRuntimeContext)
       }
 
       context.db.insertOperationItems(operationId, operationItems);
+      try {
+        // This call persists user-facing AI change-log rows for duplicate merge workflows.
+        await appendAiChangeLogForOperation(context, client, 'linkwarden_merge_duplicates', operationId, operationItems);
+      } catch (error) {
+        // This warning keeps duplicate merge behavior non-blocking when auxiliary log persistence fails unexpectedly.
+        context.logger.warn(
+          {
+            event: 'ai_change_log_append_failed',
+            toolName: 'linkwarden_merge_duplicates',
+            operationId,
+            error: errorForLog(error)
+          },
+          'ai_change_log_append_failed'
+        );
+      }
       context.db.insertAudit({
         actor: context.actor,
         toolName: 'linkwarden_merge_duplicates',
@@ -3650,7 +3904,16 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
       }
 
       const failures: Array<{ itemId: string; code: string; message: string; retryable: boolean }> = [];
-      const createdLinks: Array<{ id: number; url: string; collectionId: number; tagIds: number[] }> = [];
+      const createdLinks: Array<{
+        id: number;
+        title: string;
+        url: string;
+        description: string | null;
+        collectionId: number;
+        tagIds: number[];
+        pinned: boolean;
+        archived: boolean;
+      }> = [];
       const createdWithoutTagsLinks: Array<{ id: number; url: string; collectionId: number }> = [];
 
       for (const candidate of toCreateCandidates) {
@@ -3669,9 +3932,13 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
           });
           createdLinks.push({
             id: created.id,
+            title: created.title,
             url: created.url,
+            description: created.description ?? null,
             collectionId: hierarchy.chatCollection.id,
-            tagIds: requestedTagIds ?? []
+            tagIds: requestedTagIds ?? [],
+            pinned: Boolean(created.pinned),
+            archived: Boolean(created.archived)
           });
         } catch (error) {
           const firstErrorMessage = formatCreateLinkError(error);
@@ -3682,9 +3949,13 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
               const retryCreated = await client.createLink(createInputBase);
               createdLinks.push({
                 id: retryCreated.id,
+                title: retryCreated.title,
                 url: retryCreated.url,
+                description: retryCreated.description ?? null,
                 collectionId: hierarchy.chatCollection.id,
-                tagIds: []
+                tagIds: [],
+                pinned: Boolean(retryCreated.pinned),
+                archived: Boolean(retryCreated.archived)
               });
               createdWithoutTagsLinks.push({
                 id: retryCreated.id,
@@ -3716,6 +3987,47 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
         }
       }
 
+      let operationId: string | null = null;
+      if (createdLinks.length > 0) {
+        operationId = beginOperation(context, 'linkwarden_capture_chat_links', {
+          detected: normalizedCandidates.normalized.length,
+          created: createdLinks.length,
+          failed: failures.length
+        });
+        const operationItems = createdLinks.map((link) => ({
+          itemType: 'link',
+          itemId: link.id,
+          before: {
+            deleted: true
+          },
+          after: {
+            title: link.title,
+            url: link.url,
+            description: link.description,
+            collectionId: link.collectionId,
+            tagIds: link.tagIds,
+            pinned: link.pinned,
+            archived: link.archived
+          }
+        }));
+        context.db.insertOperationItems(operationId, operationItems);
+        try {
+          // This call persists user-facing AI change-log rows for capture-created links.
+          await appendAiChangeLogForOperation(context, client, 'linkwarden_capture_chat_links', operationId, operationItems);
+        } catch (error) {
+          // This warning keeps capture apply behavior non-blocking when auxiliary log persistence fails unexpectedly.
+          context.logger.warn(
+            {
+              event: 'ai_change_log_append_failed',
+              toolName: 'linkwarden_capture_chat_links',
+              operationId,
+              error: errorForLog(error)
+            },
+            'ai_change_log_append_failed'
+          );
+        }
+      }
+
       context.db.insertAudit({
         actor: context.actor,
         toolName: 'linkwarden_capture_chat_links',
@@ -3734,6 +4046,7 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
           createdCollectionIds: hierarchy.createdCollections.map((collection) => collection.id),
           tagNames: appliedTagNames,
           tagIds: tagResolution.tagIds,
+          operationId,
           detected: normalizedCandidates.normalized.length,
           created: createdLinks.length,
           createdWithoutTags: createdWithoutTagsLinks.length,
@@ -3744,6 +4057,7 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
       return {
         ok: true,
         data: {
+          operationId,
           aiName: aiCollectionName,
           chatName: chatCollectionName,
           hierarchy,
@@ -3915,6 +4229,144 @@ async function handleGetAudit(args: unknown, context: ToolRuntimeContext): Promi
   );
 }
 
+// This helper undoes selected AI change-log rows with conflict checks and deterministic status updates.
+export async function undoChangesByIds(
+  context: ToolRuntimeContext,
+  changeIds: number[]
+): Promise<{
+  requested: number;
+  undone: number;
+  conflicts: Array<{ changeId: number; linkId: number | null; reason: string }>;
+  failed: Array<{ changeId: number; linkId: number | null; reason: string }>;
+  warnings: string[];
+  operationIdsAffected: string[];
+  undoOperationId: string;
+}> {
+  assertWriteAccess(context);
+  const requestedIds = [...new Set(changeIds.filter((value) => Number.isInteger(value) && value > 0))];
+  if (requestedIds.length === 0) {
+    throw new AppError(400, 'validation_error', 'At least one valid change id is required.');
+  }
+
+  const client = getClient(context);
+  const candidates = context.db.getAiChangeUndoCandidates(context.principal.userId, requestedIds);
+  const candidateById = new Map(candidates.map((candidate) => [candidate.change.id, candidate]));
+  const warnings: string[] = [];
+  const conflicts: Array<{ changeId: number; linkId: number | null; reason: string }> = [];
+  const failed: Array<{ changeId: number; linkId: number | null; reason: string }> = [];
+  const appliedChangeIds: number[] = [];
+  const conflictChangeIds: number[] = [];
+  const failedChangeIds: number[] = [];
+  const operationIdsAffected = new Set<string>();
+  let undone = 0;
+
+  const nowIso = new Date().toISOString();
+  const undoOperationId = randomUUID();
+  context.db.createOperation({
+    id: undoOperationId,
+    userId: context.principal.userId,
+    toolName: 'linkwarden_undo_changes',
+    summary: {
+      requested: requestedIds.length
+    },
+    undoUntil: null
+  });
+
+  for (const changeId of requestedIds) {
+    const candidate = candidateById.get(changeId);
+    if (!candidate) {
+      const reason = 'Change id was not found for this user.';
+      failed.push({ changeId, linkId: null, reason });
+      failedChangeIds.push(changeId);
+      continue;
+    }
+
+    const change = candidate.change;
+    operationIdsAffected.add(change.operationId);
+
+    if (change.undoStatus === 'applied') {
+      warnings.push(`Change ${change.id} was already undone and was skipped.`);
+      continue;
+    }
+
+    if (!candidate.undoUntil || new Date(candidate.undoUntil).getTime() <= Date.now()) {
+      const reason = `Undo window expired for change ${change.id}.`;
+      failed.push({ changeId: change.id, linkId: change.linkId, reason });
+      failedChangeIds.push(change.id);
+      continue;
+    }
+
+    if (candidate.hasNewerOpenChange) {
+      const reason = `A newer non-undone change exists for link ${change.linkId ?? 'unknown'}.`;
+      conflicts.push({ changeId: change.id, linkId: change.linkId, reason });
+      conflictChangeIds.push(change.id);
+      continue;
+    }
+
+    const undoItem: OperationItemRecord = {
+      operationId: change.operationId,
+      itemType: 'link',
+      itemId: change.operationItemId,
+      before: candidate.before,
+      after: candidate.after,
+      undoStatus: 'pending'
+    };
+    const undoResult = await undoOperationItem(context, client, change.operationId, undoItem);
+    if (undoResult.ok) {
+      undone += 1;
+      appliedChangeIds.push(change.id);
+    } else {
+      const reason = undoResult.message ?? 'undo failed';
+      failed.push({ changeId: change.id, linkId: change.linkId, reason });
+      failedChangeIds.push(change.id);
+    }
+  }
+
+  if (appliedChangeIds.length > 0) {
+    context.db.markAiChangesUndone(context.principal.userId, appliedChangeIds, undoOperationId, nowIso);
+  }
+  if (conflictChangeIds.length > 0) {
+    context.db.setAiChangeUndoStatus(context.principal.userId, conflictChangeIds, 'conflict', {
+      atIso: nowIso,
+      undoOperationId
+    });
+  }
+  if (failedChangeIds.length > 0) {
+    context.db.setAiChangeUndoStatus(context.principal.userId, failedChangeIds, 'failed', {
+      atIso: nowIso,
+      undoOperationId
+    });
+  }
+
+  context.db.insertAudit({
+    actor: context.actor,
+    toolName: 'linkwarden_undo_changes',
+    targetType: 'ai_change',
+    targetIds: requestedIds,
+    beforeSummary: 'undo selected changes requested',
+    afterSummary: JSON.stringify({
+      undone,
+      conflicts: conflicts.length,
+      failed: failed.length
+    }),
+    outcome: failed.length === 0 ? 'success' : 'failed',
+    details: {
+      userId: context.principal.userId,
+      undoOperationId
+    }
+  });
+
+  return {
+    requested: requestedIds.length,
+    undone,
+    conflicts,
+    failed,
+    warnings,
+    operationIdsAffected: [...operationIdsAffected].sort((left, right) => left.localeCompare(right)),
+    undoOperationId
+  };
+}
+
 // This helper applies one before-snapshot to a link and updates operation item state based on outcome.
 async function undoOperationItem(
   context: ToolRuntimeContext,
@@ -3923,11 +4375,18 @@ async function undoOperationItem(
   item: OperationItemRecord
 ): Promise<{ ok: boolean; message?: string }> {
   if (item.before.deleted === true) {
-    context.db.setOperationItemUndoStatus(operationId, item.itemId, 'failed');
-    return {
-      ok: false,
-      message: 'Hard-deleted links cannot be restored.'
-    };
+    try {
+      // This branch undoes create-link operations by deleting the newly created link entity.
+      await client.deleteLink(item.itemId);
+      context.db.setOperationItemUndoStatus(operationId, item.itemId, 'applied');
+      return { ok: true };
+    } catch (error) {
+      context.db.setOperationItemUndoStatus(operationId, item.itemId, 'failed');
+      return {
+        ok: false,
+        message: error instanceof Error ? error.message : 'undo delete failed'
+      };
+    }
   }
 
   try {
@@ -3965,13 +4424,17 @@ async function handleUndoOperation(args: unknown, context: ToolRuntimeContext): 
 
   const client = getClient(context);
   const failures: Array<{ itemId: number; code: string; message: string; retryable: boolean }> = [];
+  const appliedItemIds: number[] = [];
+  const failedItemIds: number[] = [];
   let undone = 0;
 
   for (const item of operation.items) {
     const result = await undoOperationItem(context, client, input.operationId, item);
     if (result.ok) {
       undone += 1;
+      appliedItemIds.push(item.itemId);
     } else {
+      failedItemIds.push(item.itemId);
       failures.push({
         itemId: item.itemId,
         code: 'undo_failed',
@@ -3979,6 +4442,32 @@ async function handleUndoOperation(args: unknown, context: ToolRuntimeContext): 
         retryable: false
       });
     }
+  }
+
+  const undoAppliedAt = new Date().toISOString();
+  if (appliedItemIds.length > 0) {
+    context.db.setAiChangeUndoStatusByOperationItems(
+      context.principal.userId,
+      input.operationId,
+      appliedItemIds,
+      'applied',
+      {
+        atIso: undoAppliedAt,
+        undoOperationId: input.operationId
+      }
+    );
+  }
+  if (failedItemIds.length > 0) {
+    context.db.setAiChangeUndoStatusByOperationItems(
+      context.principal.userId,
+      input.operationId,
+      failedItemIds,
+      'failed',
+      {
+        atIso: undoAppliedAt,
+        undoOperationId: input.operationId
+      }
+    );
   }
 
   context.db.insertAudit({

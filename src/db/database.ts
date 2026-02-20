@@ -5,6 +5,11 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { PassphraseVerifier } from '../config/crypto.js';
 import type {
+  AiChangeActionType,
+  AiChangeLogFacets,
+  AiChangeLogFilters,
+  AiChangeLogRecord,
+  AiChangeUndoStatus,
   AuditEntry,
   AuthenticatedPrincipal,
   EncryptedSecret,
@@ -262,7 +267,40 @@ interface UserChatControlRow {
   chat_capture_tag_name: string;
   chat_capture_tag_ai_chat_enabled: number;
   chat_capture_tag_ai_name_enabled: number;
+  ai_activity_retention_days: number;
   updated_at: string;
+}
+
+interface AiChangeLogRow {
+  id: number;
+  user_id: number;
+  operation_id: string;
+  operation_item_id: number;
+  tool_name: string;
+  action_type: string;
+  link_id: number | null;
+  link_title: string | null;
+  url_before: string | null;
+  url_after: string | null;
+  tracking_trimmed: number;
+  collection_from_id: number | null;
+  collection_from_name: string | null;
+  collection_to_id: number | null;
+  collection_to_name: string | null;
+  tags_added_json: string;
+  tags_removed_json: string;
+  changed_at: string;
+  undo_status: 'pending' | 'applied' | 'conflict' | 'failed';
+  undone_at: string | null;
+  undo_operation_id: string | null;
+  meta_json: string | null;
+}
+
+interface AiChangeUndoCandidateRow extends AiChangeLogRow {
+  before_json: string;
+  after_json: string;
+  undo_until: string | null;
+  has_newer_open_change: number;
 }
 
 // This constant defines the allowed strictness presets for deterministic DB validation and API parsing.
@@ -278,6 +316,9 @@ const ALLOWED_TAGGING_INFERENCE_PROVIDERS: TaggingInferenceProvider[] = [
   'mistral',
   'huggingface'
 ];
+
+// This constant defines allowed per-user AI activity retention windows in days.
+const ALLOWED_AI_ACTIVITY_RETENTION_DAYS: Array<30 | 90 | 180 | 365> = [30, 90, 180, 365];
 
 // This constant defines one deterministic global policy baseline when no policy row exists yet.
 const DEFAULT_GLOBAL_TAGGING_POLICY: GlobalTaggingPolicy = {
@@ -399,6 +440,7 @@ export class SqliteStore {
         chat_capture_tag_name TEXT NOT NULL DEFAULT 'AI Chat',
         chat_capture_tag_ai_chat_enabled INTEGER NOT NULL DEFAULT 1,
         chat_capture_tag_ai_name_enabled INTEGER NOT NULL DEFAULT 1,
+        ai_activity_retention_days INTEGER NOT NULL DEFAULT 180 CHECK (ai_activity_retention_days IN (30, 90, 180, 365)),
         updated_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
       );
@@ -719,6 +761,44 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_operation_items_operation
       ON operation_items(operation_id);
 
+      CREATE TABLE IF NOT EXISTS ai_change_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        operation_id TEXT NOT NULL,
+        operation_item_id INTEGER NOT NULL,
+        tool_name TEXT NOT NULL,
+        action_type TEXT NOT NULL,
+        link_id INTEGER,
+        link_title TEXT,
+        url_before TEXT,
+        url_after TEXT,
+        tracking_trimmed INTEGER NOT NULL DEFAULT 0,
+        collection_from_id INTEGER,
+        collection_from_name TEXT,
+        collection_to_id INTEGER,
+        collection_to_name TEXT,
+        tags_added_json TEXT NOT NULL DEFAULT '[]',
+        tags_removed_json TEXT NOT NULL DEFAULT '[]',
+        changed_at TEXT NOT NULL,
+        undo_status TEXT NOT NULL DEFAULT 'pending' CHECK (undo_status IN ('pending', 'applied', 'conflict', 'failed')),
+        undone_at TEXT,
+        undo_operation_id TEXT,
+        meta_json TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY(operation_id) REFERENCES operation_log(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ai_change_log_user_changed
+      ON ai_change_log(user_id, changed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ai_change_log_user_link_changed
+      ON ai_change_log(user_id, link_id, changed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ai_change_log_user_action_changed
+      ON ai_change_log(user_id, action_type, changed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ai_change_log_user_operation
+      ON ai_change_log(user_id, operation_id);
+      CREATE INDEX IF NOT EXISTS idx_ai_change_log_user_undo_changed
+      ON ai_change_log(user_id, undo_status, changed_at DESC);
+
       CREATE TABLE IF NOT EXISTS tag_aliases (
         user_id INTEGER NOT NULL,
         canonical_tag_id INTEGER NOT NULL,
@@ -765,6 +845,7 @@ export class SqliteStore {
     this.migrateUsersTableIfNeeded();
     this.migrateUserSettingsTableIfNeeded();
     this.migrateUserChatControlTableIfNeeded();
+    this.migrateAiChangeLogTableIfNeeded();
     this.migrateApiKeyScopesIfNeeded();
   }
 
@@ -991,9 +1072,66 @@ export class SqliteStore {
       this.db.exec('ALTER TABLE user_chat_control ADD COLUMN chat_capture_tag_ai_name_enabled INTEGER NOT NULL DEFAULT 1;');
     }
 
+    // This migration adds per-user AI activity log retention control for /admin log pruning.
+    if (!hasColumn('ai_activity_retention_days')) {
+      this.db.exec(
+        'ALTER TABLE user_chat_control ADD COLUMN ai_activity_retention_days INTEGER NOT NULL DEFAULT 180;'
+      );
+    }
+
     if (!hasColumn('updated_at')) {
       this.db.exec("ALTER TABLE user_chat_control ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z';");
     }
+
+    // This migration normalizes retention values to supported presets after schema upgrades.
+    this.db.exec(`
+      UPDATE user_chat_control
+      SET ai_activity_retention_days = 180
+      WHERE ai_activity_retention_days NOT IN (30, 90, 180, 365)
+    `);
+  }
+
+  // This migration ensures AI change-log schema and indexes exist for user-facing undo history.
+  private migrateAiChangeLogTableIfNeeded(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ai_change_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        operation_id TEXT NOT NULL,
+        operation_item_id INTEGER NOT NULL,
+        tool_name TEXT NOT NULL,
+        action_type TEXT NOT NULL,
+        link_id INTEGER,
+        link_title TEXT,
+        url_before TEXT,
+        url_after TEXT,
+        tracking_trimmed INTEGER NOT NULL DEFAULT 0,
+        collection_from_id INTEGER,
+        collection_from_name TEXT,
+        collection_to_id INTEGER,
+        collection_to_name TEXT,
+        tags_added_json TEXT NOT NULL DEFAULT '[]',
+        tags_removed_json TEXT NOT NULL DEFAULT '[]',
+        changed_at TEXT NOT NULL,
+        undo_status TEXT NOT NULL DEFAULT 'pending' CHECK (undo_status IN ('pending', 'applied', 'conflict', 'failed')),
+        undone_at TEXT,
+        undo_operation_id TEXT,
+        meta_json TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY(operation_id) REFERENCES operation_log(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ai_change_log_user_changed
+      ON ai_change_log(user_id, changed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ai_change_log_user_link_changed
+      ON ai_change_log(user_id, link_id, changed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ai_change_log_user_action_changed
+      ON ai_change_log(user_id, action_type, changed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ai_change_log_user_operation
+      ON ai_change_log(user_id, operation_id);
+      CREATE INDEX IF NOT EXISTS idx_ai_change_log_user_undo_changed
+      ON ai_change_log(user_id, undo_status, changed_at DESC);
+    `);
   }
 
   // This migration upgrades api_keys with optional tool and collection scope columns for fine-grained MCP authorization.
@@ -1150,9 +1288,10 @@ export class SqliteStore {
             chat_capture_tag_name,
             chat_capture_tag_ai_chat_enabled,
             chat_capture_tag_ai_name_enabled,
+            ai_activity_retention_days,
             updated_at
           )
-          VALUES (?, 'Archive', NULL, 'AI Chat', 1, 1, ?)
+          VALUES (?, 'Archive', NULL, 'AI Chat', 1, 1, 180, ?)
           ON CONFLICT(user_id) DO NOTHING
         `
         )
@@ -1396,13 +1535,23 @@ export class SqliteStore {
           chat_capture_tag_name,
           chat_capture_tag_ai_chat_enabled,
           chat_capture_tag_ai_name_enabled,
+          ai_activity_retention_days,
           updated_at
         )
-        VALUES (?, 'Archive', NULL, 'AI Chat', 1, 1, ?)
+        VALUES (?, 'Archive', NULL, 'AI Chat', 1, 1, 180, ?)
         ON CONFLICT(user_id) DO NOTHING
       `
       )
       .run(userId, new Date().toISOString());
+  }
+
+  // This helper enforces supported AI activity retention presets for deterministic pruning behavior.
+  private normalizeAiActivityRetentionDays(value: number | null | undefined): 30 | 90 | 180 | 365 {
+    const normalized = Number(value);
+    if (ALLOWED_AI_ACTIVITY_RETENTION_DAYS.includes(normalized as 30 | 90 | 180 | 365)) {
+      return normalized as 30 | 90 | 180 | 365;
+    }
+    return 180;
   }
 
   // This method returns one normalized user chat-control document including archive routing defaults.
@@ -1420,6 +1569,7 @@ export class SqliteStore {
           chat_capture_tag_name,
           chat_capture_tag_ai_chat_enabled,
           chat_capture_tag_ai_name_enabled,
+          ai_activity_retention_days,
           updated_at
         FROM user_chat_control
         WHERE user_id = ?
@@ -1433,6 +1583,7 @@ export class SqliteStore {
 
     const normalizedName = row.archive_collection_name.trim().slice(0, 120) || 'Archive';
     const normalizedChatCaptureTagName = row.chat_capture_tag_name.trim().slice(0, 80) || 'AI Chat';
+    const normalizedRetentionDays = this.normalizeAiActivityRetentionDays(row.ai_activity_retention_days);
     return {
       userId: row.user_id,
       archiveCollectionName: normalizedName,
@@ -1440,6 +1591,7 @@ export class SqliteStore {
       chatCaptureTagName: normalizedChatCaptureTagName,
       chatCaptureTagAiChatEnabled: row.chat_capture_tag_ai_chat_enabled === 1,
       chatCaptureTagAiNameEnabled: row.chat_capture_tag_ai_name_enabled === 1,
+      aiActivityRetentionDays: normalizedRetentionDays,
       updatedAt: row.updated_at
     };
   }
@@ -1453,6 +1605,7 @@ export class SqliteStore {
       chatCaptureTagName?: string;
       chatCaptureTagAiChatEnabled?: boolean;
       chatCaptureTagAiNameEnabled?: boolean;
+      aiActivityRetentionDays?: 30 | 90 | 180 | 365;
     }
   ): UserChatControlSettings {
     const now = new Date().toISOString();
@@ -1479,6 +1632,10 @@ export class SqliteStore {
       payload.chatCaptureTagAiNameEnabled === undefined
         ? existing.chatCaptureTagAiNameEnabled
         : payload.chatCaptureTagAiNameEnabled;
+    const nextAiActivityRetentionDays =
+      payload.aiActivityRetentionDays === undefined
+        ? existing.aiActivityRetentionDays
+        : this.normalizeAiActivityRetentionDays(payload.aiActivityRetentionDays);
 
     this.db
       .prepare(
@@ -1490,6 +1647,7 @@ export class SqliteStore {
           chat_capture_tag_name = ?,
           chat_capture_tag_ai_chat_enabled = ?,
           chat_capture_tag_ai_name_enabled = ?,
+          ai_activity_retention_days = ?,
           updated_at = ?
         WHERE user_id = ?
       `
@@ -1500,6 +1658,7 @@ export class SqliteStore {
         nextChatCaptureTagName,
         nextChatCaptureTagAiChatEnabled ? 1 : 0,
         nextChatCaptureTagAiNameEnabled ? 1 : 0,
+        nextAiActivityRetentionDays,
         now,
         userId
       );
@@ -3728,6 +3887,542 @@ export class SqliteStore {
     this.db
       .prepare('UPDATE operation_items SET undo_status = ? WHERE operation_id = ? AND item_id = ?')
       .run(status, operationId, itemId);
+  }
+
+  // This helper maps raw AI change-log rows to strongly typed domain records.
+  private mapAiChangeLogRow(row: AiChangeLogRow): AiChangeLogRecord {
+    return {
+      id: row.id,
+      userId: row.user_id,
+      operationId: row.operation_id,
+      operationItemId: row.operation_item_id,
+      toolName: row.tool_name,
+      actionType: row.action_type as AiChangeActionType,
+      linkId: row.link_id,
+      linkTitle: row.link_title,
+      urlBefore: row.url_before,
+      urlAfter: row.url_after,
+      trackingTrimmed: row.tracking_trimmed === 1,
+      collectionFromId: row.collection_from_id,
+      collectionFromName: row.collection_from_name,
+      collectionToId: row.collection_to_id,
+      collectionToName: row.collection_to_name,
+      tagsAdded: parseJson<string[]>(row.tags_added_json, 'ai_change_log.tags_added_json'),
+      tagsRemoved: parseJson<string[]>(row.tags_removed_json, 'ai_change_log.tags_removed_json'),
+      changedAt: row.changed_at,
+      undoStatus: row.undo_status as AiChangeUndoStatus,
+      undoneAt: row.undone_at,
+      undoOperationId: row.undo_operation_id,
+      meta: row.meta_json ? parseJson<Record<string, unknown>>(row.meta_json, 'ai_change_log.meta_json') : null
+    };
+  }
+
+  // This method appends one or more normalized AI change-log records derived from MCP write operations.
+  public appendAiChangeLogEntries(input: {
+    userId: number;
+    operationId: string;
+    toolName: string;
+    changedAt?: string;
+    entries: Array<{
+      operationItemId: number;
+      actionType: AiChangeActionType;
+      linkId: number | null;
+      linkTitle?: string | null;
+      urlBefore?: string | null;
+      urlAfter?: string | null;
+      trackingTrimmed?: boolean;
+      collectionFromId?: number | null;
+      collectionFromName?: string | null;
+      collectionToId?: number | null;
+      collectionToName?: string | null;
+      tagsAdded?: string[];
+      tagsRemoved?: string[];
+      undoStatus?: AiChangeUndoStatus;
+      meta?: Record<string, unknown> | null;
+    }>;
+  }): void {
+    if (input.entries.length === 0) {
+      return;
+    }
+
+    const changedAt = input.changedAt ?? new Date().toISOString();
+    const insert = this.db.prepare(
+      `
+      INSERT INTO ai_change_log (
+        user_id,
+        operation_id,
+        operation_item_id,
+        tool_name,
+        action_type,
+        link_id,
+        link_title,
+        url_before,
+        url_after,
+        tracking_trimmed,
+        collection_from_id,
+        collection_from_name,
+        collection_to_id,
+        collection_to_name,
+        tags_added_json,
+        tags_removed_json,
+        changed_at,
+        undo_status,
+        undone_at,
+        undo_operation_id,
+        meta_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+    `
+    );
+
+    const tx = this.db.transaction(() => {
+      for (const entry of input.entries) {
+        insert.run(
+          input.userId,
+          input.operationId,
+          entry.operationItemId,
+          input.toolName,
+          entry.actionType,
+          entry.linkId,
+          entry.linkTitle ?? null,
+          entry.urlBefore ?? null,
+          entry.urlAfter ?? null,
+          entry.trackingTrimmed ? 1 : 0,
+          entry.collectionFromId ?? null,
+          entry.collectionFromName ?? null,
+          entry.collectionToId ?? null,
+          entry.collectionToName ?? null,
+          JSON.stringify(entry.tagsAdded ?? []),
+          JSON.stringify(entry.tagsRemoved ?? []),
+          changedAt,
+          entry.undoStatus ?? 'pending',
+          entry.meta ? JSON.stringify(entry.meta) : null
+        );
+      }
+    });
+    tx();
+  }
+
+  // This method returns paged AI change-log rows with deterministic filtering and sorting for /admin UI.
+  public listAiChangeLog(
+    userId: number,
+    filters: AiChangeLogFilters,
+    paging: { limit: number; offset: number },
+    sorting: { sortBy: 'changedAt' | 'linkId' | 'actionType' | 'toolName'; sortDir: 'asc' | 'desc' }
+  ): { items: AiChangeLogRecord[]; total: number } {
+    const conditions: string[] = ['user_id = ?'];
+    const params: Array<string | number> = [userId];
+
+    if (filters.q) {
+      const query = `%${filters.q.trim().toLocaleLowerCase()}%`;
+      conditions.push(
+        `(LOWER(COALESCE(link_title, '')) LIKE ? OR LOWER(COALESCE(url_before, '')) LIKE ? OR LOWER(COALESCE(url_after, '')) LIKE ? OR LOWER(COALESCE(collection_from_name, '')) LIKE ? OR LOWER(COALESCE(collection_to_name, '')) LIKE ? OR LOWER(COALESCE(tags_added_json, '')) LIKE ? OR LOWER(COALESCE(tags_removed_json, '')) LIKE ?)`
+      );
+      params.push(query, query, query, query, query, query, query);
+    }
+
+    if (filters.dateFrom) {
+      conditions.push('changed_at >= ?');
+      params.push(filters.dateFrom);
+    }
+    if (filters.dateTo) {
+      conditions.push('changed_at <= ?');
+      params.push(filters.dateTo);
+    }
+
+    if (filters.actionTypes && filters.actionTypes.length > 0) {
+      const placeholders = filters.actionTypes.map(() => '?').join(', ');
+      conditions.push(`action_type IN (${placeholders})`);
+      params.push(...filters.actionTypes);
+    }
+
+    if (filters.toolNames && filters.toolNames.length > 0) {
+      const placeholders = filters.toolNames.map(() => '?').join(', ');
+      conditions.push(`tool_name IN (${placeholders})`);
+      params.push(...filters.toolNames);
+    }
+
+    if (typeof filters.linkId === 'number') {
+      conditions.push('link_id = ?');
+      params.push(filters.linkId);
+    }
+    if (typeof filters.collectionFromId === 'number') {
+      conditions.push('collection_from_id = ?');
+      params.push(filters.collectionFromId);
+    }
+    if (typeof filters.collectionToId === 'number') {
+      conditions.push('collection_to_id = ?');
+      params.push(filters.collectionToId);
+    }
+
+    if (filters.tagName) {
+      const normalizedTagName = `%${filters.tagName.trim().toLocaleLowerCase()}%`;
+      conditions.push('(LOWER(tags_added_json) LIKE ? OR LOWER(tags_removed_json) LIKE ?)');
+      params.push(normalizedTagName, normalizedTagName);
+    }
+
+    if (typeof filters.trackingTrimmed === 'boolean') {
+      conditions.push('tracking_trimmed = ?');
+      params.push(filters.trackingTrimmed ? 1 : 0);
+    }
+
+    if (filters.undoStatus) {
+      conditions.push('undo_status = ?');
+      params.push(filters.undoStatus);
+    }
+
+    const whereSql = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const sortBySql =
+      sorting.sortBy === 'linkId'
+        ? 'link_id'
+        : sorting.sortBy === 'actionType'
+          ? 'action_type'
+          : sorting.sortBy === 'toolName'
+            ? 'tool_name'
+            : 'changed_at';
+    const sortDirSql = sorting.sortDir === 'asc' ? 'ASC' : 'DESC';
+
+    const rows = this.db
+      .prepare(
+        `
+        SELECT
+          id,
+          user_id,
+          operation_id,
+          operation_item_id,
+          tool_name,
+          action_type,
+          link_id,
+          link_title,
+          url_before,
+          url_after,
+          tracking_trimmed,
+          collection_from_id,
+          collection_from_name,
+          collection_to_id,
+          collection_to_name,
+          tags_added_json,
+          tags_removed_json,
+          changed_at,
+          undo_status,
+          undone_at,
+          undo_operation_id,
+          meta_json
+        FROM ai_change_log
+        ${whereSql}
+        ORDER BY ${sortBySql} ${sortDirSql}, id ${sortDirSql}
+        LIMIT ? OFFSET ?
+      `
+      )
+      .all(...params, paging.limit, paging.offset) as AiChangeLogRow[];
+
+    const totalRow = this.db
+      .prepare(
+        `
+        SELECT COUNT(1) AS count
+        FROM ai_change_log
+        ${whereSql}
+      `
+      )
+      .get(...params) as { count: number };
+
+    return {
+      items: rows.map((row) => this.mapAiChangeLogRow(row)),
+      total: totalRow.count
+    };
+  }
+
+  // This method returns dynamic AI log facets so the UI can populate deterministic filter options.
+  public listAiChangeLogFacets(userId: number, baseFilters: Pick<AiChangeLogFilters, 'dateFrom' | 'dateTo'>): AiChangeLogFacets {
+    const conditions: string[] = ['user_id = ?'];
+    const params: Array<string | number> = [userId];
+
+    if (baseFilters.dateFrom) {
+      conditions.push('changed_at >= ?');
+      params.push(baseFilters.dateFrom);
+    }
+    if (baseFilters.dateTo) {
+      conditions.push('changed_at <= ?');
+      params.push(baseFilters.dateTo);
+    }
+
+    const whereSql = `WHERE ${conditions.join(' AND ')}`;
+
+    const actionRows = this.db
+      .prepare(
+        `
+        SELECT DISTINCT action_type
+        FROM ai_change_log
+        ${whereSql}
+        ORDER BY action_type ASC
+      `
+      )
+      .all(...params) as Array<{ action_type: string }>;
+
+    const toolRows = this.db
+      .prepare(
+        `
+        SELECT DISTINCT tool_name
+        FROM ai_change_log
+        ${whereSql}
+        ORDER BY tool_name ASC
+      `
+      )
+      .all(...params) as Array<{ tool_name: string }>;
+
+    const collectionFromRows = this.db
+      .prepare(
+        `
+        SELECT collection_from_id, collection_from_name
+        FROM ai_change_log
+        ${whereSql}
+          AND collection_from_id IS NOT NULL
+        GROUP BY collection_from_id, collection_from_name
+        ORDER BY LOWER(COALESCE(collection_from_name, '')), collection_from_id
+      `
+      )
+      .all(...params) as Array<{ collection_from_id: number; collection_from_name: string | null }>;
+
+    const collectionToRows = this.db
+      .prepare(
+        `
+        SELECT collection_to_id, collection_to_name
+        FROM ai_change_log
+        ${whereSql}
+          AND collection_to_id IS NOT NULL
+        GROUP BY collection_to_id, collection_to_name
+        ORDER BY LOWER(COALESCE(collection_to_name, '')), collection_to_id
+      `
+      )
+      .all(...params) as Array<{ collection_to_id: number; collection_to_name: string | null }>;
+
+    const tagRows = this.db
+      .prepare(
+        `
+        SELECT tags_added_json, tags_removed_json
+        FROM ai_change_log
+        ${whereSql}
+      `
+      )
+      .all(...params) as Array<{ tags_added_json: string; tags_removed_json: string }>;
+
+    const bounds = this.db
+      .prepare(
+        `
+        SELECT MIN(changed_at) AS min_changed_at, MAX(changed_at) AS max_changed_at
+        FROM ai_change_log
+        ${whereSql}
+      `
+      )
+      .get(...params) as { min_changed_at: string | null; max_changed_at: string | null };
+
+    const tagSet = new Set<string>();
+    for (const row of tagRows) {
+      const added = parseJson<string[]>(row.tags_added_json, 'ai_change_log.tags_added_json');
+      const removed = parseJson<string[]>(row.tags_removed_json, 'ai_change_log.tags_removed_json');
+      for (const tagName of [...added, ...removed]) {
+        const normalized = String(tagName || '').trim();
+        if (normalized.length > 0) {
+          tagSet.add(normalized);
+        }
+      }
+    }
+
+    return {
+      actionTypes: actionRows.map((row) => row.action_type as AiChangeActionType),
+      toolNames: toolRows.map((row) => row.tool_name),
+      collectionFrom: collectionFromRows.map((row) => ({
+        id: row.collection_from_id,
+        name: row.collection_from_name ?? `Collection ${row.collection_from_id}`
+      })),
+      collectionTo: collectionToRows.map((row) => ({
+        id: row.collection_to_id,
+        name: row.collection_to_name ?? `Collection ${row.collection_to_id}`
+      })),
+      tags: [...tagSet].sort((left, right) => left.localeCompare(right, 'de')),
+      minChangedAt: bounds.min_changed_at,
+      maxChangedAt: bounds.max_changed_at
+    };
+  }
+
+  // This method returns selected AI change rows together with operation snapshots and conflict indicators.
+  public getAiChangeUndoCandidates(
+    userId: number,
+    changeIds: number[]
+  ): Array<{
+    change: AiChangeLogRecord;
+    before: Record<string, unknown>;
+    after: Record<string, unknown>;
+    undoUntil: string | null;
+    hasNewerOpenChange: boolean;
+  }> {
+    if (changeIds.length === 0) {
+      return [];
+    }
+
+    const placeholders = changeIds.map(() => '?').join(', ');
+    const rows = this.db
+      .prepare(
+        `
+        SELECT
+          l.id,
+          l.user_id,
+          l.operation_id,
+          l.operation_item_id,
+          l.tool_name,
+          l.action_type,
+          l.link_id,
+          l.link_title,
+          l.url_before,
+          l.url_after,
+          l.tracking_trimmed,
+          l.collection_from_id,
+          l.collection_from_name,
+          l.collection_to_id,
+          l.collection_to_name,
+          l.tags_added_json,
+          l.tags_removed_json,
+          l.changed_at,
+          l.undo_status,
+          l.undone_at,
+          l.undo_operation_id,
+          l.meta_json,
+          oi.before_json,
+          oi.after_json,
+          o.undo_until,
+          CASE
+            WHEN l.link_id IS NULL THEN 0
+            WHEN EXISTS (
+              SELECT 1
+              FROM ai_change_log newer
+              WHERE newer.user_id = l.user_id
+                AND newer.link_id = l.link_id
+                AND newer.id NOT IN (${placeholders})
+                AND newer.undo_status <> 'applied'
+                AND (
+                  newer.changed_at > l.changed_at
+                  OR (newer.changed_at = l.changed_at AND newer.id > l.id)
+                )
+            ) THEN 1
+            ELSE 0
+          END AS has_newer_open_change
+        FROM ai_change_log l
+        JOIN operation_items oi
+          ON oi.operation_id = l.operation_id
+         AND oi.item_id = l.operation_item_id
+        JOIN operation_log o
+          ON o.id = l.operation_id
+         AND o.user_id = l.user_id
+        WHERE l.user_id = ?
+          AND l.id IN (${placeholders})
+        ORDER BY l.changed_at DESC, l.id DESC
+      `
+      )
+      .all(...changeIds, userId, ...changeIds) as AiChangeUndoCandidateRow[];
+
+    return rows.map((row) => ({
+      change: this.mapAiChangeLogRow(row),
+      before: parseJson<Record<string, unknown>>(row.before_json, 'operation_items.before_json'),
+      after: parseJson<Record<string, unknown>>(row.after_json, 'operation_items.after_json'),
+      undoUntil: row.undo_until,
+      hasNewerOpenChange: row.has_newer_open_change === 1
+    }));
+  }
+
+  // This method marks selected AI change rows as successfully undone with one undo operation reference.
+  public markAiChangesUndone(userId: number, changeIds: number[], undoOperationId: string, atIso: string): void {
+    if (changeIds.length === 0) {
+      return;
+    }
+    const placeholders = changeIds.map(() => '?').join(', ');
+    this.db
+      .prepare(
+        `
+        UPDATE ai_change_log
+        SET
+          undo_status = 'applied',
+          undone_at = ?,
+          undo_operation_id = ?
+        WHERE user_id = ?
+          AND id IN (${placeholders})
+      `
+      )
+      .run(atIso, undoOperationId, userId, ...changeIds);
+  }
+
+  // This method updates selected AI change rows with one explicit undo status for conflict/failed tracking.
+  public setAiChangeUndoStatus(
+    userId: number,
+    changeIds: number[],
+    status: AiChangeUndoStatus,
+    options?: {
+      atIso?: string;
+      undoOperationId?: string | null;
+    }
+  ): void {
+    if (changeIds.length === 0) {
+      return;
+    }
+    const placeholders = changeIds.map(() => '?').join(', ');
+    this.db
+      .prepare(
+        `
+        UPDATE ai_change_log
+        SET
+          undo_status = ?,
+          undone_at = ?,
+          undo_operation_id = ?
+        WHERE user_id = ?
+          AND id IN (${placeholders})
+      `
+      )
+      .run(status, options?.atIso ?? null, options?.undoOperationId ?? null, userId, ...changeIds);
+  }
+
+  // This method updates undo status for AI change rows scoped to one operation and selected operation-item ids.
+  public setAiChangeUndoStatusByOperationItems(
+    userId: number,
+    operationId: string,
+    operationItemIds: number[],
+    status: AiChangeUndoStatus,
+    options?: {
+      atIso?: string;
+      undoOperationId?: string | null;
+    }
+  ): void {
+    if (operationItemIds.length === 0) {
+      return;
+    }
+    const placeholders = operationItemIds.map(() => '?').join(', ');
+    this.db
+      .prepare(
+        `
+        UPDATE ai_change_log
+        SET
+          undo_status = ?,
+          undone_at = ?,
+          undo_operation_id = ?
+        WHERE user_id = ?
+          AND operation_id = ?
+          AND operation_item_id IN (${placeholders})
+      `
+      )
+      .run(status, options?.atIso ?? null, options?.undoOperationId ?? null, userId, operationId, ...operationItemIds);
+  }
+
+  // This method removes expired AI change-log rows for one user according to selected retention days.
+  public pruneAiChangeLog(userId: number, retentionDays: 30 | 90 | 180 | 365): number {
+    const safeRetentionDays = this.normalizeAiActivityRetentionDays(retentionDays);
+    const cutoffIso = new Date(Date.now() - safeRetentionDays * 24 * 60 * 60 * 1000).toISOString();
+    const result = this.db
+      .prepare(
+        `
+        DELETE FROM ai_change_log
+        WHERE user_id = ?
+          AND changed_at < ?
+      `
+      )
+      .run(userId, cutoffIso);
+    return result.changes;
   }
 
   // This method returns audit log rows with deterministic paging for MCP audit tools.

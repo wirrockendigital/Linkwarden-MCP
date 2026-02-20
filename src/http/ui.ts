@@ -5,8 +5,9 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { ConfigStore } from '../config/config-store.js';
 import { SqliteStore } from '../db/database.js';
+import { executeTool, undoChangesByIds } from '../mcp/tools.js';
 import { getNewLinksRoutineStatus } from '../services/new-links-routine.js';
-import type { AuthenticatedPrincipal, SessionPrincipal, UserRole } from '../types/domain.js';
+import type { AiChangeActionType, AuthenticatedPrincipal, SessionPrincipal, UserRole } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
 import { sanitizeForLog } from '../utils/logger.js';
 import {
@@ -31,6 +32,20 @@ interface LoginAttemptState {
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_BLOCK_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 5;
+const ALLOWED_AI_CHANGE_ACTION_TYPES: AiChangeActionType[] = [
+  'create_link',
+  'update_link',
+  'delete_link',
+  'move_collection',
+  'tag_add',
+  'tag_remove',
+  'normalize_url',
+  'archive',
+  'unarchive',
+  'merge'
+];
+const AI_LOG_PRUNE_THROTTLE_MS = 5 * 60 * 1000;
+const aiLogPruneLastRunByUser = new Map<number, number>();
 
 const loginSchema = z.object({
   username: z.string().min(1).max(80),
@@ -148,11 +163,94 @@ const setChatControlSchema = z
       )
       .optional(),
     chatCaptureTagAiChatEnabled: z.boolean().optional(),
-    chatCaptureTagAiNameEnabled: z.boolean().optional()
+    chatCaptureTagAiNameEnabled: z.boolean().optional(),
+    aiActivityRetentionDays: z.union([z.literal(30), z.literal(90), z.literal(180), z.literal(365)]).optional()
   })
   .refine((payload) => Object.keys(payload).length > 0, {
     message: 'At least one chat-control field must be updated.'
   });
+
+// This helper normalizes query-string fields into deterministic string arrays.
+const stringArrayQuerySchema = z.preprocess((value) => {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    return value
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+  }
+  return [];
+}, z.array(z.string().trim().min(1).max(120)).max(100));
+
+// This helper parses query booleans from native or string-encoded values.
+const queryBooleanSchema = z.preprocess((value) => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true' || normalized === '1' || normalized === 'yes') {
+      return true;
+    }
+    if (normalized === 'false' || normalized === '0' || normalized === 'no') {
+      return false;
+    }
+  }
+  return undefined;
+}, z.boolean().optional());
+
+const listAiLogQuerySchema = z.object({
+  q: z.string().trim().max(300).optional(),
+  dateFrom: z.string().datetime().optional(),
+  dateTo: z.string().datetime().optional(),
+  actionType: stringArrayQuerySchema.optional(),
+  toolName: stringArrayQuerySchema.optional(),
+  linkId: z.coerce.number().int().positive().optional(),
+  collectionFromId: z.coerce.number().int().positive().optional(),
+  collectionToId: z.coerce.number().int().positive().optional(),
+  tagName: z.string().trim().max(120).optional(),
+  trackingTrimmed: queryBooleanSchema,
+  undoStatus: z.enum(['pending', 'applied', 'conflict', 'failed']).optional(),
+  page: z.coerce.number().int().min(1).max(500000).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(25),
+  sortBy: z.enum(['changedAt', 'linkId', 'actionType', 'toolName']).default('changedAt'),
+  sortDir: z.enum(['asc', 'desc']).default('desc')
+});
+
+const aiLogFacetQuerySchema = z.object({
+  dateFrom: z.string().datetime().optional(),
+  dateTo: z.string().datetime().optional()
+});
+
+const aiLogUndoSchema = z
+  .object({
+    mode: z.enum(['changes', 'operations']),
+    changeIds: z.array(z.number().int().positive()).max(200).optional(),
+    operationIds: z.array(z.string().trim().min(8).max(100)).max(200).optional()
+  })
+  .superRefine((payload, ctx) => {
+    // This validation enforces explicit target identifiers for both undo modes.
+    if (payload.mode === 'changes' && (!payload.changeIds || payload.changeIds.length === 0)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['changeIds'],
+        message: 'changeIds are required when mode=changes.'
+      });
+    }
+    if (payload.mode === 'operations' && (!payload.operationIds || payload.operationIds.length === 0)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['operationIds'],
+        message: 'operationIds are required when mode=operations.'
+      });
+    }
+  });
+
+const aiLogSettingsSchema = z.object({
+  retentionDays: z.union([z.literal(30), z.literal(90), z.literal(180), z.literal(365)])
+});
 
 const createApiKeySchema = z.object({
   userId: z.number().int().positive(),
@@ -691,6 +789,59 @@ function renderThemeStyles(): string {
     font-size: 0.88rem;
   }
 
+  .inline-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.7rem;
+  }
+
+  .inline-actions button {
+    width: auto;
+    min-width: 11rem;
+    margin-top: 0;
+  }
+
+  .ai-log-table-wrap {
+    margin-top: 0.85rem;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--pre-bg);
+  }
+
+  .ai-log-table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 1100px;
+  }
+
+  .ai-log-table th,
+  .ai-log-table td {
+    border-bottom: 1px solid var(--border);
+    padding: 0.5rem 0.55rem;
+    text-align: left;
+    vertical-align: top;
+    color: var(--text);
+    font-size: 0.86rem;
+  }
+
+  .ai-log-table thead th {
+    position: sticky;
+    top: 0;
+    background: var(--surface);
+    z-index: 2;
+  }
+
+  .ai-log-table tbody tr:last-child td {
+    border-bottom: none;
+  }
+
+  .mono {
+    font-family: "JetBrains Mono", "Fira Mono", "SFMono-Regular", Consolas, monospace;
+    word-break: break-word;
+  }
+
   .field-error {
     margin: 0.28rem 0 0;
     color: #b42318;
@@ -1170,6 +1321,118 @@ export function renderDashboardPage(principal: SessionPrincipal, csrfToken: stri
     </details>
   </div>
 
+  <div class="card tab-panel-card" data-top-tab="uebersicht" data-sub-tab="ai-log">
+    <h2>AI-Log</h2>
+    <button onclick="refreshAiLog()">AI-Log laden</button>
+    <pre id="aiLogResult">Noch nicht geladen</pre>
+    <div class="form-block" data-form-section="ai-log-filters" data-form-section-label="AI-Log Filter">
+      <h3>Filter</h3>
+      <p class="help-text">Filtere nach Link, Collection, Tags, Zeitraum und Änderungsstatus.</p>
+      <label for="aiLogQuery">Suche (Titel/URL/Collection/Tag)</label>
+      <input id="aiLogQuery" placeholder="z. B. serverfault.com oder AI Chat" />
+      <label for="aiLogDateFrom">Von (Datum/Zeit)</label>
+      <input id="aiLogDateFrom" type="datetime-local" />
+      <label for="aiLogDateTo">Bis (Datum/Zeit)</label>
+      <input id="aiLogDateTo" type="datetime-local" />
+      <label for="aiLogActionTypes">Aktionstypen (Mehrfachauswahl)</label>
+      <select id="aiLogActionTypes" multiple size="6"></select>
+      <label for="aiLogToolNames">Tools (Mehrfachauswahl)</label>
+      <select id="aiLogToolNames" multiple size="6"></select>
+      <label for="aiLogCollectionFrom">Collection von</label>
+      <select id="aiLogCollectionFrom"></select>
+      <label for="aiLogCollectionTo">Collection nach</label>
+      <select id="aiLogCollectionTo"></select>
+      <label for="aiLogLinkId">Link-ID</label>
+      <input id="aiLogLinkId" type="number" min="1" />
+      <label for="aiLogTagName">Tag enthält</label>
+      <input id="aiLogTagName" placeholder="z. B. ChatGPT" />
+      <label for="aiLogTrackingTrimmed">Tracking gekürzt</label>
+      <select id="aiLogTrackingTrimmed">
+        <option value="">alle</option>
+        <option value="true">ja</option>
+        <option value="false">nein</option>
+      </select>
+      <label for="aiLogUndoStatus">Undo-Status</label>
+      <select id="aiLogUndoStatus">
+        <option value="">alle</option>
+        <option value="pending">pending</option>
+        <option value="applied">applied</option>
+        <option value="conflict">conflict</option>
+        <option value="failed">failed</option>
+      </select>
+      <label for="aiLogSortBy">Sortierung</label>
+      <select id="aiLogSortBy">
+        <option value="changedAt">Datum</option>
+        <option value="actionType">Aktion</option>
+        <option value="toolName">Tool</option>
+        <option value="linkId">Link-ID</option>
+      </select>
+      <label for="aiLogSortDir">Richtung</label>
+      <select id="aiLogSortDir">
+        <option value="desc">absteigend</option>
+        <option value="asc">aufsteigend</option>
+      </select>
+      <label for="aiLogPageSize">Einträge pro Seite</label>
+      <select id="aiLogPageSize">
+        <option value="10">10</option>
+        <option value="25" selected>25</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+      </select>
+      <div class="inline-actions">
+        <button onclick="applyAiLogFilters()">Filter anwenden</button>
+        <button onclick="resetAiLogFilters()">Filter zurücksetzen</button>
+        <button onclick="loadAiLogFacets()">Filterlisten aktualisieren</button>
+      </div>
+    </div>
+    <div class="form-block" data-form-section="ai-log-actions" data-form-section-label="AI-Log Aktionen">
+      <h3>Aktionen</h3>
+      <p class="help-text">Markiere Einträge und führe selektives oder operation-basiertes Undo aus.</p>
+      <div class="inline-actions">
+        <button onclick="undoSelectedAiLogChanges()">Ausgewählte Änderungen rückgängig</button>
+        <button onclick="undoSelectedAiLogOperations()">Ausgewählte Operationen rückgängig</button>
+      </div>
+      <p class="status-inline" id="aiLogSelectionSummary">Keine Einträge ausgewählt.</p>
+      <p class="status-inline" id="aiLogPagingInfo">Seite 1</p>
+      <div class="inline-actions">
+        <button onclick="prevAiLogPage()">Vorherige Seite</button>
+        <button onclick="nextAiLogPage()">Nächste Seite</button>
+      </div>
+    </div>
+    <div class="form-block" data-form-section="ai-log-retention" data-form-section-label="AI-Log Aufbewahrung">
+      <h3>Aufbewahrung</h3>
+      <p class="help-text">Lege fest, wie lange AI-Log-Einträge pro User aufbewahrt werden.</p>
+      <label for="selfAiActivityRetentionDays">Retention (Tage)</label>
+      <select id="selfAiActivityRetentionDays">
+        <option value="30">30</option>
+        <option value="90">90</option>
+        <option value="180" selected>180</option>
+        <option value="365">365</option>
+      </select>
+      <button onclick="setOwnAiLogSettings()">Retention speichern</button>
+    </div>
+    <div class="ai-log-table-wrap">
+      <table class="ai-log-table" id="aiLogTable" aria-label="AI Aktivitätslog">
+        <thead>
+          <tr>
+            <th><input id="aiLogSelectAll" type="checkbox" onchange="toggleAiLogSelectAll()" aria-label="Alle auswählen" /></th>
+            <th>Datum</th>
+            <th>Aktion</th>
+            <th>Link</th>
+            <th>Collection von -> nach</th>
+            <th>Tags + / -</th>
+            <th>URL vorher -> nachher</th>
+            <th>Tool</th>
+            <th>Undo</th>
+          </tr>
+        </thead>
+        <tbody id="aiLogTableBody">
+          <tr><td colspan="9">Noch keine Daten geladen.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
   <div class="card tab-panel-card" data-top-tab="mein-konto" data-sub-tab="profil">
     <h2>Mein Profil</h2>
     <button onclick="loadMe()">Profil neu laden</button>
@@ -1319,6 +1582,10 @@ let activeTopTab = 'uebersicht';
 let activeSubTab = 'status';
 const topNavFocusMode = 'tab-button';
 const subNavFocusMode = 'tab-button';
+let aiLogPage = 1;
+let aiLogTotal = 0;
+let aiLogPageSize = 25;
+let aiLogEntries = [];
 
 /** @type {TabDefinition[]} */
 const topTabDefinitions = [
@@ -1333,7 +1600,10 @@ const topTabDefinitions = [
 // This registry documents allowed subtab keys for each top-level tab key.
 /** @type {Record<TabKey, Array<{ key: SubTabKey, label: string, adminOnly: boolean }>>} */
 const subTabDefinitions = {
-  'uebersicht': [{ key: 'status', label: 'Status', adminOnly: false }],
+  'uebersicht': [
+    { key: 'status', label: 'Status', adminOnly: false },
+    { key: 'ai-log', label: 'AI-Log', adminOnly: false }
+  ],
   'mein-konto': [
     { key: 'profil', label: 'Profil', adminOnly: false },
     { key: 'api-keys', label: 'MCP API Keys', adminOnly: false }
@@ -1362,6 +1632,11 @@ const panelLoaders = {
     await loadMe();
     await loadOwnNewLinksRoutine();
   },
+  'uebersicht:ai-log': async () => {
+    await loadAiLogFacets();
+    await loadOwnAiLogSettings();
+    await loadAiLog();
+  },
   'mein-konto:profil': async () => { await loadMe(); },
   'mein-konto:api-keys': async () => { await loadOwnKeys(); },
   'automationen:routine': async () => { await loadOwnNewLinksRoutine(); },
@@ -1389,7 +1664,7 @@ const mutationInvalidationMap = {
   setOwnWriteMode: ['mein-konto:profil', 'uebersicht:status'],
   setOwnTaggingPreferences: ['governance:mein-tagging', 'uebersicht:status'],
   setOwnNewLinksRoutine: ['automationen:routine', 'uebersicht:status'],
-  setOwnChatControl: ['automationen:chat-control'],
+  setOwnChatControl: ['automationen:chat-control', 'uebersicht:ai-log'],
   setOwnLinkwardenToken: ['integrationen:linkwarden-token', 'uebersicht:status'],
   issueOwnKey: ['mein-konto:api-keys'],
   revokeOwnKey: ['mein-konto:api-keys'],
@@ -1398,7 +1673,10 @@ const mutationInvalidationMap = {
   setUserLinkwardenToken: ['integrationen:user-linkwarden-token', 'administration:benutzer'],
   setTaggingPolicy: ['governance:*'],
   setUserTaggingPreferences: ['governance:*'],
-  updateLinkwardenConfig: ['integrationen:linkwarden-ziel']
+  updateLinkwardenConfig: ['integrationen:linkwarden-ziel'],
+  undoAiLogChanges: ['uebersicht:ai-log', 'uebersicht:status'],
+  undoAiLogOperations: ['uebersicht:ai-log', 'uebersicht:status'],
+  setOwnAiLogSettings: ['uebersicht:ai-log']
 };
 
 // This helper creates a deterministic key for tab/subtab addressed panel state.
@@ -2356,6 +2634,445 @@ function applyRoutineSettingsToForm(settings) {
   document.getElementById('selfRoutineModuleDedupe').checked = modules.has('dedupe');
 }
 
+// This helper escapes dynamic text content before composing HTML strings for table cells.
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// This helper formats one ISO timestamp into localized dashboard date/time output.
+function formatAiLogTimestamp(iso) {
+  if (!iso) {
+    return '-';
+  }
+  const parsed = new Date(String(iso));
+  if (Number.isNaN(parsed.getTime())) {
+    return String(iso);
+  }
+  return parsed.toLocaleString('de-DE');
+}
+
+// This helper parses optional datetime-local input values into ISO timestamps for backend filtering.
+function readOptionalDateTimeIso(inputId) {
+  const raw = document.getElementById(inputId)?.value?.trim() || '';
+  if (raw.length === 0) {
+    return null;
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  return parsed.toISOString();
+}
+
+// This helper parses optional positive integer inputs and returns null for empty values.
+function readOptionalPositiveInt(inputId) {
+  const raw = document.getElementById(inputId)?.value?.trim() || '';
+  if (raw.length === 0) {
+    return null;
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
+// This helper reads selected values from a multiple-select control in deterministic order.
+function getSelectedValues(selectId) {
+  const select = document.getElementById(selectId);
+  if (!select) {
+    return [];
+  }
+  return Array.from(select.selectedOptions || [])
+    .map((option) => option.value)
+    .filter((value) => String(value).trim().length > 0);
+}
+
+// This helper keeps selection state stable when select options are refreshed from facet payloads.
+function replaceSelectOptions(selectId, options, includeAllOption = false) {
+  const select = document.getElementById(selectId);
+  if (!select) {
+    return;
+  }
+  const previous = new Set(Array.from(select.selectedOptions || []).map((option) => option.value));
+  select.innerHTML = '';
+  if (includeAllOption) {
+    const allOption = document.createElement('option');
+    allOption.value = '';
+    allOption.textContent = 'alle';
+    select.appendChild(allOption);
+  }
+  options.forEach((option) => {
+    const element = document.createElement('option');
+    element.value = String(option.value);
+    element.textContent = String(option.label);
+    if (previous.has(element.value)) {
+      element.selected = true;
+    }
+    select.appendChild(element);
+  });
+}
+
+// This helper builds deterministic query parameters from current AI-log filter controls.
+function buildAiLogQueryParams() {
+  const params = new URLSearchParams();
+  const query = document.getElementById('aiLogQuery')?.value?.trim() || '';
+  const dateFrom = readOptionalDateTimeIso('aiLogDateFrom');
+  const dateTo = readOptionalDateTimeIso('aiLogDateTo');
+  const actionTypes = getSelectedValues('aiLogActionTypes');
+  const toolNames = getSelectedValues('aiLogToolNames');
+  const collectionFromId = document.getElementById('aiLogCollectionFrom')?.value || '';
+  const collectionToId = document.getElementById('aiLogCollectionTo')?.value || '';
+  const linkId = readOptionalPositiveInt('aiLogLinkId');
+  const tagName = document.getElementById('aiLogTagName')?.value?.trim() || '';
+  const trackingTrimmed = document.getElementById('aiLogTrackingTrimmed')?.value || '';
+  const undoStatus = document.getElementById('aiLogUndoStatus')?.value || '';
+  const sortBy = document.getElementById('aiLogSortBy')?.value || 'changedAt';
+  const sortDir = document.getElementById('aiLogSortDir')?.value || 'desc';
+  aiLogPageSize = Number(document.getElementById('aiLogPageSize')?.value || '25');
+
+  if (query.length > 0) {
+    params.set('q', query);
+  }
+  if (dateFrom) {
+    params.set('dateFrom', dateFrom);
+  }
+  if (dateTo) {
+    params.set('dateTo', dateTo);
+  }
+  actionTypes.forEach((actionType) => params.append('actionType', actionType));
+  toolNames.forEach((toolName) => params.append('toolName', toolName));
+  if (collectionFromId) {
+    params.set('collectionFromId', collectionFromId);
+  }
+  if (collectionToId) {
+    params.set('collectionToId', collectionToId);
+  }
+  if (linkId) {
+    params.set('linkId', String(linkId));
+  }
+  if (tagName.length > 0) {
+    params.set('tagName', tagName);
+  }
+  if (trackingTrimmed === 'true' || trackingTrimmed === 'false') {
+    params.set('trackingTrimmed', trackingTrimmed);
+  }
+  if (undoStatus.length > 0) {
+    params.set('undoStatus', undoStatus);
+  }
+  params.set('sortBy', sortBy);
+  params.set('sortDir', sortDir);
+  params.set('page', String(aiLogPage));
+  params.set('pageSize', String(aiLogPageSize));
+  return params;
+}
+
+// This helper updates paging labels and selection summary for the AI-log table.
+function updateAiLogSelectionSummary() {
+  const selectedRows = Array.from(document.querySelectorAll('#aiLogTableBody input[data-ai-log-select]:checked'));
+  const selectedCount = selectedRows.length;
+  const operationIds = new Set(
+    selectedRows
+      .map((row) => row.getAttribute('data-operation-id') || '')
+      .filter((value) => value.length > 0)
+  );
+  const summaryElement = document.getElementById('aiLogSelectionSummary');
+  if (summaryElement) {
+    summaryElement.textContent = selectedCount > 0
+      ? String(selectedCount) + ' Einträge ausgewählt (' + String(operationIds.size) + ' Operationen).'
+      : 'Keine Einträge ausgewählt.';
+  }
+}
+
+// This helper renders one paged AI-log table body from API response rows.
+function renderAiLogRows(rows) {
+  const body = document.getElementById('aiLogTableBody');
+  if (!body) {
+    return;
+  }
+  if (!Array.isArray(rows) || rows.length === 0) {
+    body.innerHTML = '<tr><td colspan="9">Keine passenden Einträge gefunden.</td></tr>';
+    updateAiLogSelectionSummary();
+    return;
+  }
+
+  body.innerHTML = rows
+    .map((row) => {
+      const tagsAdded = Array.isArray(row.tagsAdded) ? row.tagsAdded.join(', ') : '';
+      const tagsRemoved = Array.isArray(row.tagsRemoved) ? row.tagsRemoved.join(', ') : '';
+      const collectionFrom = row.collectionFromName || (row.collectionFromId ? '#' + String(row.collectionFromId) : '-');
+      const collectionTo = row.collectionToName || (row.collectionToId ? '#' + String(row.collectionToId) : '-');
+      const urlBefore = row.urlBefore || '-';
+      const urlAfter = row.urlAfter || '-';
+      const trackingNote = row.trackingTrimmed ? ' (tracking gekürzt)' : '';
+      return (
+        '<tr>' +
+        '<td>' +
+        '<input ' +
+        'type="checkbox" ' +
+        'data-ai-log-select="1" ' +
+        'data-change-id="' + escapeHtml(row.id) + '" ' +
+        'data-operation-id="' + escapeHtml(row.operationId || '') + '" ' +
+        'onchange="updateAiLogSelectionSummary()" ' +
+        'aria-label="Eintrag ' + escapeHtml(row.id) + ' auswählen" ' +
+        '/>' +
+        '</td>' +
+        '<td>' + escapeHtml(formatAiLogTimestamp(row.changedAt)) + '</td>' +
+        '<td class="mono">' + escapeHtml(row.actionType) + '</td>' +
+        '<td>' +
+        '<div>' + escapeHtml(row.linkTitle || '-') + '</div>' +
+        '<div class="mono">#' + escapeHtml(row.linkId || '-') + '</div>' +
+        '</td>' +
+        '<td>' + escapeHtml(collectionFrom) + ' -> ' + escapeHtml(collectionTo) + '</td>' +
+        '<td><strong>+</strong> ' + escapeHtml(tagsAdded || '-') + '<br /><strong>-</strong> ' + escapeHtml(tagsRemoved || '-') + '</td>' +
+        '<td class="mono">' + escapeHtml(urlBefore) + '<br />-> ' + escapeHtml(urlAfter) + escapeHtml(trackingNote) + '</td>' +
+        '<td class="mono">' + escapeHtml(row.toolName || '-') + '</td>' +
+        '<td class="mono">' + escapeHtml(row.undoStatus || '-') + '</td>' +
+        '</tr>'
+      );
+    })
+    .join('');
+  updateAiLogSelectionSummary();
+}
+
+// This helper loads AI-log facets so filter lists stay aligned with available records.
+async function loadAiLogFacets() {
+  const params = new URLSearchParams();
+  const dateFrom = readOptionalDateTimeIso('aiLogDateFrom');
+  const dateTo = readOptionalDateTimeIso('aiLogDateTo');
+  if (dateFrom) {
+    params.set('dateFrom', dateFrom);
+  }
+  if (dateTo) {
+    params.set('dateTo', dateTo);
+  }
+
+  const query = params.toString();
+  const path = query.length > 0 ? '/admin/ui/user/ai-log/facets?' + query : '/admin/ui/user/ai-log/facets';
+  const { res, json } = await requestJson(path);
+  if (!res.ok) {
+    showToast('error', json?.error?.message || 'AI-Log Filterlisten konnten nicht geladen werden.');
+    openDebugDrawer(json, { autoOpenOnError: true });
+    return;
+  }
+
+  const facets = json?.facets || {};
+  replaceSelectOptions(
+    'aiLogActionTypes',
+    (Array.isArray(facets.actionTypes) ? facets.actionTypes : []).map((entry) => ({ value: entry, label: entry })),
+    false
+  );
+  replaceSelectOptions(
+    'aiLogToolNames',
+    (Array.isArray(facets.toolNames) ? facets.toolNames : []).map((entry) => ({ value: entry, label: entry })),
+    false
+  );
+  replaceSelectOptions(
+    'aiLogCollectionFrom',
+    (Array.isArray(facets.collectionFrom) ? facets.collectionFrom : []).map((entry) => ({
+      value: String(entry.id),
+      label: String(entry.name) + ' (#' + String(entry.id) + ')'
+    })),
+    true
+  );
+  replaceSelectOptions(
+    'aiLogCollectionTo',
+    (Array.isArray(facets.collectionTo) ? facets.collectionTo : []).map((entry) => ({
+      value: String(entry.id),
+      label: String(entry.name) + ' (#' + String(entry.id) + ')'
+    })),
+    true
+  );
+}
+
+// This helper loads per-user AI-log retention settings into dashboard controls.
+async function loadOwnAiLogSettings() {
+  const { res, json } = await requestJson('/admin/ui/user/ai-log/settings');
+  if (!res.ok) {
+    showToast('error', json?.error?.message || 'AI-Log Einstellungen konnten nicht geladen werden.');
+    openDebugDrawer(json, { autoOpenOnError: true });
+    return;
+  }
+  const retentionDays = Number(json?.settings?.retentionDays ?? 180);
+  document.getElementById('selfAiActivityRetentionDays').value = String(retentionDays);
+}
+
+// This helper persists per-user AI-log retention settings.
+async function setOwnAiLogSettings() {
+  await api('/admin/ui/user/ai-log/settings', {
+    method: 'POST',
+    body: JSON.stringify({
+      retentionDays: Number(document.getElementById('selfAiActivityRetentionDays').value)
+    }),
+    mutationAction: 'setOwnAiLogSettings',
+    mutationSections: ['ai-log-retention'],
+    successMessage: 'AI-Log Retention gespeichert.'
+  });
+  await loadAiLog();
+}
+
+// This helper loads one AI-log page using current filters and updates table + paging state.
+async function loadAiLog() {
+  const params = buildAiLogQueryParams();
+  const path = '/admin/ui/user/ai-log?' + params.toString();
+  const { res, json } = await requestJson(path);
+  document.getElementById('aiLogResult').textContent = JSON.stringify(json, null, 2);
+  openDebugDrawer(json, { autoOpenOnError: !res.ok });
+  if (!res.ok) {
+    const message = json?.error?.message || 'AI-Log konnte nicht geladen werden.';
+    showToast('error', message);
+    setOverviewStatus('Fehler: ' + message);
+    renderAiLogRows([]);
+    return;
+  }
+
+  aiLogEntries = Array.isArray(json?.items) ? json.items : [];
+  aiLogTotal = Number(json?.paging?.total ?? aiLogEntries.length);
+  renderAiLogRows(aiLogEntries);
+  const totalPages = Math.max(1, Math.ceil(aiLogTotal / Math.max(1, aiLogPageSize)));
+  const pagingInfo = document.getElementById('aiLogPagingInfo');
+  if (pagingInfo) {
+    pagingInfo.textContent = 'Seite ' + String(aiLogPage) + ' / ' + String(totalPages) + ' (' + String(aiLogTotal) + ' Einträge)';
+  }
+  const selectAll = document.getElementById('aiLogSelectAll');
+  if (selectAll) {
+    selectAll.checked = false;
+  }
+}
+
+// This helper refreshes AI-log data while keeping current page and filter state.
+async function refreshAiLog() {
+  await loadAiLog();
+}
+
+// This helper applies current AI-log filters from the first page.
+async function applyAiLogFilters() {
+  aiLogPage = 1;
+  await loadAiLogFacets();
+  await loadAiLog();
+}
+
+// This helper resets AI-log filters to defaults and reloads facets plus first page.
+async function resetAiLogFilters() {
+  document.getElementById('aiLogQuery').value = '';
+  document.getElementById('aiLogDateFrom').value = '';
+  document.getElementById('aiLogDateTo').value = '';
+  document.getElementById('aiLogLinkId').value = '';
+  document.getElementById('aiLogTagName').value = '';
+  document.getElementById('aiLogTrackingTrimmed').value = '';
+  document.getElementById('aiLogUndoStatus').value = '';
+  document.getElementById('aiLogSortBy').value = 'changedAt';
+  document.getElementById('aiLogSortDir').value = 'desc';
+  document.getElementById('aiLogPageSize').value = '25';
+  Array.from(document.getElementById('aiLogActionTypes').options).forEach((option) => {
+    option.selected = false;
+  });
+  Array.from(document.getElementById('aiLogToolNames').options).forEach((option) => {
+    option.selected = false;
+  });
+  document.getElementById('aiLogCollectionFrom').value = '';
+  document.getElementById('aiLogCollectionTo').value = '';
+  aiLogPage = 1;
+  await loadAiLogFacets();
+  await loadAiLog();
+}
+
+// This helper toggles all visible AI-log row selections from one header checkbox.
+function toggleAiLogSelectAll() {
+  const selectAll = document.getElementById('aiLogSelectAll');
+  const checked = Boolean(selectAll?.checked);
+  document.querySelectorAll('#aiLogTableBody input[data-ai-log-select]').forEach((checkbox) => {
+    checkbox.checked = checked;
+  });
+  updateAiLogSelectionSummary();
+}
+
+// This helper returns currently selected AI-log table rows with normalized change/operation ids.
+function getSelectedAiLogRows() {
+  return Array.from(document.querySelectorAll('#aiLogTableBody input[data-ai-log-select]:checked')).map((checkbox) => ({
+    changeId: Number(checkbox.getAttribute('data-change-id')),
+    operationId: checkbox.getAttribute('data-operation-id') || ''
+  }));
+}
+
+// This helper submits undo requests for selected AI-log change rows.
+async function undoSelectedAiLogChanges() {
+  const selectedRows = getSelectedAiLogRows();
+  const changeIds = [...new Set(selectedRows.map((row) => row.changeId).filter((id) => Number.isInteger(id) && id > 0))];
+  if (changeIds.length === 0) {
+    showToast('info', 'Bitte mindestens einen AI-Log Eintrag auswählen.', { durationMs: 2200 });
+    return;
+  }
+  const proceed = window.confirm('Soll(en) ' + String(changeIds.length) + ' Änderung(en) rückgängig gemacht werden?');
+  if (!proceed) {
+    return;
+  }
+
+  await api('/admin/ui/user/ai-log/undo', {
+    method: 'POST',
+    body: JSON.stringify({
+      mode: 'changes',
+      changeIds
+    }),
+    mutationAction: 'undoAiLogChanges',
+    mutationSections: ['ai-log-actions'],
+    successMessage: 'Ausgewählte Änderungen wurden rückgängig gemacht.'
+  });
+  await loadAiLog();
+}
+
+// This helper submits undo requests for unique operation ids from selected AI-log rows.
+async function undoSelectedAiLogOperations() {
+  const selectedRows = getSelectedAiLogRows();
+  const operationIds = [...new Set(selectedRows.map((row) => row.operationId).filter((id) => id.length > 0))];
+  if (operationIds.length === 0) {
+    showToast('info', 'Bitte mindestens einen Eintrag mit Operation auswählen.', { durationMs: 2200 });
+    return;
+  }
+  const proceed = window.confirm('Soll(en) ' + String(operationIds.length) + ' Operation(en) rückgängig gemacht werden?');
+  if (!proceed) {
+    return;
+  }
+
+  await api('/admin/ui/user/ai-log/undo', {
+    method: 'POST',
+    body: JSON.stringify({
+      mode: 'operations',
+      operationIds
+    }),
+    mutationAction: 'undoAiLogOperations',
+    mutationSections: ['ai-log-actions'],
+    successMessage: 'Ausgewählte Operationen wurden rückgängig gemacht.'
+  });
+  await loadAiLog();
+}
+
+// This helper moves to the previous AI-log page when available.
+async function prevAiLogPage() {
+  if (aiLogPage <= 1) {
+    showToast('info', 'Bereits auf der ersten Seite.', { durationMs: 1800 });
+    return;
+  }
+  aiLogPage -= 1;
+  await loadAiLog();
+}
+
+// This helper moves to the next AI-log page when available.
+async function nextAiLogPage() {
+  const totalPages = Math.max(1, Math.ceil(aiLogTotal / Math.max(1, aiLogPageSize)));
+  if (aiLogPage >= totalPages) {
+    showToast('info', 'Keine weitere Seite vorhanden.', { durationMs: 1800 });
+    return;
+  }
+  aiLogPage += 1;
+  await loadAiLog();
+}
+
 async function api(url, options = {}) {
   clearFieldErrors();
   const mutationAction = options.mutationAction || '';
@@ -2485,6 +3202,10 @@ async function loadOwnChatControl() {
       json?.chatControl?.chatCaptureTagAiChatEnabled !== false;
     document.getElementById('selfChatCaptureTagAiNameEnabled').checked =
       json?.chatControl?.chatCaptureTagAiNameEnabled !== false;
+    const retentionInput = document.getElementById('selfAiActivityRetentionDays');
+    if (retentionInput) {
+      retentionInput.value = String(json?.chatControl?.aiActivityRetentionDays ?? 180);
+    }
   }
 }
 
@@ -2784,6 +3505,18 @@ function toInternalPrincipal(principal: SessionPrincipal): AuthenticatedPrincipa
     toolScopes: ['*'],
     collectionScopes: []
   };
+}
+
+// This helper throttles per-user AI-log pruning on read paths to avoid repeated expensive cleanup queries.
+function pruneAiLogIfDue(db: SqliteStore, userId: number, retentionDays: 30 | 90 | 180 | 365): number {
+  const now = Date.now();
+  const lastRunAt = aiLogPruneLastRunByUser.get(userId) ?? 0;
+  if (now - lastRunAt < AI_LOG_PRUNE_THROTTLE_MS) {
+    return 0;
+  }
+
+  aiLogPruneLastRunByUser.set(userId, now);
+  return db.pruneAiChangeLog(userId, retentionDays);
 }
 
 // This helper returns view data for one authenticated user including per-user settings.
@@ -3657,7 +4390,8 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       archiveCollectionParentId: chatControl.archiveCollectionParentId,
       chatCaptureTagName: chatControl.chatCaptureTagName,
       chatCaptureTagAiChatEnabled: chatControl.chatCaptureTagAiChatEnabled,
-      chatCaptureTagAiNameEnabled: chatControl.chatCaptureTagAiNameEnabled
+      chatCaptureTagAiNameEnabled: chatControl.chatCaptureTagAiNameEnabled,
+      aiActivityRetentionDays: chatControl.aiActivityRetentionDays
     });
 
     reply.send({
@@ -3683,7 +4417,8 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       archiveCollectionParentId: parsed.data.archiveCollectionParentId,
       chatCaptureTagName: parsed.data.chatCaptureTagName,
       chatCaptureTagAiChatEnabled: parsed.data.chatCaptureTagAiChatEnabled,
-      chatCaptureTagAiNameEnabled: parsed.data.chatCaptureTagAiNameEnabled
+      chatCaptureTagAiNameEnabled: parsed.data.chatCaptureTagAiNameEnabled,
+      aiActivityRetentionDays: parsed.data.aiActivityRetentionDays
     });
 
     logUiInfo(request, 'ui_user_set_chat_control_success', {
@@ -3692,12 +4427,237 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       archiveCollectionParentId: chatControl.archiveCollectionParentId,
       chatCaptureTagName: chatControl.chatCaptureTagName,
       chatCaptureTagAiChatEnabled: chatControl.chatCaptureTagAiChatEnabled,
-      chatCaptureTagAiNameEnabled: chatControl.chatCaptureTagAiNameEnabled
+      chatCaptureTagAiNameEnabled: chatControl.chatCaptureTagAiNameEnabled,
+      aiActivityRetentionDays: chatControl.aiActivityRetentionDays
     });
 
     reply.send({
       ok: true,
       chatControl
+    });
+  });
+
+  fastify.get('/admin/ui/user/ai-log/settings', async (request, reply) => {
+    const principal = requireSession(request, db);
+    const chatControl = db.getUserChatControlSettings(principal.userId);
+
+    reply.send({
+      ok: true,
+      settings: {
+        retentionDays: chatControl.aiActivityRetentionDays
+      }
+    });
+  });
+
+  fastify.post('/admin/ui/user/ai-log/settings', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+    const parsed = aiLogSettingsSchema.safeParse(request.body);
+    if (!parsed.success) {
+      logUiWarn(request, 'ui_user_set_ai_log_settings_validation_failed', {
+        details: parsed.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid AI log settings payload.', parsed.error.flatten());
+    }
+
+    const chatControl = db.setUserChatControlSettings(principal.userId, {
+      aiActivityRetentionDays: parsed.data.retentionDays
+    });
+    db.pruneAiChangeLog(principal.userId, chatControl.aiActivityRetentionDays);
+
+    logUiInfo(request, 'ui_user_set_ai_log_settings_success', {
+      userId: principal.userId,
+      retentionDays: chatControl.aiActivityRetentionDays
+    });
+
+    reply.send({
+      ok: true,
+      settings: {
+        retentionDays: chatControl.aiActivityRetentionDays
+      }
+    });
+  });
+
+  fastify.get('/admin/ui/user/ai-log/facets', async (request, reply) => {
+    const principal = requireSession(request, db);
+    const parsed = aiLogFacetQuerySchema.safeParse(request.query ?? {});
+    if (!parsed.success) {
+      logUiWarn(request, 'ui_user_get_ai_log_facets_validation_failed', {
+        details: parsed.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid AI log facet query.', parsed.error.flatten());
+    }
+
+    const chatControl = db.getUserChatControlSettings(principal.userId);
+    const pruned = pruneAiLogIfDue(db, principal.userId, chatControl.aiActivityRetentionDays);
+    if (pruned > 0) {
+      logUiInfo(request, 'ui_user_ai_log_pruned', {
+        userId: principal.userId,
+        pruned
+      });
+    }
+    const facets = db.listAiChangeLogFacets(principal.userId, {
+      dateFrom: parsed.data.dateFrom,
+      dateTo: parsed.data.dateTo
+    });
+
+    reply.send({
+      ok: true,
+      facets
+    });
+  });
+
+  fastify.get('/admin/ui/user/ai-log', async (request, reply) => {
+    const principal = requireSession(request, db);
+    const parsed = listAiLogQuerySchema.safeParse(request.query ?? {});
+    if (!parsed.success) {
+      logUiWarn(request, 'ui_user_get_ai_log_validation_failed', {
+        details: parsed.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid AI log query.', parsed.error.flatten());
+    }
+
+    const invalidActionTypes = (parsed.data.actionType ?? []).filter(
+      (value) => !ALLOWED_AI_CHANGE_ACTION_TYPES.includes(value as AiChangeActionType)
+    );
+    if (invalidActionTypes.length > 0) {
+      throw new AppError(
+        400,
+        'validation_error',
+        `Unknown actionType filter(s): ${invalidActionTypes.join(', ')}.`
+      );
+    }
+
+    const chatControl = db.getUserChatControlSettings(principal.userId);
+    const pruned = pruneAiLogIfDue(db, principal.userId, chatControl.aiActivityRetentionDays);
+    if (pruned > 0) {
+      logUiInfo(request, 'ui_user_ai_log_pruned', {
+        userId: principal.userId,
+        pruned
+      });
+    }
+
+    const page = parsed.data.page;
+    const pageSize = parsed.data.pageSize;
+    const offset = (page - 1) * pageSize;
+    const result = db.listAiChangeLog(
+      principal.userId,
+      {
+        q: parsed.data.q,
+        dateFrom: parsed.data.dateFrom,
+        dateTo: parsed.data.dateTo,
+        actionTypes: (parsed.data.actionType ?? []) as AiChangeActionType[],
+        toolNames: parsed.data.toolName ?? [],
+        linkId: parsed.data.linkId,
+        collectionFromId: parsed.data.collectionFromId,
+        collectionToId: parsed.data.collectionToId,
+        tagName: parsed.data.tagName,
+        trackingTrimmed: parsed.data.trackingTrimmed,
+        undoStatus: parsed.data.undoStatus
+      },
+      {
+        limit: pageSize,
+        offset
+      },
+      {
+        sortBy: parsed.data.sortBy,
+        sortDir: parsed.data.sortDir
+      }
+    );
+
+    reply.send({
+      ok: true,
+      items: result.items,
+      paging: {
+        page,
+        pageSize,
+        offset,
+        returned: result.items.length,
+        total: result.total
+      }
+    });
+  });
+
+  fastify.post('/admin/ui/user/ai-log/undo', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+    const parsed = aiLogUndoSchema.safeParse(request.body);
+    if (!parsed.success) {
+      logUiWarn(request, 'ui_user_undo_ai_log_validation_failed', {
+        details: parsed.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid AI log undo payload.', parsed.error.flatten());
+    }
+
+    const runtimeContext = {
+      actor: `${principal.username}#${principal.sessionId}`,
+      principal: toInternalPrincipal(principal),
+      configStore,
+      db,
+      logger: request.log
+    };
+
+    if (parsed.data.mode === 'changes') {
+      const result = await undoChangesByIds(runtimeContext, parsed.data.changeIds ?? []);
+      reply.send({
+        ok: true,
+        result
+      });
+      return;
+    }
+
+    const operationIds = [...new Set((parsed.data.operationIds ?? []).map((value) => value.trim()).filter((value) => value.length > 0))];
+    const warnings: string[] = [];
+    const failures: Array<{ operationId: string; message: string }> = [];
+    let undone = 0;
+    for (const operationId of operationIds) {
+      try {
+        const output = await executeTool('linkwarden_undo_operation', { operationId }, runtimeContext);
+        const payload = output.structuredContent as Record<string, any>;
+        const undoneCount = Number(payload?.summary?.undone ?? 0);
+        undone += Number.isFinite(undoneCount) ? undoneCount : 0;
+        const toolWarnings = Array.isArray(payload?.warnings) ? payload.warnings : [];
+        for (const warning of toolWarnings) {
+          warnings.push(String(warning));
+        }
+      } catch (error) {
+        failures.push({
+          operationId,
+          message: error instanceof Error ? error.message : 'undo operation failed'
+        });
+      }
+    }
+
+    const outcome = failures.length > 0 ? 'failed' : 'success';
+    db.insertAudit({
+      actor: `${principal.username}#${principal.sessionId}`,
+      toolName: 'ui_ai_log_undo_operations',
+      targetType: 'operation',
+      targetIds: operationIds,
+      beforeSummary: 'ui operation undo requested',
+      afterSummary: JSON.stringify({
+        requested: operationIds.length,
+        undone,
+        failures: failures.length
+      }),
+      outcome,
+      details: {
+        userId: principal.userId,
+        warnings
+      }
+    });
+
+    reply.send({
+      ok: true,
+      result: {
+        requested: operationIds.length,
+        undone,
+        conflicts: 0,
+        failed: failures.length,
+        warnings,
+        failures,
+        operationIdsAffected: operationIds
+      }
     });
   });
 

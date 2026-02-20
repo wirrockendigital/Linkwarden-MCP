@@ -20,7 +20,7 @@ vi.mock('../src/linkwarden/runtime.js', () => ({
   }
 }));
 
-import { executeTool } from '../src/mcp/tools.js';
+import { executeTool, undoChangesByIds } from '../src/mcp/tools.js';
 
 const tempDirs: string[] = [];
 
@@ -38,6 +38,7 @@ interface FakeLinkwardenClient {
     tagIds?: number[];
     archived?: boolean;
   }) => Promise<LinkItem>;
+  deleteLink: (id: number) => Promise<void>;
 }
 
 interface FakeState {
@@ -47,6 +48,7 @@ interface FakeState {
   createCollectionCalls: Array<{ name: string; parentId?: number | null }>;
   createTagCalls: string[];
   createLinkCalls: Array<{ url: string; collectionId: number; tagIds?: number[] }>;
+  deleteLinkCalls: number[];
   failCreateLinkForUrl?: string;
   failCreateLinkWithTagsForUrl?: string;
 }
@@ -116,6 +118,7 @@ function createFakeClient(initial?: {
     createCollectionCalls: [],
     createTagCalls: [],
     createLinkCalls: [],
+    deleteLinkCalls: [],
     failCreateLinkForUrl: initial?.failCreateLinkForUrl,
     failCreateLinkWithTagsForUrl: initial?.failCreateLinkWithTagsForUrl
   };
@@ -216,6 +219,13 @@ function createFakeClient(initial?: {
         tags: created.tags.map((tag) => ({ ...tag })),
         collection: created.collection ? { ...created.collection } : null
       };
+    },
+    async deleteLink(id: number): Promise<void> {
+      state.deleteLinkCalls.push(id);
+      for (const [collectionId, links] of state.linksByCollection.entries()) {
+        const nextLinks = links.filter((link) => link.id !== id);
+        state.linksByCollection.set(collectionId, nextLinks);
+      }
     }
   };
 
@@ -631,5 +641,62 @@ describe('capture chat links', () => {
     expect(fake.state.createLinkCalls).toHaveLength(2);
     expect(fake.state.createLinkCalls[0].tagIds).toEqual([1, 2]);
     expect(fake.state.createLinkCalls[1].tagIds).toBeUndefined();
+  });
+
+  it('records create actions in AI log and undoes selected changes by deleting created links', async () => {
+    const store = createStore();
+    const userId = store.createUser({
+      username: 'capture-ai-log-undo-user',
+      role: 'user',
+      passwordSalt: 'salt',
+      passwordHash: 'hash',
+      passwordKdf: 'scrypt',
+      passwordIterations: 16384,
+      writeModeEnabled: true
+    });
+    const fake = createFakeClient();
+    activeClient = fake.client;
+    const context = createContext(store, userId);
+
+    const captureResult = await executeTool(
+      'linkwarden_capture_chat_links',
+      {
+        urls: ['https://example.com/undo-me'],
+        aiName: 'ChatGPT',
+        chatName: 'Undo Session',
+        dryRun: false
+      },
+      context
+    );
+
+    const capturePayload = captureResult.structuredContent as any;
+    expect(capturePayload.ok).toBe(true);
+    expect(capturePayload.summary.created).toBe(1);
+    expect(typeof capturePayload.data.operationId).toBe('string');
+
+    const listed = store.listAiChangeLog(
+      userId,
+      {},
+      { limit: 20, offset: 0 },
+      { sortBy: 'changedAt', sortDir: 'desc' }
+    );
+    expect(listed.total).toBe(1);
+    expect(listed.items[0].actionType).toBe('create_link');
+    expect(listed.items[0].collectionToName).toBe('Undo Session');
+    expect(listed.items[0].undoStatus).toBe('pending');
+
+    const undo = await undoChangesByIds(context, [listed.items[0].id]);
+    expect(undo.undone).toBe(1);
+    expect(undo.failed).toHaveLength(0);
+    expect(undo.conflicts).toHaveLength(0);
+    expect(fake.state.deleteLinkCalls).toHaveLength(1);
+
+    const refreshed = store.listAiChangeLog(
+      userId,
+      {},
+      { limit: 20, offset: 0 },
+      { sortBy: 'changedAt', sortDir: 'desc' }
+    );
+    expect(refreshed.items[0].undoStatus).toBe('applied');
   });
 });
