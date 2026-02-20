@@ -1035,6 +1035,35 @@ export class LinkwardenClient {
           offset,
           pageSignature
         });
+        // This fallback retries one unpaged fetch so large datasets remain discoverable even with broken offset handling.
+        if (typeof result.total !== 'number' || all.length < result.total) {
+          try {
+            const unpagedFallback = await this.listCollectionsUnpagedFallback();
+            if (unpagedFallback.length > all.length) {
+              const previousCount = all.length;
+              const mergedById = new Map<number, LinkCollection>();
+              for (const item of all) {
+                mergedById.set(item.id, item);
+              }
+              for (const item of unpagedFallback) {
+                mergedById.set(item.id, item);
+              }
+              const merged = [...mergedById.values()].sort((left, right) => left.id - right.id);
+              all.length = 0;
+              all.push(...merged);
+              this.log('info', 'linkwarden_collection_unpaged_fallback_applied', {
+                previousCount,
+                fallbackCount: unpagedFallback.length,
+                mergedCount: merged.length
+              });
+            }
+          } catch (error) {
+            this.log('warn', 'linkwarden_collection_unpaged_fallback_failed', {
+              offset,
+              error: errorForLog(error)
+            });
+          }
+        }
         break;
       }
       seenPageSignatures.add(pageSignature);
@@ -1052,6 +1081,19 @@ export class LinkwardenClient {
     }
 
     return all;
+  }
+
+  // This helper performs one unpaged collection request for pagination-recovery scenarios.
+  private async listCollectionsUnpagedFallback(): Promise<LinkCollection[]> {
+    const response = await this.request<any>('GET', '/api/v1/collections');
+    const rawItems = this.extractListItems(response);
+    const mappedItems = rawItems.map((raw: any) => this.mapCollection(raw));
+    this.log('debug', 'linkwarden_collection_unpaged_fallback_loaded', {
+      returnedItems: mappedItems.length,
+      firstId: mappedItems[0]?.id,
+      lastId: mappedItems[mappedItems.length - 1]?.id
+    });
+    return mappedItems;
   }
 
   // This method loads all links in one collection with paging and optional cap.

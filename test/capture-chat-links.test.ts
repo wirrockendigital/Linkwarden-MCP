@@ -327,6 +327,45 @@ describe('capture chat links', () => {
     expect(fake.state.createLinkCalls).toHaveLength(0);
   });
 
+  it('reuses existing hierarchy with case-insensitive name matching and avoids duplicate collection creation', async () => {
+    const store = createStore();
+    const userId = store.createUser({
+      username: 'capture-case-insensitive-user',
+      role: 'user',
+      passwordSalt: 'salt',
+      passwordHash: 'hash',
+      passwordKdf: 'scrypt',
+      passwordIterations: 16384,
+      writeModeEnabled: true
+    });
+    const fake = createFakeClient({
+      collections: [
+        { id: 9, name: 'AI chats', parentId: null },
+        { id: 21, name: 'chatgpt', parentId: 9 },
+        { id: 33, name: 'mx server mit ai spam', parentId: 21 }
+      ]
+    });
+    activeClient = fake.client;
+
+    const result = await executeTool(
+      'linkwarden_capture_chat_links',
+      {
+        urls: ['https://example.com/case-match'],
+        aiName: 'ChatGPT',
+        chatName: 'MX Server mit AI Spam',
+        dryRun: false
+      },
+      createContext(store, userId)
+    );
+
+    const payload = result.structuredContent as any;
+    expect(payload.ok).toBe(true);
+    expect(payload.summary.created).toBe(1);
+    expect(fake.state.createCollectionCalls).toHaveLength(0);
+    expect(fake.state.createLinkCalls).toHaveLength(1);
+    expect(fake.state.createLinkCalls[0].collectionId).toBe(33);
+  });
+
   it('applies only configured static chat tag when AI-name tagging is disabled', async () => {
     const store = createStore();
     const userId = store.createUser({
@@ -467,6 +506,44 @@ describe('capture chat links', () => {
         warning.includes('chatName not provided, fallback "Current Chat" was used')
       )
     ).toBe(true);
+  });
+
+  it('uses conversation-title alias when chatName is missing', async () => {
+    const store = createStore();
+    const userId = store.createUser({
+      username: 'capture-chat-title-alias-user',
+      role: 'user',
+      passwordSalt: 'salt',
+      passwordHash: 'hash',
+      passwordKdf: 'scrypt',
+      passwordIterations: 16384,
+      writeModeEnabled: true
+    });
+    const fake = createFakeClient();
+    activeClient = fake.client;
+
+    const result = await executeTool(
+      'linkwarden_capture_chat_links',
+      {
+        chatText: 'https://example.com/alias-chat-title',
+        aiName: 'ChatGPT',
+        conversationTitle: 'MX Server mit AI Spam',
+        dryRun: true
+      },
+      createContext(store, userId)
+    );
+
+    const payload = result.structuredContent as any;
+    expect(payload.ok).toBe(true);
+    expect(payload.data.chatName).toBe('MX Server mit AI Spam');
+    expect(payload.warnings.some((warning: string) => warning.includes('resolved from alias "conversationTitle"'))).toBe(
+      true
+    );
+    expect(
+      payload.warnings.some((warning: string) =>
+        warning.includes('chatName not provided, fallback "Current Chat" was used')
+      )
+    ).toBe(false);
   });
 
   it('enforces write-mode gating for apply requests and surfaces per-link create failures', async () => {

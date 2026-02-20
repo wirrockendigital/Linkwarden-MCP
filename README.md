@@ -231,7 +231,8 @@ Der MCP ist jetzt auf deinen gewünschten Arbeitsmodus ausgelegt:
   - Tag `to-delete` wird im Apply-Pfad bei Bedarf automatisch angelegt und gesetzt
 - AI-Chat-Link-Capture:
   - `linkwarden_capture_chat_links` speichert Links nach `AI Chats -> <AI Name> -> <Chat Name>`
-  - Für einen gewünschten Unterordnernamen `chatName` immer explizit mitschicken; sonst wird der Fallback `Current Chat` verwendet (inkl. Warning im Tool-Output)
+  - Der aufrufende AI-Client soll den aktuellen Chat-Titel als `chatName` mitsenden; alternativ werden Aliasfelder `chatTitle`, `conversationTitle` oder `threadTitle` ausgewertet
+  - Nur wenn kein Chat-Titel übergeben wird, greift der Fallback `Current Chat` (inkl. Warning im Tool-Output)
   - Collection-Hierarchie wird bei Apply automatisch angelegt, wenn sie fehlt
   - Dedupe erfolgt innerhalb der Ziel-Collection über kanonische URLs
   - Wenn Tag-Validierung beim Erstellen fehlschlägt, wird einmal ohne Tags erneut versucht; Ergebnis wird als Warning plus `summary.createdWithoutTags` ausgewiesen

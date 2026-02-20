@@ -289,7 +289,18 @@ export const captureChatLinksSchema = z
     urls: z.array(z.string().url()).min(1).max(500).optional(),
     chatText: z.string().max(200_000).optional(),
     aiName: z.string().trim().min(1).max(120).default('ChatGPT'),
-    chatName: z.string().trim().min(1).max(160).default('Current Chat'),
+    // This field should be set to the current chat title whenever the calling client can provide it.
+    chatName: z
+      .string()
+      .trim()
+      .min(1)
+      .max(160)
+      .default('Current Chat')
+      .describe('Preferred target chat collection name. Use the current chat title whenever available.'),
+    // These aliases keep compatibility with clients that expose conversation metadata under alternative keys.
+    chatTitle: z.string().trim().min(1).max(160).optional(),
+    conversationTitle: z.string().trim().min(1).max(160).optional(),
+    threadTitle: z.string().trim().min(1).max(160).optional(),
     dryRun: z.boolean().default(false),
     previewLimit: z.number().int().min(1).max(200).default(50),
     idempotencyKey: z.string().trim().min(8).max(128).optional()
@@ -400,7 +411,7 @@ export function buildToolList(): McpTool[] {
     {
       name: 'linkwarden_capture_chat_links',
       description:
-        'Capture links from AI chat text or URL lists into AI Chats > <AI Name> > <Chat Name> with deterministic dedupe.'
+        'Capture links from AI chat text or URL lists into AI Chats > <AI Name> > <Chat Name> with deterministic dedupe. Always pass the current chat title as chatName when available.'
     },
     {
       name: 'linkwarden_get_new_links_routine_status',

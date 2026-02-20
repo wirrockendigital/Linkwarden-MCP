@@ -350,6 +350,62 @@ describe('linkwarden client', () => {
     expect(page.total).toBe(3);
   });
 
+  it('uses unpaged fallback for listAllCollections when paged responses repeat the same page', async () => {
+    // This mock simulates broken offset paging and verifies recovery through one unpaged fallback request.
+    const firstPage = Array.from({ length: 100 }, (_unused, index) => ({
+      id: index + 1,
+      name: `Collection ${index + 1}`,
+      parentId: null
+    }));
+    const fullSet = Array.from({ length: 150 }, (_unused, index) => ({
+      id: index + 1,
+      name: `Collection ${index + 1}`,
+      parentId: null
+    }));
+
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/api/v1/collections') && init?.method === 'GET') {
+        const hasPaging = url.searchParams.has('limit') || url.searchParams.has('offset');
+        if (hasPaging) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              response: firstPage,
+              total: 392
+            })
+          };
+        }
+
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            response: fullSet,
+            total: 150
+          })
+        };
+      }
+
+      throw new Error(`Unexpected URL in fallback test: ${url.toString()}`);
+    });
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new LinkwardenClient('http://linkwarden:3000', runtimeConfig, 'token-value');
+    const allCollections = await client.listAllCollections();
+
+    expect(allCollections).toHaveLength(150);
+    expect(allCollections[149]?.id).toBe(150);
+    expect(
+      fetchMock.mock.calls.some((call) => {
+        const url = String(call[0]);
+        return url.endsWith('/api/v1/collections');
+      })
+    ).toBe(true);
+  });
+
   it('omits parentId in createCollection payload when caller passes null', async () => {
     // This mock verifies root-level collection creation payload compatibility.
     const fetchMock = vi.fn(async () => ({

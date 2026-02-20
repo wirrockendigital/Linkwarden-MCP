@@ -141,6 +141,12 @@ describe('tool schema safety (alpha)', () => {
     expect(withChatText.aiName).toBe('ChatGPT');
     expect(withChatText.chatName).toBe('Current Chat');
 
+    const withConversationTitleAlias = captureChatLinksSchema.parse({
+      chatText: 'Hier ist ein Link: https://example.com/c',
+      conversationTitle: 'MX Server mit AI Spam'
+    });
+    expect(withConversationTitleAlias.conversationTitle).toBe('MX Server mit AI Spam');
+
     expect(() => captureChatLinksSchema.parse({ aiName: 'ChatGPT' })).toThrow();
   });
 

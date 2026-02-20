@@ -281,6 +281,43 @@ function normalizeAiNameTag(raw: string | undefined): string {
   return normalizeCollectionSegment(raw, 'ChatGPT', 80);
 }
 
+// This helper normalizes collection names for deterministic case-insensitive hierarchy matching.
+function normalizeCollectionMatchName(value: string): string {
+  return value
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase();
+}
+
+// This helper resolves chat-name input priority across explicit field and known alias metadata keys.
+function resolveChatNamePreference(input: {
+  chatName?: string;
+  chatTitle?: string;
+  conversationTitle?: string;
+  threadTitle?: string;
+}): { rawName: string | undefined; source: 'chatName' | 'chatTitle' | 'conversationTitle' | 'threadTitle' | 'fallback' } {
+  const candidates: Array<{ source: 'chatName' | 'chatTitle' | 'conversationTitle' | 'threadTitle'; value: string | undefined }> = [
+    { source: 'chatName', value: input.chatName },
+    { source: 'chatTitle', value: input.chatTitle },
+    { source: 'conversationTitle', value: input.conversationTitle },
+    { source: 'threadTitle', value: input.threadTitle }
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate.value === 'string' && candidate.value.trim().length > 0) {
+      return {
+        rawName: candidate.value,
+        source: candidate.source
+      };
+    }
+  }
+
+  return {
+    rawName: undefined,
+    source: 'fallback'
+  };
+}
+
 // This helper normalizes one create-link error into a stable readable message.
 function formatCreateLinkError(error: unknown): string {
   if (error instanceof Error) {
@@ -407,8 +444,12 @@ function pickExactCollectionMatchByParent(
   name: string,
   parentId: number | null
 ): LinkCollection | null {
+  const normalizedTargetName = normalizeCollectionMatchName(name);
   const matches = collections
-    .filter((collection) => collection.name.trim() === name && collection.parentId === parentId)
+    .filter(
+      (collection) =>
+        normalizeCollectionMatchName(collection.name) === normalizedTargetName && collection.parentId === parentId
+    )
     .sort((left, right) => left.id - right.id);
   return matches[0] ?? null;
 }
@@ -3465,15 +3506,24 @@ async function handleRunRulesNow(args: unknown, context: ToolRuntimeContext): Pr
 // This function handles link capture from AI chats into deterministic AI Chats > <AI Name> > <Chat Name> collections.
 async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const rawArgs = typeof args === 'object' && args !== null ? (args as Record<string, unknown>) : {};
-  const hasExplicitChatName = typeof rawArgs.chatName === 'string' && rawArgs.chatName.trim().length > 0;
   const input = captureChatLinksSchema.parse(args);
   if (!input.dryRun) {
     assertWriteAccess(context);
   }
 
+  // This helper preserves only explicit non-empty string inputs from raw tool arguments.
+  const rawString = (value: unknown): string | undefined =>
+    typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+
+  const chatNamePreference = resolveChatNamePreference({
+    chatName: rawString(rawArgs.chatName),
+    chatTitle: rawString(rawArgs.chatTitle),
+    conversationTitle: rawString(rawArgs.conversationTitle),
+    threadTitle: rawString(rawArgs.threadTitle)
+  });
   const client = getClient(context);
   const aiCollectionName = normalizeCollectionSegment(input.aiName, 'ChatGPT', 120);
-  const chatCollectionName = normalizeCollectionSegment(input.chatName, 'Current Chat', 160);
+  const chatCollectionName = normalizeCollectionSegment(chatNamePreference.rawName, 'Current Chat', 160);
   const aiNameTag = normalizeAiNameTag(input.aiName);
 
   return withIdempotency(
@@ -3494,9 +3544,13 @@ async function handleCaptureChatLinks(args: unknown, context: ToolRuntimeContext
       const hierarchy = await resolveChatCollectionHierarchy(client, aiCollectionName, chatCollectionName, !input.dryRun);
       const warnings = [...normalizedCandidates.warnings];
 
-      if (!hasExplicitChatName) {
+      if (chatNamePreference.source === 'fallback') {
         warnings.push(
           `capture_chat_links: chatName not provided, fallback "${chatCollectionName}" was used.`
+        );
+      } else if (chatNamePreference.source !== 'chatName') {
+        warnings.push(
+          `capture_chat_links: chatName resolved from alias "${chatNamePreference.source}" as "${chatCollectionName}".`
         );
       }
 
