@@ -223,6 +223,12 @@ export interface UserSettings {
   offlineMinConsecutiveFailures: number;
   offlineAction: 'archive' | 'delete' | 'none';
   offlineArchiveCollectionId: number | null;
+  link404MonitorEnabled: boolean;
+  link404MonitorInterval: Link404MonitorInterval;
+  link404ToDeleteAfter: Link404ToDeleteAfter;
+  link404LastRunAt: string | null;
+  link404LastStatus: string | null;
+  link404LastError: string | null;
   updatedAt: string;
 }
 
@@ -279,6 +285,33 @@ export interface NewLinksRoutineStatus {
   due: boolean;
   nextDueAt: string | null;
   backlogCount: number | null;
+  warnings: string[];
+}
+
+// This union keeps 404-monitor schedule presets explicit and validation-friendly.
+export type Link404MonitorInterval = 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'semiannual' | 'yearly';
+
+// This union keeps to-delete escalation presets explicit and stable across API/UI/service contracts.
+export type Link404ToDeleteAfter = 'after_1_month' | 'after_6_months' | 'after_1_year';
+
+// This model stores one user's configurable 404-monitor preferences and state.
+export interface Link404MonitorSettings {
+  userId: number;
+  enabled: boolean;
+  interval: Link404MonitorInterval;
+  toDeleteAfter: Link404ToDeleteAfter;
+  lastRunAt: string | null;
+  lastStatus: string | null;
+  lastError: string | null;
+  updatedAt: string;
+}
+
+// This model stores one computed runtime status payload for the user-specific 404 monitor.
+export interface Link404MonitorStatus {
+  userId: number;
+  settings: Link404MonitorSettings;
+  due: boolean;
+  nextDueAt: string | null;
   warnings: string[];
 }
 

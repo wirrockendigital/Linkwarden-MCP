@@ -8,6 +8,10 @@ import { SqliteStore } from '../db/database.js';
 import { LinkwardenClient } from '../linkwarden/client.js';
 import { createUserLinkwardenClient } from '../linkwarden/runtime.js';
 import {
+  getLink404MonitorStatus,
+  runLink404MonitorNow
+} from '../services/link-404-routine.js';
+import {
   getNewLinksRoutineStatus,
   runNewLinksRoutineNow
 } from '../services/new-links-routine.js';
@@ -46,6 +50,7 @@ import {
   deleteTagSchema,
   findDuplicatesSchema,
   getAuditSchema,
+  getLink404MonitorStatusSchema,
   getLinkSchema,
   getNewLinksRoutineStatusSchema,
   getStatsSchema,
@@ -59,6 +64,7 @@ import {
   normalizeUrlsSchema,
   queryLinksSchema,
   runRulesNowSchema,
+  runLink404MonitorNowSchema,
   runNewLinksRoutineNowSchema,
   runSavedQuerySchema,
   serverInfoSchema,
@@ -4143,6 +4149,46 @@ async function handleRunNewLinksRoutineNow(args: unknown, context: ToolRuntimeCo
   );
 }
 
+// This function handles linkwarden_get_link_404_monitor_status and returns schedule/status warnings for 404 monitoring.
+async function handleGetLink404MonitorStatus(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  getLink404MonitorStatusSchema.parse(args);
+  const status = await getLink404MonitorStatus(context, {});
+
+  return ok(
+    {
+      routine: status
+    },
+    {
+      summary: {
+        enabled: status.settings.enabled,
+        due: status.due,
+        interval: status.settings.interval,
+        toDeleteAfter: status.settings.toDeleteAfter
+      },
+      warnings: status.warnings
+    }
+  );
+}
+
+// This function handles linkwarden_run_link_404_monitor_now and delegates to the shared 404-monitor service path.
+async function handleRunLink404MonitorNow(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
+  runLink404MonitorNowSchema.parse(args);
+  const routineResult = await runLink404MonitorNow(context, {
+    ignoreSchedule: true
+  });
+
+  return ok(
+    {
+      routine: routineResult
+    },
+    {
+      summary: routineResult.summary,
+      warnings: routineResult.warnings,
+      failures: routineResult.failures.map((failure) => ({ ...failure }))
+    }
+  );
+}
+
 // This function handles linkwarden_list_rules and supports optional enabled-only filtering.
 async function handleListRules(args: unknown, context: ToolRuntimeContext): Promise<ToolCallResult> {
   const input = listRulesSchema.parse(args);
@@ -4527,6 +4573,8 @@ const toolHandlers: Record<string, (args: unknown, context: ToolRuntimeContext) 
   linkwarden_capture_chat_links: handleCaptureChatLinks,
   linkwarden_get_new_links_routine_status: handleGetNewLinksRoutineStatus,
   linkwarden_run_new_links_routine_now: handleRunNewLinksRoutineNow,
+  linkwarden_get_link_404_monitor_status: handleGetLink404MonitorStatus,
+  linkwarden_run_link_404_monitor_now: handleRunLink404MonitorNow,
   linkwarden_list_rules: handleListRules,
   linkwarden_delete_rule: handleDeleteRule,
   linkwarden_create_saved_query: handleCreateSavedQuery,

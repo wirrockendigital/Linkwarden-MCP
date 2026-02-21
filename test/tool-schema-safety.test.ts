@@ -9,11 +9,13 @@ import {
   createRuleSchema,
   createSavedQuerySchema,
   deleteLinksSchema,
+  getLink404MonitorStatusSchema,
   getNewLinksRoutineStatusSchema,
   governedTagLinksSchema,
   mutateLinksSchema,
   normalizeUrlsSchema,
   queryLinksSchema,
+  runLink404MonitorNowSchema,
   runNewLinksRoutineNowSchema,
   runRulesNowSchema,
   selectorSchema,
@@ -124,6 +126,8 @@ describe('tool schema safety (alpha)', () => {
 
     expect(getNewLinksRoutineStatusSchema.parse({})).toEqual({});
     expect(runNewLinksRoutineNowSchema.parse({})).toEqual({});
+    expect(getLink404MonitorStatusSchema.parse({})).toEqual({});
+    expect(runLink404MonitorNowSchema.parse({})).toEqual({});
   });
 
   it('validates chat-link capture schema defaults and flexible input contract', () => {
@@ -165,7 +169,7 @@ describe('tool schema safety (alpha)', () => {
 
   it('lists only alpha tool names (no legacy search/fetch/reorg names)', () => {
     const names = buildToolList().map((tool) => tool.name);
-    expect(names).toHaveLength(33);
+    expect(names).toHaveLength(35);
     expect(names).toContain('linkwarden_query_links');
     expect(names).toContain('linkwarden_governed_tag_links');
     expect(names).toContain('linkwarden_mutate_links');
@@ -175,6 +179,8 @@ describe('tool schema safety (alpha)', () => {
     expect(names).toContain('linkwarden_capture_chat_links');
     expect(names).toContain('linkwarden_get_new_links_routine_status');
     expect(names).toContain('linkwarden_run_new_links_routine_now');
+    expect(names).toContain('linkwarden_get_link_404_monitor_status');
+    expect(names).toContain('linkwarden_run_link_404_monitor_now');
     expect(names).toContain('linkwarden_create_saved_query');
     expect(names).toContain('linkwarden_get_audit');
     expect(names).toContain('linkwarden_undo_operation');

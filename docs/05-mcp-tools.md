@@ -164,6 +164,18 @@ New-Links-Routine sofort ausführen:
 Nutze linkwarden_run_new_links_routine_now
 ```
 
+404-Monitor Status:
+
+```text
+Nutze linkwarden_get_link_404_monitor_status
+```
+
+404-Monitor sofort ausführen:
+
+```text
+Nutze linkwarden_run_link_404_monitor_now
+```
+
 Gespeicherte Query ausführen:
 
 ```text

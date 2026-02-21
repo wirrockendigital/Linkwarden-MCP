@@ -11,6 +11,7 @@ import { registerUiRoutes } from './http/ui.js';
 import { createValidatedLinkwardenClientWithToken } from './linkwarden/runtime.js';
 import { registerMcpRoutes } from './mcp/protocol.js';
 import { executeTool } from './mcp/tools.js';
+import { runLink404MonitorNow } from './services/link-404-routine.js';
 import { runNewLinksRoutineNow } from './services/new-links-routine.js';
 import type { AuthenticatedPrincipal } from './types/domain.js';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION, formatProtocolVersionWithTimestamp } from './version.js';
@@ -323,6 +324,7 @@ export function createServer(): ServerResources {
 
   let newLinksRoutineSchedulerTimer: NodeJS.Timeout | null = null;
   let newLinksRoutineSchedulerRunning = false;
+  let link404MonitorSchedulerRunning = false;
   const schedulerTickMs = 60 * 1000;
 
   // This helper executes one scheduler tick and triggers due user routines with shared service logic.
@@ -390,11 +392,77 @@ export function createServer(): ServerResources {
     }
   };
 
+  // This helper executes one scheduler tick and triggers due user 404-monitor routines with shared service logic.
+  const runLink404MonitorSchedulerTick = async (): Promise<void> => {
+    if (link404MonitorSchedulerRunning) {
+      app.log.debug(
+        {
+          event: 'link_404_monitor_scheduler_tick_skipped_running'
+        },
+        'link_404_monitor_scheduler_tick_skipped_running'
+      );
+      return;
+    }
+
+    if (!configStore.isInitialized() || !configStore.isUnlocked()) {
+      return;
+    }
+
+    link404MonitorSchedulerRunning = true;
+    try {
+      const candidates = db.listUsersWithEnabledLink404Monitor();
+      for (const candidate of candidates) {
+        const principal = buildSchedulerPrincipal({
+          userId: candidate.userId,
+          username: candidate.username,
+          role: candidate.role
+        });
+
+        const result = await runLink404MonitorNow(
+          {
+            actor: `scheduler#user:${candidate.userId}`,
+            principal,
+            configStore,
+            db,
+            logger: app.log
+          },
+          {
+            ignoreSchedule: false
+          }
+        );
+
+        app.log.info(
+          {
+            event: 'link_404_monitor_scheduler_user_completed',
+            userId: candidate.userId,
+            status: result.status,
+            summary: result.summary,
+            warnings: result.warnings,
+            failures: result.failures.length
+          },
+          'link_404_monitor_scheduler_user_completed'
+        );
+      }
+    } catch (error) {
+      app.log.error(
+        {
+          event: 'link_404_monitor_scheduler_tick_failed',
+          error: errorForLog(error)
+        },
+        'link_404_monitor_scheduler_tick_failed'
+      );
+    } finally {
+      link404MonitorSchedulerRunning = false;
+    }
+  };
+
   // This startup task enables one in-process scheduler loop so no external cron dependency is required.
   newLinksRoutineSchedulerTimer = setInterval(() => {
     void runNewLinksRoutineSchedulerTick();
+    void runLink404MonitorSchedulerTick();
   }, schedulerTickMs);
   void runNewLinksRoutineSchedulerTick();
+  void runLink404MonitorSchedulerTick();
 
   // This shutdown hook clears scheduler timers so app close remains deterministic.
   app.addHook('onClose', async () => {

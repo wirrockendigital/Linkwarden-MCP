@@ -351,3 +351,21 @@
 1. Added ConfigStore regression coverage for setup defaults/persistence of `oauthSessionLifetime` (`test/config-store-oauth-session.test.ts`) to lock the `permanent` default behavior.
 2. Revalidated full Docker QA gate after OAuth session lifetime implementation: `npm run qa:docker` green with `24/24` test files and `110/110` tests passing.
 3. Finalized release metadata to `0.2.23` (`package.json`, `package-lock.json`, `src/version.ts`) for commit/tag/push.
+4. Added native per-user 404-monitor persistence fields in `user_settings` (`link_404_monitor_enabled`, `link_404_monitor_interval`, `link_404_to_delete_after`, run-state columns) with migration/default normalization to period-based presets (`monthly` / `after_1_year`).
+5. Extended domain/store contracts with explicit 404-monitor types and APIs (`Link404MonitorInterval`, `Link404ToDeleteAfter`, `Link404MonitorSettings`, `Link404MonitorStatus`) plus new store methods for settings, run-state, and scheduler candidate listing.
+6. Implemented new native routine service `src/services/link-404-routine.ts` with strict HTTP-404 detection, calendar-based escalation (`after_1_month|after_6_months|after_1_year`), automatic recovery untagging (`404` + `to-delete` removal), maintenance locking, and operation/AI-log audit integration.
+7. Wired 404-monitor scheduler execution into `src/server.ts` as a dedicated background path parallel to the new-links scheduler, including structured tick/user completion/failure logging.
+8. Added MCP tool surface for 404 monitoring:
+   - `linkwarden_get_link_404_monitor_status`
+   - `linkwarden_run_link_404_monitor_now`
+   including schema registry and tool discovery updates.
+9. Extended `/admin` user backend/API + dashboard with new automation panel `404-Monitor`:
+   - `GET /admin/ui/user/link-404-monitor`
+   - `POST /admin/ui/user/link-404-monitor`
+   and UI controls for enable toggle, interval presets (`daily|weekly|biweekly|monthly|semiannual|yearly`), and escalation presets (`after_1_month|after_6_months|after_1_year`).
+10. Added regression coverage for new behavior:
+    - store defaults/persistence/run-state (`test/link-404-monitor-store.test.ts`)
+    - schedule semantics (`test/link-404-routine-schedule.test.ts`)
+    - runtime tag/update/recovery/error paths (`test/link-404-routine.test.ts`)
+    - tool schema/discovery and admin UI contract updates (`test/tool-schema-safety.test.ts`, `test/admin-ui-refactor.test.ts`).
+11. Finalized release metadata to `0.2.24` (`package.json`, `package-lock.json`, `src/version.ts`) for commit/tag/push.

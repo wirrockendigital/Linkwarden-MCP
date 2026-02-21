@@ -283,6 +283,10 @@ export const getNewLinksRoutineStatusSchema = z.object({});
 
 export const runNewLinksRoutineNowSchema = z.object({});
 
+export const getLink404MonitorStatusSchema = z.object({});
+
+export const runLink404MonitorNowSchema = z.object({});
+
 // This schema captures one chat-link capture request with optional URL extraction from chat text.
 export const captureChatLinksSchema = z
   .object({
@@ -369,6 +373,8 @@ export const toolSchemas = {
   linkwarden_capture_chat_links: captureChatLinksSchema,
   linkwarden_get_new_links_routine_status: getNewLinksRoutineStatusSchema,
   linkwarden_run_new_links_routine_now: runNewLinksRoutineNowSchema,
+  linkwarden_get_link_404_monitor_status: getLink404MonitorStatusSchema,
+  linkwarden_run_link_404_monitor_now: runLink404MonitorNowSchema,
   linkwarden_list_rules: listRulesSchema,
   linkwarden_delete_rule: deleteRuleSchema,
   linkwarden_create_saved_query: createSavedQuerySchema,
@@ -420,6 +426,14 @@ export function buildToolList(): McpTool[] {
     {
       name: 'linkwarden_run_new_links_routine_now',
       description: 'Run the user-specific new-links routine immediately via the native scheduler service.'
+    },
+    {
+      name: 'linkwarden_get_link_404_monitor_status',
+      description: 'Return user-specific status, schedule, and warnings for automatic 404 link monitoring.'
+    },
+    {
+      name: 'linkwarden_run_link_404_monitor_now',
+      description: 'Run the user-specific 404 monitor immediately via the native scheduler service.'
     },
     { name: 'linkwarden_list_rules', description: 'List persisted rules for the current user.' },
     { name: 'linkwarden_delete_rule', description: 'Delete one rule by id.' },

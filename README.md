@@ -236,6 +236,18 @@ Der MCP ist jetzt auf deinen gewünschten Arbeitsmodus ausgelegt:
   - `linkwarden_get_new_links_routine_status`
   - `linkwarden_run_new_links_routine_now`
   - User-Backend unter `/admin/ui/user/new-links-routine` für `enabled`, `intervalMinutes`, `modules`, `batchSize`, Backfill-Anfrage/-Bestätigung
+- Native 404-Monitor-Routine:
+  - `linkwarden_get_link_404_monitor_status`
+  - `linkwarden_run_link_404_monitor_now`
+  - User-Backend unter `/admin/ui/user/link-404-monitor` für:
+    - `enabled`
+    - periodisches Prüfintervall: `daily|weekly|biweekly|monthly|semiannual|yearly` (Default `monthly`)
+    - Eskalation für `to-delete`: `after_1_month|after_6_months|after_1_year` (Default `after_1_year`)
+  - Verhalten:
+    - prüft nur nicht archivierte Links
+    - setzt Tag `404` bei HTTP `404`
+    - setzt zusätzlich `to-delete`, wenn 404 über den konfigurierten Zeitraum bestehen bleibt
+    - entfernt `404` und `to-delete` automatisch bei Recovery (`status != 404`)
 - Soft-Delete/ARCHIVE_TAG mit pro-User Archiv-Collection:
   - Backend-Einstellung unter `/admin/ui/user/chat-control` für `archiveCollectionName` und optional `archiveCollectionParentId`
   - Standardname ist `Archive`
@@ -280,11 +292,10 @@ Beispiel für AI-Chat-Link-Capture:
 
 - `Nutze linkwarden_capture_chat_links mit chatText "<aktueller Chattext>" aiName "ChatGPT" chatName "Prompt Engineering" dryRun false`.
 
-Hinweis zu „proaktiv“:
+Hinweis zu Regel-Automation:
 
-- Der MCP stellt die Tools bereit; die automatische Ausführung passiert über den aufrufenden Agenten/Connector.
-- Praktisch: In ChatGPT einen wiederkehrenden Task auf `linkwarden_run_rules_now` setzen.
-- Für One-shot-Orchestrierung `linkwarden_apply_rule` (einzelne Regel) oder `linkwarden_run_rules_now` (mehrere Regeln) nutzen.
+- Für regelbasierte Jobs kannst du weiterhin externe Trigger nutzen (z. B. ChatGPT Tasks mit `linkwarden_run_rules_now`).
+- Für One-shot-Orchestrierung nutze `linkwarden_apply_rule` (einzelne Regel) oder `linkwarden_run_rules_now` (mehrere Regeln).
 
 ## Versionierung und automatische Docker-Releases
 

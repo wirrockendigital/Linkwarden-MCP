@@ -1,6 +1,6 @@
 {
   "name": "linkwarden-mcp",
-  "version": "0.2.23",
+  "version": "0.2.24",
   "private": true,
   "description": "Remote MCP server for Linkwarden bookmark management",
   "type": "module",

@@ -15,6 +15,9 @@ import type {
   EncryptedSecret,
   FetchMode,
   GlobalTaggingPolicy,
+  Link404MonitorInterval,
+  Link404MonitorSettings,
+  Link404ToDeleteAfter,
   NewLinksCursor,
   NewLinksRoutineModule,
   NewLinksRoutineSettings,
@@ -320,6 +323,21 @@ const ALLOWED_TAGGING_INFERENCE_PROVIDERS: TaggingInferenceProvider[] = [
 
 // This constant defines allowed per-user AI activity retention windows in days.
 const ALLOWED_AI_ACTIVITY_RETENTION_DAYS: Array<30 | 90 | 180 | 365> = [30, 90, 180, 365];
+// This constant defines supported calendar-based 404-monitor intervals for deterministic schedule behavior.
+const ALLOWED_LINK_404_MONITOR_INTERVALS: Link404MonitorInterval[] = [
+  'daily',
+  'weekly',
+  'biweekly',
+  'monthly',
+  'semiannual',
+  'yearly'
+];
+// This constant defines supported 404 escalation periods used to apply the to-delete tag.
+const ALLOWED_LINK_404_TO_DELETE_AFTER: Link404ToDeleteAfter[] = [
+  'after_1_month',
+  'after_6_months',
+  'after_1_year'
+];
 // This constant represents the deterministic max timestamp used for permanent OAuth refresh sessions.
 const OAUTH_PERMANENT_REFRESH_EXPIRES_AT = '9999-12-31T23:59:59.000Z';
 
@@ -432,6 +450,12 @@ export class SqliteStore {
         offline_min_consecutive_failures INTEGER NOT NULL DEFAULT 3,
         offline_action TEXT NOT NULL DEFAULT 'archive' CHECK (offline_action IN ('archive', 'delete', 'none')),
         offline_archive_collection_id INTEGER,
+        link_404_monitor_enabled INTEGER NOT NULL DEFAULT 0,
+        link_404_monitor_interval TEXT NOT NULL DEFAULT 'monthly' CHECK (link_404_monitor_interval IN ('daily', 'weekly', 'biweekly', 'monthly', 'semiannual', 'yearly')),
+        link_404_to_delete_after TEXT NOT NULL DEFAULT 'after_1_year' CHECK (link_404_to_delete_after IN ('after_1_month', 'after_6_months', 'after_1_year')),
+        link_404_last_run_at TEXT,
+        link_404_last_status TEXT,
+        link_404_last_error TEXT,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
       );
@@ -1037,6 +1061,47 @@ export class SqliteStore {
     if (!hasColumn('offline_archive_collection_id')) {
       this.db.exec('ALTER TABLE user_settings ADD COLUMN offline_archive_collection_id INTEGER;');
     }
+
+    // This migration adds per-user 404-monitor enablement and periodic schedule controls.
+    if (!hasColumn('link_404_monitor_enabled')) {
+      this.db.exec('ALTER TABLE user_settings ADD COLUMN link_404_monitor_enabled INTEGER NOT NULL DEFAULT 0;');
+    }
+
+    // This migration adds period-based 404-monitor interval presets and normalizes legacy/invalid values.
+    if (!hasColumn('link_404_monitor_interval')) {
+      this.db.exec("ALTER TABLE user_settings ADD COLUMN link_404_monitor_interval TEXT NOT NULL DEFAULT 'monthly';");
+    }
+
+    // This migration adds period-based escalation presets for applying the to-delete tag.
+    if (!hasColumn('link_404_to_delete_after')) {
+      this.db.exec("ALTER TABLE user_settings ADD COLUMN link_404_to_delete_after TEXT NOT NULL DEFAULT 'after_1_year';");
+    }
+
+    if (!hasColumn('link_404_last_run_at')) {
+      this.db.exec('ALTER TABLE user_settings ADD COLUMN link_404_last_run_at TEXT;');
+    }
+
+    if (!hasColumn('link_404_last_status')) {
+      this.db.exec('ALTER TABLE user_settings ADD COLUMN link_404_last_status TEXT;');
+    }
+
+    if (!hasColumn('link_404_last_error')) {
+      this.db.exec('ALTER TABLE user_settings ADD COLUMN link_404_last_error TEXT;');
+    }
+
+    // This migration keeps persisted 404-monitor interval values within supported presets.
+    this.db.exec(`
+      UPDATE user_settings
+      SET link_404_monitor_interval = 'monthly'
+      WHERE link_404_monitor_interval NOT IN ('daily', 'weekly', 'biweekly', 'monthly', 'semiannual', 'yearly')
+    `);
+
+    // This migration keeps persisted to-delete escalation values within supported presets.
+    this.db.exec(`
+      UPDATE user_settings
+      SET link_404_to_delete_after = 'after_1_year'
+      WHERE link_404_to_delete_after NOT IN ('after_1_month', 'after_6_months', 'after_1_year')
+    `);
   }
 
   // This migration upgrades user_chat_control to include archive defaults for backend-driven delete alternatives.
@@ -1447,6 +1512,12 @@ export class SqliteStore {
           offline_min_consecutive_failures,
           offline_action,
           offline_archive_collection_id,
+          link_404_monitor_enabled,
+          link_404_monitor_interval,
+          link_404_to_delete_after,
+          link_404_last_run_at,
+          link_404_last_status,
+          link_404_last_error,
           updated_at
         FROM user_settings
         WHERE user_id = ?
@@ -1474,6 +1545,12 @@ export class SqliteStore {
           offline_min_consecutive_failures: number;
           offline_action: 'archive' | 'delete' | 'none';
           offline_archive_collection_id: number | null;
+          link_404_monitor_enabled: number;
+          link_404_monitor_interval: string;
+          link_404_to_delete_after: string;
+          link_404_last_run_at: string | null;
+          link_404_last_status: string | null;
+          link_404_last_error: string | null;
           updated_at: string;
         }
       | undefined;
@@ -1504,6 +1581,16 @@ export class SqliteStore {
       offlineMinConsecutiveFailures: row.offline_min_consecutive_failures,
       offlineAction: row.offline_action,
       offlineArchiveCollectionId: row.offline_archive_collection_id,
+      link404MonitorEnabled: row.link_404_monitor_enabled === 1,
+      link404MonitorInterval: ALLOWED_LINK_404_MONITOR_INTERVALS.includes(row.link_404_monitor_interval as Link404MonitorInterval)
+        ? (row.link_404_monitor_interval as Link404MonitorInterval)
+        : 'monthly',
+      link404ToDeleteAfter: ALLOWED_LINK_404_TO_DELETE_AFTER.includes(row.link_404_to_delete_after as Link404ToDeleteAfter)
+        ? (row.link_404_to_delete_after as Link404ToDeleteAfter)
+        : 'after_1_year',
+      link404LastRunAt: row.link_404_last_run_at,
+      link404LastStatus: row.link_404_last_status,
+      link404LastError: row.link_404_last_error,
       updatedAt: row.updated_at
     };
   }
@@ -1716,6 +1803,90 @@ export class SqliteStore {
         policy.offlineArchiveCollectionId,
         now
       );
+  }
+
+  // This method returns one normalized 404-monitor settings object derived from user_settings columns.
+  public getUserLink404MonitorSettings(userId: number): Link404MonitorSettings {
+    const settings = this.getUserSettings(userId);
+    return {
+      userId: settings.userId,
+      enabled: settings.link404MonitorEnabled,
+      interval: settings.link404MonitorInterval,
+      toDeleteAfter: settings.link404ToDeleteAfter,
+      lastRunAt: settings.link404LastRunAt,
+      lastStatus: settings.link404LastStatus,
+      lastError: settings.link404LastError,
+      updatedAt: settings.updatedAt
+    };
+  }
+
+  // This method updates one user's 404-monitor preferences with strict preset normalization.
+  public setUserLink404MonitorSettings(
+    userId: number,
+    payload: {
+      enabled?: boolean;
+      interval?: Link404MonitorInterval;
+      toDeleteAfter?: Link404ToDeleteAfter;
+    }
+  ): Link404MonitorSettings {
+    const now = new Date().toISOString();
+    this.getUserById(userId);
+    const existing = this.getUserLink404MonitorSettings(userId);
+
+    const nextEnabled = payload.enabled ?? existing.enabled;
+    const nextInterval = ALLOWED_LINK_404_MONITOR_INTERVALS.includes(payload.interval as Link404MonitorInterval)
+      ? (payload.interval as Link404MonitorInterval)
+      : existing.interval;
+    const nextToDeleteAfter = ALLOWED_LINK_404_TO_DELETE_AFTER.includes(payload.toDeleteAfter as Link404ToDeleteAfter)
+      ? (payload.toDeleteAfter as Link404ToDeleteAfter)
+      : existing.toDeleteAfter;
+
+    const existingRow = this.db
+      .prepare('SELECT write_mode_enabled FROM user_settings WHERE user_id = ?')
+      .get(userId) as { write_mode_enabled: number } | undefined;
+    const writeModeEnabled = existingRow?.write_mode_enabled === 1 ? 1 : 0;
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO user_settings (
+          user_id,
+          write_mode_enabled,
+          link_404_monitor_enabled,
+          link_404_monitor_interval,
+          link_404_to_delete_after,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          link_404_monitor_enabled = excluded.link_404_monitor_enabled,
+          link_404_monitor_interval = excluded.link_404_monitor_interval,
+          link_404_to_delete_after = excluded.link_404_to_delete_after,
+          updated_at = excluded.updated_at
+      `
+      )
+      .run(userId, writeModeEnabled, nextEnabled ? 1 : 0, nextInterval, nextToDeleteAfter, now);
+
+    return this.getUserLink404MonitorSettings(userId);
+  }
+
+  // This method stores one 404-monitor run-state snapshot including last-run timestamp and optional error message.
+  public setUserLink404MonitorRunState(userId: number, status: string, error?: string | null): void {
+    this.getUserById(userId);
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `
+        UPDATE user_settings
+        SET
+          link_404_last_run_at = ?,
+          link_404_last_status = ?,
+          link_404_last_error = ?,
+          updated_at = ?
+        WHERE user_id = ?
+      `
+      )
+      .run(now, status, error ?? null, now, userId);
   }
 
   // This method returns one normalized global governed-tagging policy with safe defaults.
@@ -1990,6 +2161,28 @@ export class SqliteStore {
         JOIN user_settings s ON s.user_id = u.id
         JOIN user_linkwarden_tokens t ON t.user_id = u.id
         WHERE u.is_active = 1 AND s.new_links_routine_enabled = 1
+        ORDER BY u.id ASC
+      `
+      )
+      .all() as NewLinksRoutineUserRow[];
+
+    return rows.map((row) => ({
+      userId: row.id,
+      username: row.username,
+      role: row.role as UserRole
+    }));
+  }
+
+  // This method returns active users with configured token and enabled 404 monitor for scheduler iteration.
+  public listUsersWithEnabledLink404Monitor(): Array<{ userId: number; username: string; role: UserRole }> {
+    const rows = this.db
+      .prepare(
+        `
+        SELECT u.id, u.username, u.role
+        FROM users u
+        JOIN user_settings s ON s.user_id = u.id
+        JOIN user_linkwarden_tokens t ON t.user_id = u.id
+        WHERE u.is_active = 1 AND s.link_404_monitor_enabled = 1
         ORDER BY u.id ASC
       `
       )

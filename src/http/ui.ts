@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { ConfigStore } from '../config/config-store.js';
 import { SqliteStore } from '../db/database.js';
 import { executeTool, undoChangesByIds } from '../mcp/tools.js';
+import { getLink404MonitorStatus } from '../services/link-404-routine.js';
 import { getNewLinksRoutineStatus } from '../services/new-links-routine.js';
 import type { AiChangeActionType, AuthenticatedPrincipal, SessionPrincipal, UserRole } from '../types/domain.js';
 import { AppError } from '../utils/errors.js';
@@ -143,6 +144,16 @@ const setNewLinksRoutineSchema = z
   })
   .refine((payload) => Object.keys(payload).length > 0, {
     message: 'At least one new-links routine field must be updated.'
+  });
+
+const setLink404MonitorSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    interval: z.enum(['daily', 'weekly', 'biweekly', 'monthly', 'semiannual', 'yearly']).optional(),
+    toDeleteAfter: z.enum(['after_1_month', 'after_6_months', 'after_1_year']).optional()
+  })
+  .refine((payload) => Object.keys(payload).length > 0, {
+    message: 'At least one 404-monitor field must be updated.'
   });
 
 const setChatControlSchema = z
@@ -1512,6 +1523,31 @@ export function renderDashboardPage(principal: SessionPrincipal, csrfToken: stri
     </div>
   </div>
 
+  <div class="card tab-panel-card" data-top-tab="automationen" data-sub-tab="link-404-monitor">
+    <h2>Mein 404-Monitor</h2>
+    <button onclick="loadOwnLink404Monitor()">404-Monitor laden</button>
+    <pre id="ownLink404MonitorResult">Noch nicht geladen</pre>
+    <div class="form-block" data-form-section="link-404-monitor-settings" data-form-section-label="404-Monitor">
+      <label><input id="selfLink404MonitorEnabled" type="checkbox" /> 404-Monitor aktiviert</label>
+      <label for="selfLink404MonitorInterval">Prüfintervall</label>
+      <select id="selfLink404MonitorInterval">
+        <option value="daily">Täglich</option>
+        <option value="weekly">Wöchentlich</option>
+        <option value="biweekly">Alle zwei Wochen</option>
+        <option value="monthly" selected>Monatlich</option>
+        <option value="semiannual">Halbjährlich</option>
+        <option value="yearly">Jährlich</option>
+      </select>
+      <label for="selfLink404MonitorToDeleteAfter">to-delete nach</label>
+      <select id="selfLink404MonitorToDeleteAfter">
+        <option value="after_1_month">Nach einem Monat</option>
+        <option value="after_6_months">Nach einem halben Jahr</option>
+        <option value="after_1_year" selected>Nach einem Jahr</option>
+      </select>
+      <button onclick="setOwnLink404Monitor()">404-Monitor speichern</button>
+    </div>
+  </div>
+
   <div class="card tab-panel-card" data-top-tab="automationen" data-sub-tab="chat-control">
     <h2>Mein Chat-Control</h2>
     <button onclick="loadOwnChatControl()">Chat-Control laden</button>
@@ -1637,6 +1673,7 @@ const subTabDefinitions = {
   ],
   'automationen': [
     { key: 'routine', label: 'New-Links-Routine', adminOnly: false },
+    { key: 'link-404-monitor', label: '404-Monitor', adminOnly: false },
     { key: 'chat-control', label: 'Chat-Control', adminOnly: false }
   ],
   'integrationen': [
@@ -1667,6 +1704,7 @@ const panelLoaders = {
   'mein-konto:profil': async () => { await loadMe(); },
   'mein-konto:api-keys': async () => { await loadOwnKeys(); },
   'automationen:routine': async () => { await loadOwnNewLinksRoutine(); },
+  'automationen:link-404-monitor': async () => { await loadOwnLink404Monitor(); },
   'automationen:chat-control': async () => { await loadOwnChatControl(); },
   'integrationen:linkwarden-token': async () => { await loadMe(); },
   'integrationen:user-linkwarden-token': async () => { await loadUsers(); },
@@ -1694,6 +1732,7 @@ const mutationInvalidationMap = {
   setOwnWriteMode: ['mein-konto:profil', 'uebersicht:status'],
   setOwnTaggingPreferences: ['governance:mein-tagging', 'uebersicht:status'],
   setOwnNewLinksRoutine: ['automationen:routine', 'uebersicht:status'],
+  setOwnLink404Monitor: ['automationen:link-404-monitor', 'uebersicht:status'],
   setOwnChatControl: ['automationen:chat-control', 'uebersicht:ai-log'],
   setOwnLinkwardenToken: ['integrationen:linkwarden-token', 'uebersicht:status'],
   issueOwnKey: ['mein-konto:api-keys'],
@@ -2665,6 +2704,15 @@ function applyRoutineSettingsToForm(settings) {
   document.getElementById('selfRoutineModuleDedupe').checked = modules.has('dedupe');
 }
 
+// This helper applies 404-monitor settings payload values to dashboard controls after API reads.
+function applyLink404MonitorSettingsToForm(settings) {
+  document.getElementById('selfLink404MonitorEnabled').checked = Boolean(settings?.enabled);
+  document.getElementById('selfLink404MonitorInterval').value = String(settings?.interval ?? 'monthly');
+  document.getElementById('selfLink404MonitorToDeleteAfter').value = String(
+    settings?.toDeleteAfter ?? 'after_1_year'
+  );
+}
+
 // This helper escapes dynamic text content before composing HTML strings for table cells.
 function escapeHtml(value) {
   return String(value ?? '')
@@ -3215,6 +3263,14 @@ async function loadOwnNewLinksRoutine() {
   }
 }
 
+async function loadOwnLink404Monitor() {
+  const { res, json } = await requestJson('/admin/ui/user/link-404-monitor');
+  document.getElementById('ownLink404MonitorResult').textContent = JSON.stringify(json, null, 2);
+  if (res.ok) {
+    applyLink404MonitorSettingsToForm(json?.status?.settings ?? {});
+  }
+}
+
 async function loadOwnChatControl() {
   const { res, json } = await requestJson('/admin/ui/user/chat-control');
   document.getElementById('ownChatControlResult').textContent = JSON.stringify(json, null, 2);
@@ -3273,6 +3329,19 @@ async function setOwnNewLinksRoutine() {
 
   document.getElementById('selfRoutineRequestBackfill').checked = false;
   document.getElementById('selfRoutineConfirmBackfill').checked = false;
+}
+
+async function setOwnLink404Monitor() {
+  await api('/admin/ui/user/link-404-monitor', {
+    method: 'POST',
+    body: JSON.stringify({
+      enabled: document.getElementById('selfLink404MonitorEnabled').checked,
+      interval: document.getElementById('selfLink404MonitorInterval').value,
+      toDeleteAfter: document.getElementById('selfLink404MonitorToDeleteAfter').value
+    }),
+    mutationAction: 'setOwnLink404Monitor',
+    mutationSections: ['link-404-monitor-settings']
+  });
 }
 
 async function setOwnChatControl() {
@@ -4485,6 +4554,75 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
       enabled: settings.enabled,
       intervalMinutes: settings.intervalMinutes,
       modules: settings.modules
+    });
+
+    reply.send({
+      ok: true,
+      settings,
+      status
+    });
+  });
+
+  fastify.get('/admin/ui/user/link-404-monitor', async (request, reply) => {
+    const principal = requireSession(request, db);
+    const status = await getLink404MonitorStatus(
+      {
+        actor: `${principal.username}#${principal.sessionId}`,
+        principal: toInternalPrincipal(principal),
+        configStore,
+        db,
+        logger: request.log
+      },
+      {}
+    );
+
+    logUiInfo(request, 'ui_user_get_link_404_monitor', {
+      userId: principal.userId,
+      enabled: status.settings.enabled,
+      due: status.due,
+      interval: status.settings.interval,
+      toDeleteAfter: status.settings.toDeleteAfter
+    });
+
+    reply.send({
+      ok: true,
+      status
+    });
+  });
+
+  fastify.post('/admin/ui/user/link-404-monitor', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+
+    const parsed = setLink404MonitorSchema.safeParse(request.body);
+    if (!parsed.success) {
+      logUiWarn(request, 'ui_user_set_link_404_monitor_validation_failed', {
+        details: parsed.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid 404-monitor payload.', parsed.error.flatten());
+    }
+
+    const settings = db.setUserLink404MonitorSettings(principal.userId, {
+      enabled: parsed.data.enabled,
+      interval: parsed.data.interval,
+      toDeleteAfter: parsed.data.toDeleteAfter
+    });
+    const status = await getLink404MonitorStatus(
+      {
+        actor: `${principal.username}#${principal.sessionId}`,
+        principal: toInternalPrincipal(principal),
+        configStore,
+        db,
+        logger: request.log
+      },
+      {}
+    );
+
+    logUiInfo(request, 'ui_user_set_link_404_monitor_success', {
+      userId: principal.userId,
+      enabled: settings.enabled,
+      interval: settings.interval,
+      toDeleteAfter: settings.toDeleteAfter
     });
 
     reply.send({

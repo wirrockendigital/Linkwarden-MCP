@@ -108,6 +108,29 @@ Verhalten bei `linkwarden_capture_chat_links`:
   - statischer Tag aus `Chat-Link-Tag-Name` (wenn `AI Chat-Tag setzen` aktiv)
   - dynamischer Tag aus `AI Name` (wenn `AI Name-Tag setzen` aktiv)
 
+## 404-Monitor im User-Backend
+
+Im Tab `Automationen -> 404-Monitor` steuerst du die dauerhafte 404-Überwachung deiner Links pro User.
+
+Einstellungen:
+
+- `404-Monitor aktiviert`
+- `Prüfintervall`: `täglich | wöchentlich | alle zwei Wochen | monatlich | halbjährlich | jährlich`
+- `to-delete nach`: `nach einem Monat | nach einem halben Jahr | nach einem Jahr`
+
+Defaults:
+
+- Prüfintervall: `monatlich`
+- `to-delete`-Eskalation: `nach einem Jahr`
+
+Laufzeitverhalten:
+
+- Es werden nur nicht archivierte Links geprüft.
+- Nur HTTP `404` zählt als Offline-Fall.
+- Bei `404` wird Tag `404` gesetzt.
+- Bleibt der Link über den konfigurierten Zeitraum auf `404`, wird zusätzlich Tag `to-delete` gesetzt.
+- Wird der Link wieder erreichbar (`status != 404`), entfernt der Monitor die Tags `404` und `to-delete` automatisch.
+
 ## AI-Aktivitätslog im User-Backend
 
 Im Tab `Übersicht -> AI-Log` siehst du alle MCP/AI-Write-Änderungen deiner Links mit Zeitstempel.
