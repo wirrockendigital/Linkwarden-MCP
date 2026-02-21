@@ -58,6 +58,15 @@ curl -X POST http://192.168.123.220:8080/setup/unlock \
 3. Linkwarden Target + Whitelist pflegen
 4. Linkwarden API Key -> MCP pro Benutzer setzen/rotieren
 5. Write-Mode pro Benutzer steuern
+6. OAuth Session-Laufzeit setzen (`Dauerhaft`, `Täglich`, `Wöchentlich`, `30`, `180`, `365` Tage)
+
+### OAuth Session-Laufzeit (global)
+
+Im Admin-Dashboard unter `Integrationen -> Linkwarden Ziel` steuert der Admin die Laufzeit von OAuth-Refresh-Sessions.
+
+- Standard: `Dauerhaft`
+- Änderung wirkt sofort auf aktive Refresh-Tokens
+- Access-Token bleiben kurzlebig
 
 ### User-Flow
 

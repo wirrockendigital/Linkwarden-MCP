@@ -6,6 +6,22 @@ import type { EncryptedConfig, RuntimeConfig } from '../types/domain.js';
 
 // This constant defines the key size for AES-256-GCM.
 const KEY_LENGTH = 32;
+const ALLOWED_OAUTH_SESSION_LIFETIMES = new Set<RuntimeConfig['oauthSessionLifetime']>([
+  'permanent',
+  1,
+  7,
+  30,
+  180,
+  365
+]);
+
+// This helper keeps runtime config migration deterministic for legacy config.enc files.
+function normalizeOAuthSessionLifetime(value: unknown): RuntimeConfig['oauthSessionLifetime'] {
+  if (ALLOWED_OAUTH_SESSION_LIFETIMES.has(value as RuntimeConfig['oauthSessionLifetime'])) {
+    return value as RuntimeConfig['oauthSessionLifetime'];
+  }
+  return 'permanent';
+}
 
 // This helper derives a symmetric key from the user passphrase with PBKDF2.
 function deriveKey(passphrase: string, salt: Buffer, iterations: number): Buffer {
@@ -72,6 +88,7 @@ export function decryptRuntimeConfig(payload: EncryptedConfig, passphrase: strin
       maxRetries: Number.isFinite(parsed.maxRetries) ? Number(parsed.maxRetries) : 3,
       retryBaseDelayMs: Number.isFinite(parsed.retryBaseDelayMs) ? Number(parsed.retryBaseDelayMs) : 350,
       planTtlHours: Number.isFinite(parsed.planTtlHours) ? Number(parsed.planTtlHours) : 24,
+      oauthSessionLifetime: normalizeOAuthSessionLifetime(parsed.oauthSessionLifetime),
       oauthClientId:
         typeof parsed.oauthClientId === 'string' && parsed.oauthClientId.trim().length > 0
           ? parsed.oauthClientId.trim()

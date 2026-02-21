@@ -55,6 +55,8 @@ export class ConfigStore {
       maxRetries: payload.maxRetries ?? 3,
       retryBaseDelayMs: payload.retryBaseDelayMs ?? 350,
       planTtlHours: payload.planTtlHours ?? 24,
+      // This default keeps OAuth client sessions unbounded until admins choose a finite policy.
+      oauthSessionLifetime: payload.oauthSessionLifetime ?? 'permanent',
       oauthClientId: payload.oauthClientId?.trim() ? payload.oauthClientId.trim() : undefined,
       oauthClientSecret: payload.oauthClientSecret?.trim() ? payload.oauthClientSecret.trim() : undefined
     };

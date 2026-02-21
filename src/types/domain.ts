@@ -124,9 +124,13 @@ export interface RuntimeConfig {
   maxRetries: number;
   retryBaseDelayMs: number;
   planTtlHours: number;
+  oauthSessionLifetime: OAuthSessionLifetime;
   oauthClientId?: string;
   oauthClientSecret?: string;
 }
+
+// This union defines globally supported OAuth refresh-session lifetime presets.
+export type OAuthSessionLifetime = 'permanent' | 1 | 7 | 30 | 180 | 365;
 
 export interface SetupPayload {
   masterPassphrase: string;
@@ -134,6 +138,7 @@ export interface SetupPayload {
   adminPassword: string;
   linkwardenBaseUrl: string;
   linkwardenApiToken: string;
+  oauthSessionLifetime?: OAuthSessionLifetime;
   oauthClientId?: string;
   oauthClientSecret?: string;
   adminWriteModeDefault: boolean;

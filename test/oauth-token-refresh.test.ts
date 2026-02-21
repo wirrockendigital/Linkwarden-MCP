@@ -31,7 +31,7 @@ describe('oauth token refresh flow', () => {
       configStore: {
         isInitialized: () => true,
         isUnlocked: () => true,
-        getRuntimeConfig: () => ({})
+        getRuntimeConfig: () => ({ oauthSessionLifetime: 'permanent' })
       } as any,
       db: {
         getOAuthRefreshToken: () => refreshRecord,
@@ -84,7 +84,7 @@ describe('oauth token refresh flow', () => {
       configStore: {
         isInitialized: () => true,
         isUnlocked: () => true,
-        getRuntimeConfig: () => ({})
+        getRuntimeConfig: () => ({ oauthSessionLifetime: 'permanent' })
       } as any,
       db: {
         getOAuthRefreshToken: () => refreshRecord,
@@ -125,6 +125,105 @@ describe('oauth token refresh flow', () => {
       });
       expect(consumeExpectedClientId).toBe('client-a');
       expect(createdTokens).toBe(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('issues refresh tokens with permanent lifetime when configured', async () => {
+    const refreshRecord = makeRefreshRecord('client-a');
+    let createdTokenInput: any = null;
+
+    const app = Fastify({ logger: false });
+    registerOAuthRoutes(app, {
+      configStore: {
+        isInitialized: () => true,
+        isUnlocked: () => true,
+        getRuntimeConfig: () => ({ oauthSessionLifetime: 'permanent' })
+      } as any,
+      db: {
+        getOAuthRefreshToken: () => refreshRecord,
+        consumeOAuthRefreshToken: () => refreshRecord,
+        getOAuthClient: (clientId: string) => ({
+          clientId,
+          clientName: 'dynamic-client',
+          redirectUris: ['https://client.example/callback'],
+          tokenEndpointAuthMethod: 'none',
+          clientSecretHash: undefined,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        }),
+        createOAuthToken: (input: any) => {
+          createdTokenInput = input;
+        }
+      } as any
+    });
+
+    await app.ready();
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/token',
+        payload: {
+          grant_type: 'refresh_token',
+          refresh_token: VALID_REFRESH_TOKEN
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(createdTokenInput?.refreshExpiresAt).toBe('9999-12-31T23:59:59.000Z');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('issues refresh tokens with finite lifetime when configured', async () => {
+    const refreshRecord = makeRefreshRecord('client-a');
+    let createdTokenInput: any = null;
+    const startedAt = Date.now();
+
+    const app = Fastify({ logger: false });
+    registerOAuthRoutes(app, {
+      configStore: {
+        isInitialized: () => true,
+        isUnlocked: () => true,
+        getRuntimeConfig: () => ({ oauthSessionLifetime: 7 })
+      } as any,
+      db: {
+        getOAuthRefreshToken: () => refreshRecord,
+        consumeOAuthRefreshToken: () => refreshRecord,
+        getOAuthClient: (clientId: string) => ({
+          clientId,
+          clientName: 'dynamic-client',
+          redirectUris: ['https://client.example/callback'],
+          tokenEndpointAuthMethod: 'none',
+          clientSecretHash: undefined,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        }),
+        createOAuthToken: (input: any) => {
+          createdTokenInput = input;
+        }
+      } as any
+    });
+
+    await app.ready();
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/token',
+        payload: {
+          grant_type: 'refresh_token',
+          refresh_token: VALID_REFRESH_TOKEN
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const expectedMin = startedAt + 7 * 24 * 60 * 60 * 1000 - 3000;
+      const expectedMax = Date.now() + 7 * 24 * 60 * 60 * 1000 + 3000;
+      const actual = new Date(String(createdTokenInput?.refreshExpiresAt ?? '')).getTime();
+      expect(actual).toBeGreaterThanOrEqual(expectedMin);
+      expect(actual).toBeLessThanOrEqual(expectedMax);
     } finally {
       await app.close();
     }

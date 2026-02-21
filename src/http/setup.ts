@@ -7,12 +7,23 @@ import { SqliteStore } from '../db/database.js';
 import { AppError } from '../utils/errors.js';
 import { hashPassword, generateApiToken, hashApiToken } from '../utils/security.js';
 
+// This schema constrains OAuth session lifetime to supported admin-selectable presets.
+const oauthSessionLifetimeSchema = z.union([
+  z.literal('permanent'),
+  z.literal(1),
+  z.literal(7),
+  z.literal(30),
+  z.literal(180),
+  z.literal(365)
+]);
+
 const initializeSchema = z.object({
   masterPassphrase: z.string().min(12),
   adminUsername: z.string().min(3).max(50),
   adminPassword: z.string().min(12).max(200),
   linkwardenBaseUrl: z.string().url(),
   linkwardenApiToken: z.string().min(20),
+  oauthSessionLifetime: oauthSessionLifetimeSchema.optional(),
   oauthClientId: z.string().min(3).max(255).optional(),
   oauthClientSecret: z.string().min(8).max(500).optional(),
   adminWriteModeDefault: z.boolean().default(false),
@@ -113,6 +124,7 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
         maxRetries: parsed.data.maxRetries ?? 3,
         retryBaseDelayMs: parsed.data.retryBaseDelayMs ?? 350,
         planTtlHours: parsed.data.planTtlHours ?? 24,
+        oauthSessionLifetime: parsed.data.oauthSessionLifetime ?? 'permanent',
         oauthClientConfigured: Boolean(parsed.data.oauthClientId?.trim()),
         oauthClientSecretConfigured: Boolean(parsed.data.oauthClientSecret?.trim())
       },
@@ -125,6 +137,7 @@ export function registerSetupRoutes(fastify: FastifyInstance, configStore: Confi
       adminPassword: parsed.data.adminPassword,
       linkwardenBaseUrl: parsed.data.linkwardenBaseUrl,
       linkwardenApiToken: parsed.data.linkwardenApiToken,
+      oauthSessionLifetime: parsed.data.oauthSessionLifetime,
       oauthClientId: parsed.data.oauthClientId,
       oauthClientSecret: parsed.data.oauthClientSecret,
       adminWriteModeDefault: parsed.data.adminWriteModeDefault,

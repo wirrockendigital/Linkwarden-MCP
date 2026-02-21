@@ -35,7 +35,11 @@ Konfiguration über Env:
 - `MCP_HOST_PORT=39227`
 - `MCP_PUBLIC_BASE_URL=https://mcp.deine-domain.tld`
 - `MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=1800`
-- `MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS=2592000`
+
+Die OAuth Refresh-Session-Laufzeit wird im Admin-Backend gesetzt:
+
+- `Integrationen -> Linkwarden Ziel -> OAuth Session-Laufzeit`
+- Presets: `Dauerhaft`, `Täglich`, `Wöchentlich`, `30`, `180`, `365` Tage
 
 Der Container wird mit diesen Werten gestartet:
 

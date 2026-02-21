@@ -9,7 +9,8 @@ const runtimeConfig: RuntimeConfig = {
   requestTimeoutMs: 10_000,
   maxRetries: 0,
   retryBaseDelayMs: 50,
-  planTtlHours: 24
+  planTtlHours: 24,
+  oauthSessionLifetime: 'permanent'
 };
 
 describe('linkwarden client', () => {

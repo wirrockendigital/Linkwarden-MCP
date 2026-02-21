@@ -18,6 +18,7 @@ describe('crypto helpers', () => {
     maxRetries: 3,
     retryBaseDelayMs: 350,
     planTtlHours: 24,
+    oauthSessionLifetime: 'permanent',
     oauthClientId: 'chatgpt-client',
     oauthClientSecret: 'chatgpt-secret-value'
   };
@@ -47,5 +48,23 @@ describe('crypto helpers', () => {
     const decrypted = decryptSecret(payload, 'this-is-a-strong-passphrase');
 
     expect(decrypted).toBe('linkwarden-secret-token');
+  });
+
+  it('defaults missing oauthSessionLifetime from legacy payloads to permanent', () => {
+    // This cast simulates old config.enc payloads that were created before oauthSessionLifetime existed.
+    const payload = encryptRuntimeConfig(
+      {
+        requestTimeoutMs: config.requestTimeoutMs,
+        maxRetries: config.maxRetries,
+        retryBaseDelayMs: config.retryBaseDelayMs,
+        planTtlHours: config.planTtlHours,
+        oauthClientId: config.oauthClientId,
+        oauthClientSecret: config.oauthClientSecret
+      } as RuntimeConfig,
+      'this-is-a-strong-passphrase'
+    );
+
+    const decrypted = decryptRuntimeConfig(payload, 'this-is-a-strong-passphrase');
+    expect(decrypted.oauthSessionLifetime).toBe('permanent');
   });
 });

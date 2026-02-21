@@ -31,6 +31,7 @@ import type {
   OperationRecord,
   OAuthAuthorizationCodeRecord,
   OAuthClientRecord,
+  OAuthSessionLifetime,
   OAuthTokenRecord,
   PlanItem,
   PlanScope,
@@ -319,6 +320,8 @@ const ALLOWED_TAGGING_INFERENCE_PROVIDERS: TaggingInferenceProvider[] = [
 
 // This constant defines allowed per-user AI activity retention windows in days.
 const ALLOWED_AI_ACTIVITY_RETENTION_DAYS: Array<30 | 90 | 180 | 365> = [30, 90, 180, 365];
+// This constant represents the deterministic max timestamp used for permanent OAuth refresh sessions.
+const OAUTH_PERMANENT_REFRESH_EXPIRES_AT = '9999-12-31T23:59:59.000Z';
 
 // This constant defines one deterministic global policy baseline when no policy row exists yet.
 const DEFAULT_GLOBAL_TAGGING_POLICY: GlobalTaggingPolicy = {
@@ -2637,6 +2640,38 @@ export class SqliteStore {
         now,
         now
       );
+  }
+
+  // This helper resolves deterministic refresh expiry timestamps from admin session lifetime presets.
+  private resolveOAuthRefreshExpiry(lifetime: OAuthSessionLifetime, nowIso: string): string {
+    if (lifetime === 'permanent') {
+      return OAUTH_PERMANENT_REFRESH_EXPIRES_AT;
+    }
+
+    const nowMs = new Date(nowIso).getTime();
+    return new Date(nowMs + lifetime * 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  // This method reapplies the global OAuth refresh session lifetime to all currently active refresh tokens.
+  public rebaseActiveOAuthRefreshExpiries(
+    lifetime: OAuthSessionLifetime,
+    nowIso = new Date().toISOString()
+  ): number {
+    const normalizedNowIso = new Date(nowIso).toISOString();
+    const nextRefreshExpiresAt = this.resolveOAuthRefreshExpiry(lifetime, normalizedNowIso);
+
+    const result = this.db
+      .prepare(
+        `
+        UPDATE oauth_tokens
+        SET refresh_expires_at = ?, updated_at = ?
+        WHERE revoked = 0
+          AND refresh_expires_at > ?
+      `
+      )
+      .run(nextRefreshExpiresAt, normalizedNowIso, normalizedNowIso);
+
+    return Number(result.changes ?? 0);
   }
 
   // This method validates OAuth bearer tokens for MCP access and updates last-used metadata.

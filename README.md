@@ -75,7 +75,6 @@ Wichtige Env-Werte in `linkwarden-mcp.env`:
 - `MCP_COOKIE_SECURE=auto`
 - `MCP_PUBLIC_BASE_URL=https://mcp.deine-domain.tld`
 - `MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=1800`
-- `MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS=2592000`
 - `MCP_DEFAULT_QUERY_TIMEZONE=Europe/Berlin`
 - `MCP_PERPLEXITY_API_KEY=` (optional; für `inferenceProvider=perplexity`)
 - `MCP_MISTRAL_API_KEY=` (optional; für `inferenceProvider=mistral`)
@@ -112,6 +111,19 @@ Hinweis:
 
 - Der im Setup eingegebene `Linkwarden API Key -> MCP` wird dem Admin-User zugeordnet.
 - Jeder weitere Benutzer muss seinen eigenen Linkwarden API Key setzen (oder der Admin setzt ihn).
+
+## OAuth Session-Laufzeit im Admin-Backend
+
+Im Dashboard unter `Integrationen -> Linkwarden Ziel` kann der Admin die Refresh-Session-Laufzeit für OAuth steuern:
+
+- `Dauerhaft` (Standard)
+- `Täglich`
+- `Wöchentlich`
+- `30 Tage`
+- `180 Tage`
+- `365 Tage`
+
+Beim Speichern wird die gewählte Laufzeit sofort auf alle aktiven OAuth-Refresh-Tokens angewendet.
 
 ## Annahmen
 

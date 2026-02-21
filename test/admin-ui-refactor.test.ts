@@ -98,6 +98,8 @@ describe('admin ui ia refactor contracts', () => {
       'revokeAdminKey',
       'setUserLinkwardenToken',
       'updateLinkwardenConfig',
+      'loadOAuthSessionSettings',
+      'setOAuthSessionLifetime',
       'setOwnTaggingPreferences',
       'setOwnNewLinksRoutine',
       'setOwnChatControl',

@@ -252,6 +252,20 @@ const aiLogSettingsSchema = z.object({
   retentionDays: z.union([z.literal(30), z.literal(90), z.literal(180), z.literal(365)])
 });
 
+// This schema limits admin OAuth session-lifetime updates to deterministic supported presets.
+const oauthSessionLifetimeSchema = z.union([
+  z.literal('permanent'),
+  z.literal(1),
+  z.literal(7),
+  z.literal(30),
+  z.literal(180),
+  z.literal(365)
+]);
+
+const setOauthSessionSchema = z.object({
+  sessionLifetime: oauthSessionLifetimeSchema
+});
+
 const createApiKeySchema = z.object({
   userId: z.number().int().positive(),
   label: z.string().min(2).max(100).default('default')
@@ -1281,6 +1295,19 @@ export function renderDashboardPage(principal: SessionPrincipal, csrfToken: stri
       <input id="lwBaseUrl" placeholder="http://linkwarden:3000" />
       <button onclick="updateLinkwardenConfig()">Linkwarden Konfiguration speichern</button>
     </div>
+    <div class="form-block" data-form-section="oauth-session-lifetime" data-form-section-label="OAuth Session-Laufzeit">
+      <label for="oauthSessionLifetime">OAuth Session-Laufzeit (Refresh-Token)</label>
+      <select id="oauthSessionLifetime">
+        <option value="permanent">Dauerhaft</option>
+        <option value="1">Täglich</option>
+        <option value="7">Wöchentlich</option>
+        <option value="30">30 Tage</option>
+        <option value="180">180 Tage</option>
+        <option value="365">365 Tage</option>
+      </select>
+      <button onclick="setOAuthSessionLifetime()">Session-Laufzeit speichern</button>
+      <p class="status-inline" id="oauthSessionLifetimeStatus"></p>
+    </div>
   </div>
       `
       : '';
@@ -1643,7 +1670,10 @@ const panelLoaders = {
   'automationen:chat-control': async () => { await loadOwnChatControl(); },
   'integrationen:linkwarden-token': async () => { await loadMe(); },
   'integrationen:user-linkwarden-token': async () => { await loadUsers(); },
-  'integrationen:linkwarden-ziel': async () => { await loadLinkwardenConfig(); },
+  'integrationen:linkwarden-ziel': async () => {
+    await loadLinkwardenConfig();
+    await loadOAuthSessionSettings();
+  },
   'governance:mein-tagging': async () => { await loadOwnTaggingPreferences(); },
   'governance:tagging-policy': async () => {
     await loadTaggingPolicy();
@@ -1674,6 +1704,7 @@ const mutationInvalidationMap = {
   setTaggingPolicy: ['governance:*'],
   setUserTaggingPreferences: ['governance:*'],
   updateLinkwardenConfig: ['integrationen:linkwarden-ziel'],
+  setOAuthSessionLifetime: ['integrationen:linkwarden-ziel', 'uebersicht:status'],
   undoAiLogChanges: ['uebersicht:ai-log', 'uebersicht:status'],
   undoAiLogOperations: ['uebersicht:ai-log', 'uebersicht:status'],
   setOwnAiLogSettings: ['uebersicht:ai-log']
@@ -3446,6 +3477,19 @@ async function loadLinkwardenConfig() {
   document.getElementById('linkwardenConfigResult').textContent = JSON.stringify(json, null, 2);
 }
 
+// This helper loads current OAuth session-lifetime settings for admin runtime policy controls.
+async function loadOAuthSessionSettings() {
+  const { res, json } = await requestJson('/admin/ui/admin/oauth-session');
+  if (!res.ok) {
+    const message = json?.error?.message || 'OAuth Session-Einstellungen konnten nicht geladen werden.';
+    showToast('error', message);
+    return;
+  }
+
+  const value = String(json?.settings?.sessionLifetime ?? 'permanent');
+  document.getElementById('oauthSessionLifetime').value = value;
+}
+
 async function updateLinkwardenConfig() {
   const payload = {};
   const baseUrl = document.getElementById('lwBaseUrl').value.trim();
@@ -3460,6 +3504,21 @@ async function updateLinkwardenConfig() {
     mutationAction: 'updateLinkwardenConfig',
     mutationSections: ['linkwarden-ziel-update']
   });
+}
+
+// This helper stores global OAuth session lifetime and immediately reapplies it to active refresh tokens.
+async function setOAuthSessionLifetime() {
+  const rawValue = document.getElementById('oauthSessionLifetime').value;
+  const sessionLifetime = rawValue === 'permanent' ? 'permanent' : Number(rawValue);
+  const json = await api('/admin/ui/admin/oauth-session', {
+    method: 'POST',
+    body: JSON.stringify({ sessionLifetime }),
+    mutationAction: 'setOAuthSessionLifetime',
+    mutationSections: ['oauth-session-lifetime']
+  });
+  const affectedCount = Number(json?.affectedCount ?? 0);
+  document.getElementById('oauthSessionLifetimeStatus').textContent =
+    'Aktive Sessions aktualisiert: ' + affectedCount;
 }
 
 async function setUserLinkwardenToken() {
@@ -4125,6 +4184,61 @@ export function registerUiRoutes(fastify: FastifyInstance, configStore: ConfigSt
     reply.send({
       ok: true,
       target: db.getLinkwardenTarget()
+    });
+  });
+
+  fastify.get('/admin/ui/admin/oauth-session', async (request, reply) => {
+    const principal = requireSession(request, db);
+    requireAdminSession(principal);
+
+    const runtime = configStore.getRuntimeConfig();
+
+    logUiInfo(request, 'ui_admin_get_oauth_session_settings', {
+      actorUserId: principal.userId,
+      sessionLifetime: runtime.oauthSessionLifetime
+    });
+
+    reply.send({
+      ok: true,
+      settings: {
+        sessionLifetime: runtime.oauthSessionLifetime
+      }
+    });
+  });
+
+  fastify.post('/admin/ui/admin/oauth-session', async (request, reply) => {
+    requireCsrf(request);
+    const principal = requireSession(request, db);
+    requireAdminSession(principal);
+
+    const parsed = setOauthSessionSchema.safeParse(request.body);
+    if (!parsed.success) {
+      logUiWarn(request, 'ui_admin_set_oauth_session_settings_validation_failed', {
+        details: parsed.error.flatten()
+      });
+      throw new AppError(400, 'validation_error', 'Invalid OAuth session settings payload.', parsed.error.flatten());
+    }
+
+    configStore.updateConfig((current) => ({
+      ...current,
+      oauthSessionLifetime: parsed.data.sessionLifetime
+    }));
+
+    const affectedCount = db.rebaseActiveOAuthRefreshExpiries(parsed.data.sessionLifetime, new Date().toISOString());
+    const runtime = configStore.getRuntimeConfig();
+
+    logUiInfo(request, 'ui_admin_set_oauth_session_settings_success', {
+      actorUserId: principal.userId,
+      sessionLifetime: runtime.oauthSessionLifetime,
+      affectedCount
+    });
+
+    reply.send({
+      ok: true,
+      settings: {
+        sessionLifetime: runtime.oauthSessionLifetime
+      },
+      affectedCount
     });
   });
 

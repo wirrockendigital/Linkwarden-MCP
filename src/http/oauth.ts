@@ -21,11 +21,15 @@ import {
   normalizeScope
 } from '../utils/oauth.js';
 import { hashApiToken } from '../utils/security.js';
+import type { RuntimeConfig } from '../types/domain.js';
 
 interface OAuthRouteDeps {
   configStore: ConfigStore;
   db: SqliteStore;
 }
+
+// This constant defines the max timestamp used to model non-expiring refresh sessions.
+const OAUTH_PERMANENT_REFRESH_EXPIRES_AT = '9999-12-31T23:59:59.000Z';
 
 const authorizeQuerySchema = z.object({
   response_type: z.string().default('code'),
@@ -199,6 +203,7 @@ function assertClientAuthentication(
 // This helper creates and persists one fresh OAuth token pair for a user/client binding.
 function issueTokenPair(
   db: SqliteStore,
+  runtimeConfig: RuntimeConfig,
   input: {
     userId: number;
     clientId: string;
@@ -207,14 +212,14 @@ function issueTokenPair(
   }
 ): { accessToken: string; refreshToken: string; expiresIn: number } {
   const accessTtlSeconds = clampTtlSeconds(process.env.OAUTH_ACCESS_TOKEN_TTL_SECONDS, 300, 86_400, 1_800);
-  const refreshTtlSeconds = clampTtlSeconds(
-    process.env.OAUTH_REFRESH_TOKEN_TTL_SECONDS,
-    3_600,
-    365 * 24 * 3_600,
-    30 * 24 * 3_600
-  );
+  // This mapping keeps refresh-token lifetime aligned with runtime admin policy presets.
+  const refreshTtlSeconds =
+    runtimeConfig.oauthSessionLifetime === 'permanent' ? null : runtimeConfig.oauthSessionLifetime * 24 * 3_600;
   const accessExpiresAt = new Date(Date.now() + accessTtlSeconds * 1000).toISOString();
-  const refreshExpiresAt = new Date(Date.now() + refreshTtlSeconds * 1000).toISOString();
+  const refreshExpiresAt =
+    refreshTtlSeconds === null
+      ? OAUTH_PERMANENT_REFRESH_EXPIRES_AT
+      : new Date(Date.now() + refreshTtlSeconds * 1000).toISOString();
   const access = generateAccessToken();
   const refresh = generateRefreshToken();
 
@@ -463,6 +468,8 @@ export function registerOAuthRoutes(fastify: FastifyInstance, deps: OAuthRouteDe
     }
 
     try {
+      // This read keeps token issuance and client policy checks on one consistent runtime config snapshot.
+      const runtimeConfig = deps.configStore.getRuntimeConfig();
       // This normalization keeps grant-specific client handling deterministic for optional refresh client_id.
       const requestedClientId = parsed.data.client_id?.trim() ? parsed.data.client_id.trim() : undefined;
 
@@ -506,7 +513,7 @@ export function registerOAuthRoutes(fastify: FastifyInstance, deps: OAuthRouteDe
           }
         }
 
-        const issued = issueTokenPair(deps.db, {
+        const issued = issueTokenPair(deps.db, runtimeConfig, {
           userId: consumed.userId,
           clientId: consumed.clientId,
           scope: consumed.scope,
@@ -566,7 +573,7 @@ export function registerOAuthRoutes(fastify: FastifyInstance, deps: OAuthRouteDe
         throw new AppError(400, 'invalid_grant', 'Refresh token is invalid or expired.');
       }
 
-      const issued = issueTokenPair(deps.db, {
+      const issued = issueTokenPair(deps.db, runtimeConfig, {
         userId: consumedRefresh.userId,
         clientId: consumedRefresh.clientId,
         scope,
